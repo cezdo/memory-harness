@@ -1,0 +1,83 @@
+# Install, configure and integrate
+
+[中文](usage.md) · [Back to overview](../README.en.md)
+
+## Install and check
+
+Python 3.11 or later is required. Core storage, reading and tests use the Python standard library; installation uses setuptools. Host adapters, model calls and Chinese parsing require additional configuration.
+
+```sh
+python3 -m pip install --no-cache-dir --no-build-isolation .
+mh --help
+```
+
+Start with a separate temporary instance. These commands create an empty database and check its integrity:
+
+```sh
+demo_dir=$(mktemp -d)
+MH_HOME="$demo_dir/data" MH_INSTANCE="$demo_dir/instance.toml" \
+  mh engram check --engram-db "$demo_dir/data/engram.db" --brief
+```
+
+From a source checkout, use `python3 -m mh` in place of `mh`. This check verifies storage; model calls and host integration require the configuration below.
+
+## Instance configuration
+
+Configuration defaults to `~/.config/memory-harness/instance.toml`. Copy and edit `mh/engram/store/instance.example.toml`, or set `MH_INSTANCE` to another file.
+
+```toml
+projects = "~/projects"
+
+[user]
+name = "用户"
+aliases = []
+
+[resources]
+standing = "~/.config/memory-harness/standing.md"
+glossary = "~/.config/memory-harness/glossary.md"
+workspace_status = "~/.config/memory-harness/workspace-status"
+```
+
+These optional texts are maintained by each user: standing context is injected at session start; glossary aliases use headings such as `**Full name / alias**`; workspace status uses `<workspace>.md` files. The distribution excludes personal profiles, real conversations and private design documents.
+
+Project design, interfaces, contributor rules and public introductions use “user” for the role. Replies, reports and documents addressed directly to a person use “you” and their preferred name when a name is needed. The model refers to itself as “I”. Choose wording for the audience, purpose and narrative viewpoint; preserve a document’s viewpoint when presenting it to a model. Runtime records and prompts use `[user].name` (default: “用户”); `[user].aliases` supplies other recognized names. Keep personal names and naming preferences in instance configuration or a profile outside the repository. Original conversations and existing memories retain their recorded names.
+
+Writing prompts and memory delivery share the expression rules in `mh.express`. Source bodies remain intact; viewpoint notes distinguish authors, addressees and readers. Input and delivery records retain the naming context and rule version. Private aliases supply retrieval candidates and separate naming hints; context distinguishes namesakes. Use the `use` ID at the end of a memory response for wording feedback: `feedback(scope="presentation", use=<id>, reason="...")`. Default record feedback handles errors in the underlying record. Presentation feedback preserves source records and does not count as a new memory exposure. Private instances continue using configured names; this feature does not guarantee anonymous model inputs.
+
+| Environment variable | Purpose |
+|---|---|
+| `MH_HOME` | Runtime data, default `~/.local/share/memory-harness` |
+| `MH_INSTANCE` | Instance configuration file |
+| `MH_DB` | Synapse database for reading and access traces; Engram commands use `--engram-db` |
+| `MH_LTP_PYTHON`, `MH_LTP_MODEL` | Python with LTP installed, and a local model directory |
+| `MH_LEXICON` | Optional lexicons under `rime-ice/cn_dicts/` and `thuocl/data/` |
+| `MH_TYPESAFE_PYTHON` | Python with the TypeSafe SDK for citation backfill |
+| `MH_COUNT` | Path to the `mh-count` word-count tool allowed during precise reading |
+
+Optional tools default to paths under `/usr/local/mh-tools/`: `ltp/venv/bin/python`, `ltp/model`, `lexicon/`, `typesafe/venv/bin/python` and `mh-count/mh-count`. Install tools, model weights and lexicons separately; they are excluded from the distribution. LTP and TypeSafe helper Python processes execute scripts bundled with the package.
+
+## Use and integration
+
+```sh
+mh engram collect
+mh engram check --brief
+mh evoke keyword
+mh roam
+mh relive L3:T5 --said
+```
+
+`collect` reads local host conversations and saves their original text to the instance. Confirm the data directory first. Originals may contain credentials and other sensitive content; keep databases and generated reading pages private. `evoke` searches by words, `relive` expands handles and traces original statements, and `roam` browses workspaces, lines and topics.
+
+Configure an MCP host with this standard-input/output server command:
+
+```sh
+python3 -m mh.synapse.pull.mcp
+```
+
+Supply the correct Python, source path and instance environment. Inspect `python3 -m mh.synapse.hosts.codex.install --help` before running the Codex hook installer, which modifies host configuration.
+
+Claude Code's session-start entry point is `python3 -m mh inject`; the per-turn entry point is `python3 -m mh.synapse.push.associate`. The dsh plugin and observation switches are bundled under `mh/synapse/hosts/dsh/` and `mh/engram/observe/switch/` and require explicit host configuration.
+
+Observation and formation call external CLIs or a dsh test instance. Preview and formation use authenticated Codex / Claude CLIs; precise and rough reading use a dsh instance with a configured model provider. Set its root through `[tools].dsh_test`. Credentials come from the relevant host configuration. Model selection and isolation are implemented in `mh/engram/invoke/` and the individual process modules.
+
+After configuring model calls, run `mh engram observe`, `mh engram form`, or separate loops using `mh rhythm`, `mh rhythm --form` and `mh rhythm --tidy`. Automatic service installation is not provided. Citation backfill (`mh backfill`) additionally requires the TypeSafe SDK and `TYPESAFE_API_KEY` in `~/.config/memory-harness/typesafe.env`; `TYPESAFE_MODEL` is optional.

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+.env.*
+node_modules/
+.dev/
+tmp/
+artifacts/
+.dsh/
+release-allowlist.local.json

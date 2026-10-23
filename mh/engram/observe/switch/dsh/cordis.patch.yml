@@ -1,0 +1,6 @@
+# mh-observe-switch bundle patch：作为 web profile 的一层 bundle 加载，在 dsh-web-app 之后插入。
+# `name` 按包名从 profile 的 node_modules 解析（profile 的 package.json 里 "mh-observe-switch": "link:…"）。
+
+- insert:
+    - id: mh-observe-switch
+      name: 'mh-observe-switch'

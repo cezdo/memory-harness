@@ -1,0 +1,20 @@
+# 粗读观察者（observe 的 deepseek-ark-web-rough，2026-10-17 实验 e4 定下）：另起的 dsh web 实例，叠加在 web profile、极简层、观察者 web 补丁之后。
+# 声明一个 bare 预设：minimal 原样去掉 persistent-shell 那组（没有任何工具），人设同 minimal；推理档位 low。
+- insert:
+    - id: preset-bare
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: bare
+        order: 9
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful software engineer assistant.
+              complete: true
+              includeRuntimeContext: false
+- id: agent-default-model
+  config:
+    provider: ark
+    model: deepseek-v4-1-flash-260910
+    reasoningEffort: low

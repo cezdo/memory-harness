@@ -1,0 +1,39 @@
+"""写入与读取共用的表达上下文；不改写源正文，不推断身份。"""
+import hashlib
+
+VERSION = "0.1"
+RULES = """人称按作者、受话人、当前读者和用途理解。原话与引语中的“我/你”保留原表达的视角；任务提示词中的“你”指执行任务的模型。
+写记录时保留说话人、来源、名字、句柄和数字，按实例记录名标明当前用户；同名的人、机器、目录和作品角色按上下文区分。
+直接给本人阅读的回复用“你”，需要称呼时采用私有偏好；代拟邮件等成文内容中的“我”按署名人解释。项目角色描述用“用户”。
+称呼线索供检索和理解使用，不凭名字相同合并主体。源记录错误在所属层纠正，呈现错误引用送达记录反馈。"""
+
+
+READ_NOTE = "以下记忆保留原记录的叙述视角。"
+RAW_NOTE = "以下原话保留来源原文和原说话人的视角。"
+VIEW_NOTE = "引语、自述和代拟文中的“我/你”按其作者与受话人理解；给本人的回复按私有称呼偏好措辞。"
+
+
+def signature():
+    return {"version": VERSION, "rules_hash": hashlib.sha256("\n".join((RULES, READ_NOTE, RAW_NOTE, VIEW_NOTE)).encode()).hexdigest()}
+
+
+def context(user_name, aliases=(), *, purpose, author="source", addressee="source", reader="model"):
+    return {**signature(), "purpose": purpose, "author": author, "addressee": addressee, "reader": reader,
+            "user_name": user_name, "aliases": list(dict.fromkeys([user_name, *aliases]))}
+
+
+def prompt(template, user_name):
+    """只填程序定义的名字槽位；不对原始材料作全文替换。"""
+    return template.strip().replace("{{用户}}", user_name) + "\n\n## 表达规范\n" + RULES
+
+
+def present(text, ctx, *, raw=False):
+    """附加阅读视角，正文逐字保留；给内部过程的输入由其调用方组织。"""
+    if not text or ctx["reader"] != "model" or ctx["purpose"] not in ("memory", "standing"):
+        return text
+    note = RAW_NOTE if raw else READ_NOTE
+    return "〔记忆视角〕" + note + VIEW_NOTE + "\n\n" + text
+
+
+def evidence(ctx, text):
+    return {**ctx, "text_hash": hashlib.sha256(text.encode()).hexdigest()}

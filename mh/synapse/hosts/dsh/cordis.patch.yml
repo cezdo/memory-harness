@@ -1,0 +1,15 @@
+# mh-synapse bundle patch：作为 web profile 的一层 bundle 加载，在 dsh-web-app 之后插入。
+# `name` 按包名从 profile 的 node_modules 解析（profile 的 package.json 里 "mh-synapse": "link:…"）。
+# 自由参数都在 config 里，改这里或在 profile 的 cordis.patch.yml 里按 id 覆盖。
+
+- insert:
+    - id: mh-synapse
+      name: 'mh-synapse'
+      config:
+        python: /usr/bin/python3
+        injectTimeoutMs: 30000      # 开场推送（mh inject）；Claude 那边 SessionStart 没设，按宿主默认
+        associateTimeoutMs: 30000   # 联想（同 Claude 的 UserPromptSubmit timeout: 30）；超时这一轮不加
+        toolTimeoutMs: 60000        # 拉取工具每次调用（同 dsh-mcp-client 默认）
+        resume: false               # 恢复会话时不再推基准（dsh 的注入会写进会话日志，历史里已有）
+        subagents: false            # 子代理不推（同 Claude：SessionStart 不在子代理上触发）
+        # oldShadow: false          # 旧联想器影子（默认 ~/.dsh/.agent-presets/whale-native/synapse.js）；false 关掉
