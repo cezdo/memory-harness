@@ -1,0 +1,14 @@
+{
+  "name": "mh-synapse",
+  "version": "0.6.0",
+  "description": "memory-harness Synapse 接入 dsh：开场推送、联想送达、拉取工具（mcp__mh__search/get/map），web profile bundle",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {}
+}

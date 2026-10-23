@@ -1,0 +1,13 @@
+# 常驻观察者（DshWeb）用的 dsh web 补丁：叠加在 web profile 和极简层（dsh-observer.patch.yml）之后。
+# 会话用 dsh 自带的 minimal 预设，原样不改（2026-10-09：DeepSeek 配 minimal 预设最强，不修改最好）；
+# 这里只做预设以外的两件事。这份文件计入 Operator：改它就是新的观察者。
+# web profile 的记忆工具（日记、记忆查询）挂在 profile 层、会进每个会话；观察者不能看到
+- id: memory-tools
+  disabled: true
+# 模型 DeepSeek V4.1 Flash（2026-10-09 ark 订阅上线；指令遵循更好，细粒度更细，用户），推理档位 high。
+# 补丁会整段替换这一项的 config，所以 provider、model 一起写
+- id: agent-default-model
+  config:
+    provider: ark
+    model: deepseek-v4-1-flash-260910
+    reasoningEffort: high

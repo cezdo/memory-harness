@@ -1,0 +1,34 @@
+# memory-harness 的实例配置示例：复制到 ~/.config/memory-harness/instance.toml 再改（或用 MH_INSTANCE 指定路径）。
+# 每一项都可以不写，不写用默认。
+
+projects = "~/projects"                          # 放项目的目录：Synapse 认不出 git 仓库时，取这下面的第一层目录当工作区
+
+[user]
+name = "用户"                                    # 写记录、填提示词用的称呼（默认“用户”）
+aliases = []                                     # 另外的称呼：识别与检索候选；同名按上下文判断，通用角色词不加入个人组
+
+[workspace.engram]                               # Engram 按目录更正工作区：最长前缀；其余取会话 cwd 的最后一节
+# "~/projects/old-name" = "new-name"
+
+[workspace.managing]                             # 管理性质的工作区：会话可以挂到目录下任何一个工作区的线
+# home = "~"
+
+[workspace.synapse]                              # Synapse 的改名、删除、别名：按路径前缀，最长的优先
+# "~/projects/old-name" = "new-name"
+
+# [[workspace.sessions]]                         # 按会话更正工作区
+# source = "claude"
+# session = "<会话 id>"
+# workspace = "<工作区>"
+
+[synapse]
+quiet = []                                       # 不当“查不到的词”送的词（手动名单）
+
+[tools]
+# codex = "codex"                                # codex CLI 的路径（默认按 PATH 找）
+# dsh_test = "~/dsh-test"                        # dsh 测试实例（精读、粗读的 headless 模式）
+
+[resources]                                     # 私有文本，独立于代码和发行包
+# standing = "~/.config/memory-harness/standing.md"
+# glossary = "~/.config/memory-harness/glossary.md"
+# workspace_status = "~/.config/memory-harness/workspace-status"
