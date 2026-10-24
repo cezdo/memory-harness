@@ -60,7 +60,7 @@ The further in, the stricter and more mechanical: the program locates citations,
 
 ### Start with the core and recent progress
 
-Each session starts with the core text (`core.md`), recall tool instructions, workspace status and the current environment, in that order. Workspace status lists recently paused sessions with topic handles to help resume work. With core-editing hooks enabled, the core is normally read-only; the user can authorize edits for one turn with `/mhcore` (`$mhcore` in Codex), and changes are appended to a kernel log. See [the usage guide](docs/usage.en.md#core-and-session-start-context) for installation and host support.
+Each session starts with the core text (`core.md`), recall tool instructions, workspace status and the current environment, in that order. Workspace status lists recently paused sessions with topic handles to help resume work. With core-editing hooks enabled, the core is normally read-only; the user can authorize edits for one turn with `/mhcore` (`$mhcore` in Codex), and changes are appended to a kernel log. See [the usage guide](design/global/使用.en.md#core-and-session-start-context) for installation and host support.
 
 ### Complements the host's own memory
 
@@ -96,7 +96,9 @@ python3 -m pip install --no-cache-dir --no-build-isolation .
 mh --help
 ```
 
-Requires Python 3.11 or later. Instance configuration, model calls, host integration and optional tools are covered in [Install, configure and integrate](docs/usage.en.md).
+Requires Python 3.11 or later. Instance configuration, model calls, host integration and optional tools are covered in [Install, configure and integrate](design/global/使用.en.md).
+
+For the internal structure, source tracing and correction mechanisms, see the [design documents](design/INDEX.md) (Chinese). They distinguish the current implementation from planned work.
 
 Development and tests: `python3 tools/test.py`. Tests run in temporary directories with synthetic data and no real model calls. Contributor rules are in [AGENTS.md](AGENTS.md).
 

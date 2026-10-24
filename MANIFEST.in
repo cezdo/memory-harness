@@ -1,5 +1,6 @@
 include README.md README.en.md AGENTS.md AGENTS.zh-CN.md LICENSE RELEASE-MANIFEST.json
-include tools/test.py docs/usage.md docs/usage.en.md
+include tools/test.py
+recursive-include design *.md
 recursive-include mh *.md *.toml *.yml *.json *.js
 global-exclude *.pyc
 prune **/__pycache__
