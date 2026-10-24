@@ -80,8 +80,8 @@ def deliver(conn, version, mode, query, text, got, *, session="", purpose="inter
     shown = express.present(text, ctx, raw=raw)
     info = dict(meta or {}, expression={**express.evidence(ctx, shown), "source_raw": raw})
     final = []
-    def finish(oid):
-        final.append(shown + f"\n\n〔送达 use {oid}〕" if shown and ctx["purpose"] in ("memory", "standing") else shown)
+    def finish(oid):                     # 送达编号要等 use 写出来才有，包的时候带上
+        final.append(express.present(text, ctx, raw=raw, use=oid))
         return final[0]
     use(conn, version, mode, query, shown, got, session=session, purpose=purpose, cwd=cwd, note=note, channel=channel, meta=info, format_shown=finish)
     return final[0]

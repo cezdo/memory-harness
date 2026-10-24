@@ -306,13 +306,13 @@ def cached(conn):
     return data
 
 
-TAG = "Synapse"           # 对话中途注入的内容用 <Synapse>…</Synapse> 包起来；常态记忆“关于你我”说明它是“我”的回想（2026-10-20）
+TAG = "memory-harness"    # 对话中途注入的内容用 <memory-harness>…</memory-harness> 包起来，和开场、拉取同一个标签；core 的图例说明它不是用户说的话（2026-10-24，原来是 <Synapse>）
 
 
 def recall_note(lost):
     """查不到的词送出去的那一行 → (给模型的，给用户看的)。"""
     line = "".join(f"「{w}」" for w in lost) + "没印象，记忆里还没有，当新的看。"     # 2026-10-22 从候选里挑的
-    return f"<{TAG}>{line}</{TAG}>", f"Synapse · 新词：{'、'.join(lost)}"
+    return f"<{TAG}>{line}</{TAG}>", f"memory-harness · 新词：{'、'.join(lost)}"
 _CODEY = re.compile(r"[=(){}<>|$;]|^\s{2,}|^\S+:\s")       # 贴进来的命令、代码、日志行：不是用户自己写的话
 
 

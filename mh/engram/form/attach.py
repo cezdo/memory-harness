@@ -58,7 +58,7 @@ def candidates(pool, picks):
 def skeleton_tree(pool, ns):
     lines = {}
     for e in pool.values():
-        if e["kind"] == "line" and e["parent"] in {n["id"] for n in ns.values()}:
+        if e["kind"] == "line" and e["parent"] in {n["id"] for n in ns.values()} and not e.get("retired"):
             node = next(p for p, n in ns.items() if n["id"] == e["parent"])
             lines.setdefault(node, []).append((e["id"], e["name"], _last(pool, e["id"])[0]))
     return skeleton.tree(ns, lines)

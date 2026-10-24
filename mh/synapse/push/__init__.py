@@ -25,12 +25,24 @@ def workspace(path):
     return "home"
 
 
-STANDING = resource("standing", Path(__file__).resolve().parents[3] / "design/synapse/常态记忆.md", "standing.md")
+def _core():
+    """内核的源文件：实例配置的 [resources].core（旧名 standing）；开发仓库是 design/synapse/core.md；发行包读实例配置旁的
+    core.md，没有就读旧的 standing.md（2026-10-24 改名前的叫法）。"""
+    from ...engram.store import instance
+    configured = instance._D.get("resources", {})
+    if "core" not in configured and "standing" in configured:
+        return resource("standing", Path(), "standing.md")
+    got = resource("core", Path(__file__).resolve().parents[3] / "design/synapse/core.md", "core.md")
+    old = instance.PATH.parent / "standing.md"
+    return old if not got.exists() and old.exists() else got
+
+
+CORE = _core()
+STANDING = CORE          # 旧名：内核态（elevate）和测试还在用
 
 
 def _text(path):
-    """常态记忆的文本（design/synapse/常态记忆.md）。2026-10-20 起它就是源文件，不再从 design/基准.md 编译（用户：基准只用于推送，
-    和 AGENTS.md 重复；自我的部分留在这里，执行的部分进 AGENTS.md，项目的部分进项目现状）；以前编译留下的第一行指纹照样跳过。"""
+    """内核的文本（design/synapse/core.md，2026-10-24 前叫常态记忆）：源文件就是推送版；以前编译留下的第一行指纹照样跳过。"""
     lines = path.read_text().splitlines() if path.exists() else []
     return "\n".join(l for l in lines if not l.startswith(("<!--", ">"))).strip()     # 开头的引用说明是给维护的人看的，不推
 
@@ -53,56 +65,75 @@ def _sections(text):
 
 
 def standing(cwd="", memory=""):
-    """常态记忆：design/synapse/常态记忆.md，memory（工具和常用入口）接在「记忆与认知」末尾。哪个工作区都是同一份
-    （2026-10-20 起各工作区自己的那份撤掉：执行的部分进各仓库的 AGENTS.md，项目的部分进项目现状）；cwd 留着给调用方定工作区。"""
-    head, secs = _sections(_text(STANDING))
+    """内核（core.md），memory（工具）接在「记忆与认知」末尾。哪个工作区都是同一份；cwd 留着给调用方定工作区。"""
+    head, secs = _sections(_text(CORE))
     if memory:
         if MEMORY_SECTION not in [x[0] for x in secs]:
             secs.append([MEMORY_SECTION, []])
         secs[[x[0] for x in secs].index(MEMORY_SECTION)][1] += ["", memory]
-    parts = ["# 常态记忆", "\n".join(head).strip()] + [h + "\n\n" + "\n".join(lines).strip() for h, lines in secs]
+    parts = ["# core", "\n".join(head).strip()] + [h + "\n\n" + "\n".join(lines).strip() for h, lines in secs]
     return "\n\n".join(x for x in parts if x)
+
+
+HOST_NAME = {"claude": "Claude Code", "codex": "codex", "dsh": "dsh"}
+
+
+def environment(host, start="", model="", now=None):
+    """环境段（放最后，2026-10-24）：现在几点、哪个宿主、哪个模型、怎么启动的（宿主给的原词：startup、resume、clear、compact）。
+    内容只用 ASCII，标题和全篇一样用中文（用户 2026-10-24）。宿主没给的就不写。"""
+    from datetime import datetime
+    t = (now or datetime.now()).astimezone()
+    bits = [f"{t:%Y-%m-%d %H:%M} {'Mon Tue Wed Thu Fri Sat Sun'.split()[t.weekday()]}", HOST_NAME.get(host, host)]
+    bits += [x for x in (model, start) if x and x.isascii()]
+    return "## 环境\n\n" + " | ".join(bits)
 
 
 # ---- 新库上的开场推送（E1a）----
 
 TOOL = "mcp__mh__"       # 宿主给 MCP 工具起的名字：mcp__<服务名>__<工具名>
-ENTRY_LINES = 8          # 常用入口列本工作区最近的几条话题线
 
 
 def entry(L, cwd):
-    """工具怎么用，加上常用入口：本工作区最近有会话的话题线（新的在前）。工作区里还没有线就只给工具。"""
+    """工具怎么用（2026-10-24：常用入口并进“最近停下的几件事”，每条带句柄；这里只留 roam 的提示）。L、cwd 留着给调用方。"""
     from ...engram.store import workspace as ws_of
     here = ws_of(cwd)
-    how = [f"`{TOOL}evoke` 按词找，`{TOOL}relive` 按句柄读，`{TOOL}roam` 走地图（参数见工具说明）。"
-           f"句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。"]
-    from ..pull import _latest, _node_line
-    lines = sorted((nid for nid, n in L.nodes.items() if n["kind"] == "line" and n["ws"] == here),
-                   key=lambda k: -_latest(L, k))[:ENTRY_LINES]
-    common = [f"- {_node_line(L, k)}" for k in lines]
-    return "\n".join(["### 工具", *how]
-                     + (["", f"### 常用入口（{here} 最近的话题线；全部：roam {here}）", *common] if common else []))
+    return "\n".join(["### 工具",
+                      f"- `{TOOL}evoke` 按词找（几个词一起给，带上换个说法的词），`{TOOL}relive` 按句柄读（必要时走到原话），"
+                      f"`{TOOL}roam` 走地图（不知道用什么词时；这个工作区全部的线：roam {here}）；参数见工具说明。",
+                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。"])
+
+
+def render(cwd, host="claude", session="", start="", model=""):
+    """开场映像的正文（还没包 <memory-harness>）：内核 + 工具 → 项目现状 → 环境，稳定的在前、易变的在后。
+    钩子和 `mh boot` 共用。项目现状是整理循环编好的，宿主自己给了的节去掉；读不到就不给（宿主不能报错）。"""
+    from . import status
+    text = standing(cwd, entry(None, cwd))
+    now = status.read(workspace(cwd), host=host)
+    if now:
+        try:
+            from . import recent
+            now = recent.drop_self(now, host, session)      # 恢复的会话不列自己
+        except Exception:
+            pass
+        text += "\n\n" + now
+    return text + "\n\n" + environment(host, start, model)
 
 
 def hook(conn, payload):
-    """开场推送（Claude Code SessionStart、codex start、dsh 的 agent/created 用同一个入口）：常态记忆 + 工具 + 常用入口；
-    记一条 use（push / assist），再写进推送流水（pushes.py）。返回宿主要的 JSON。"""
+    """开场推送（Claude Code SessionStart、codex start、dsh 的 agent/created 用同一个入口）：内核 + 工具 + 项目现状 + 环境，
+    稳定的在前、易变的在后；记一条 use（push / assist），再写进推送流水（pushes.py）。返回宿主要的 JSON。"""
     from .. import track
     from ..track import pushes
-    from ..pull import VERSION, layers
+    from ..pull import VERSION
     host, session, cwd = payload.get("host") or "claude", payload.get("session_id", ""), payload.get("cwd", "")
-    L = layers(conn)
-    text = standing(cwd, entry(L, cwd))
-    from . import status
-    now = status.read(workspace(cwd), host=host)   # 项目现状：整理循环编好的，宿主自己给了的节去掉；没有就不给（读不到不影响推送）
-    if now:
-        text += "\n\n" + now
-    lines = re.findall(r"^- L(\d+) ", text, re.M)
+    model = payload.get("model")
+    text = render(cwd, host, session, str(payload.get("source") or ""), model if isinstance(model, str) else "")
+    lines = sorted(set(re.findall(r"\bL(\d+):T\d+", text)))
     text = track.deliver(conn, VERSION, "assist", {"push": "standing"}, text,
               {"topic_line": [int(x) for x in lines]}, session=session, purpose="interactive",
               cwd=cwd, channel="push", meta={"host": host})
     try:                 # 流水出了任何错都不影响推送（pushes.py 的纪律）
-        pushes.note("assist", host, session, cwd, True, summary=f"开场推送：常态记忆 {len(text)} 字（新库）",
+        pushes.note("assist", host, session, cwd, True, summary=f"开场推送：{len(text)} 字",
                     version=VERSION, chars=len(text), workspace=workspace(cwd))
     except Exception:
         pass

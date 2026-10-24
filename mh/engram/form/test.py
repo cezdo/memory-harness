@@ -2,6 +2,7 @@
 程序补词与线的索引词。模型换成假的，不调模型。python3 -m unittest mh.engram.form.test
 """
 import io
+import subprocess
 import json
 import tempfile
 import unittest
@@ -376,6 +377,18 @@ class FormTest(unittest.TestCase):
         self.assertIn(f"[E{a[0]}]", first)
         self.assertIn("## 第 2 轮", first)
 
+    def test_line_words_share(self):
+        """线的索引词要够多子入口都有：15 个子入口要 3 个（LINE_SHARE 两成），只有两个的不收；成员少时两个就够。"""
+        def kid(i, *groups):
+            return f"T{i}", {"id": f"T{i}", "kind": "entry", "parent": "L1", "words": {"lists": [list(g) for g in groups]}}
+        pool = {"L1": {"id": "L1", "kind": "line", "name": "线", "parent": None}}
+        pool.update(kid(i, ["甲"] if i < 2 else ["丙"], ["乙"] if i < 3 else ["丁"]) for i in range(15))
+        got = form.line_words(pool, "L1")["lists"]
+        self.assertNotIn(["甲"], got)
+        self.assertIn(["乙"], got)
+        small = {k: v for k, v in pool.items() if k in ("L1", "T0", "T1")}
+        self.assertIn(["甲"], form.line_words(small, "L1")["lists"])
+
     def test_feedback_attach(self):
         """挂线的反馈：改挂到新线或已有的线，新写一条挂线，原来的留着；按会话更正工作区以后，入口和新线都算到更正后的工作区。"""
         from unittest import mock
@@ -396,6 +409,46 @@ class FormTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT count(*) FROM attachment WHERE entry=2").fetchone()[0], 2)   # 原来的留着
         form.feedback_attach(self.conn, op, 2, "还是同一个目标", line="L1")
         self.assertEqual(form.entries(self.conn)["T2"]["parent"], "L1")
+
+    def test_feedback_attach_move(self):
+        """搬线和中间层（2026-10-24，L44 按索引粗分）：新线接替旧线（from，重名不拦），旧线清空后标 retired、不进候选；
+        新线可以挂在一条线下面（中间层），只有子线的线不算清空；新线可以建在别的工作区。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        b = self._session("s2", "2026-10-17T09:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1]), PACK.format(a=b[0], b=b[1])], [LABEL, LABEL],
+                              ["挂到：新线 X 升级｜为什么：新的目标", "挂到：L1｜为什么：同一个目标"]))
+        op = st.main_operator(self.conn, "test-model")
+        top = form.feedback_attach(self.conn, op, 1, "搬线", new_line="X 升级", from_=["L1"])          # 和 L1 同名，接替它
+        self.assertEqual(json.loads(self.conn.execute('SELECT "from" FROM topic_line WHERE id=?', (top,)).fetchone()[0]), [1])
+        self.assertEqual(set(form.line_heads(self.conn, 1)), {top})                  # 旧句柄顺着 from 找到现在的线
+        sub = form.feedback_attach(self.conn, op, 2, "分到中间层下", new_line="X 升级的回滚", parent_line=f"L{top}")
+        p = form.pool(self.conn)
+        self.assertTrue(p["L1"].get("retired"))                                  # 两个话题都改挂走了
+        self.assertEqual((p[f"L{sub}"]["parent"], p["T2"]["parent"]), (f"L{top}", f"L{sub}"))
+        self.assertFalse(p[f"L{top}"].get("retired"))                            # 下面有子线里的话题
+        with self.assertRaises(ValueError):
+            form.feedback_attach(self.conn, op, 2, "重名", new_line="X 升级")       # 和现在的线重名照样拦
+        mid = form.feedback_line(self.conn, op, "X 的整体", "中间层", "w", parent_line=f"L{top}")
+        self.assertTrue(form.pool(self.conn)[f"L{mid}"].get("retired"))         # 还没有子线、话题：先不列
+        form.feedback_attach(self.conn, op, 2, "放进中间层", new_line="X 升级的回滚 2", parent_line=f"L{mid}")
+        self.assertFalse(form.pool(self.conn)[f"L{mid}"].get("retired"))
+        other = form.feedback_attach(self.conn, op, 2, "其实是别的项目的事", new_line="Z 维护", workspace="z")
+        self.assertEqual(self.conn.execute("SELECT workspace FROM topic_line WHERE id=?", (other,)).fetchone()[0], "z")
+
+    def test_root_to_global(self):
+        """根下不挂线（2026-10-24）：模型选了骨架的根，程序改挂 global。"""
+        design = self.dir / "design"
+        for d in ("", "global", "engram"):
+            (design / d).mkdir(parents=True, exist_ok=True)
+            if d:
+                (design / d / "设计.md").write_text("x")
+        self.enterContext(patch.dict(skeleton.WORKSPACES, {"proj": (design, "Proj")}, clear=True))
+        root, glob = skeleton.nodes("proj")[""]["id"], skeleton.nodes("proj")["global"]["id"]
+        a = self._session("s1", "2026-10-17T08:00:00Z", cwd="/home/u/proj")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], [f"节点：{root}｜挂到：新线 X 升级｜为什么：跨了几个模块"]))
+        line = self.conn.execute("SELECT * FROM topic_line").fetchone()
+        self.assertEqual(line["node"], "global")
+        self.assertEqual(form.pool(self.conn)["L1"]["parent"], glob)
 
     def test_managing_workspace(self):
         """管理性质的工作区（2026-10-21）：目录下别的工作区的线也能挂；不是管理性质的，挂别的工作区的线由程序拒掉，候选里也没有。"""
@@ -540,6 +593,19 @@ class FormTest(unittest.TestCase):
         ]))
         got = written.written("claude", str(log), "/r/w", ["2026-10-17T08:00:00Z", "2026-10-17T09:00:00Z"])
         self.assertEqual(got, {0: ["写了 docs/x.md", "写了 a.py"]})            # 不带时间的行沿用前一条
+        repo = self.dir / "repo"
+        repo.mkdir()
+        git = lambda *a, when=None: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, env={
+            "PATH": "/usr/bin:/bin", "HOME": str(self.dir), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+            **({"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when} if when else {})})
+        git("init", "-q")
+        for msg, when in (("先", "2026-10-17T08:10:00Z"), ("后", "2026-10-17T08:20:00Z")):
+            git("commit", "-q", "--allow-empty", "-m", msg, when=when)
+        log.write_text(json.dumps({"timestamp": "2026-10-17T08:05:00Z", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git commit -m x"}}]}}))
+        got = written.written("claude", str(log), str(repo), ["2026-10-17T08:00:00Z"])
+        self.assertEqual([x.split("「")[1][0] for x in got[0]], ["先", "后"])   # 同一轮几次提交，早的在前
 
 
 class FileSkeletonTest(unittest.TestCase):

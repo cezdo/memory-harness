@@ -13,7 +13,7 @@ from ...engram.store.instance import USER_NAME as U
 def body(text):
     """句柄一致性比较来源内容；每次送达编号属于本次交付。"""
     import re
-    return re.sub(r"^〔记忆视角〕[^\n]+\n\n|\n\n〔送达 use \d+〕$", "", text)
+    return re.sub(r"^<memory-harness[^>]*>\n|\n</memory-harness>$", "", text)
 
 
 class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；form 自己的测试不在这里重跑（见文件末尾）
@@ -214,9 +214,12 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         out = push.hook(self.conn, {"session_id": "t", "cwd": "/w", "host": "dsh"})
         text = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("### 工具\n", text)
-        self.assertIn("- L1 X 升级", text)
+        self.assertIn("roam w", text)                                # 常用入口 2026-10-24 并进“最近停下的几件事”，这里只留 roam 的提示
+        self.assertNotIn("- L1 X 升级", text)
+        self.assertTrue(text.startswith('<memory-harness use="') and text.endswith("</memory-harness>"))
+        self.assertIn("## 环境\n", text)
         u = self._uses()[-1]
-        self.assertEqual((u["channel"], u["mode"], json.loads(u["meta"])["handles"]), ("push", "assist", {"topic_line": [1]}))
+        self.assertEqual((u["channel"], u["mode"]), ("push", "assist"))
 
     def test_check_clean(self):
         from ...engram import check
@@ -266,8 +269,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
                                   "- design/：设计文档\n- tmp/：实验\n")
         with mock.patch.object(status, "SOURCES", src):
             text = status.compile("w")
-            self.assertIn("- design/ [活跃，近 3 天 1 次提交] 设计文档", text)
-            self.assertIn("- tmp/ [不进 git；1 个；最近：exp", text)
+            self.assertIn("- 近 3 天有提交：design/（1）；不进 git：tmp/", text)    # 2026-10-24 目录压成一行，说明不推
+            self.assertNotIn("设计文档", text)
             self.assertIn("第一次提交", text)
             self.assertIn("1 个文件（可能是别的会话做到一半）：design/new.md", text)
             self.assertNotIn("数据层", text)                                   # 操作文档不推
@@ -300,8 +303,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         none = lambda words: {}                                            # 测试不碰这台机器的词库
         self.assertEqual(A.missing(data, toks, "甲服务 乙仓库 openclaw ds问 时候\nfoo = bar(1)", none), ["乙仓库", "openclaw"])
         ctx, shown = A.recall_note(["乙仓库", "openclaw"])
-        self.assertEqual(ctx, "<Synapse>「乙仓库」「openclaw」没印象，记忆里还没有，当新的看。</Synapse>")
-        self.assertEqual(shown, "Synapse · 新词：乙仓库、openclaw")       # 用户那边只显示简短的一行
+        self.assertEqual(ctx, "<memory-harness>「乙仓库」「openclaw」没印象，记忆里还没有，当新的看。</memory-harness>")
+        self.assertEqual(shown, "memory-harness · 新词：乙仓库、openclaw")       # 用户那边只显示简短的一行
         # 日语不交给 LTP：假名多于汉字的行整行不看（“進化”也不列），中文行里带假名的词不列
         toks = [("進化", "nz", 0, "SBV"), ("するよ", "n", 0, "SBV"), ("さくら", "ws", 0, "SBV"), ("丙仓库", "nz", 0, "SBV")]
         self.assertEqual(A.missing(data, toks, "今日は進化するよ もっともっと\n丙仓库写作さくら也行", none), ["丙仓库"])
@@ -326,6 +329,12 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertFalse(feedback["isError"])
         self.assertIn(f"use {uid}", feedback["content"][0]["text"])
         self.assertIn("[L1:T1]", r["content"][0]["text"])       # 旧写法 s-1 也认，写 L1:T1
+        bad = mcp.handle(self.conn, {"id": 4, "method": "tools/call",
+                                     "params": {"name": "relive", "arguments": {"handle": "L1"}}})["result"]
+        self.assertTrue(bad["isError"])                            # 参数名写错：说清楚，不默默回空
+        self.assertIn("没有参数 handle", bad["content"][0]["text"])
+        self.assertIn("缺 handles", bad["content"][0]["text"])
+        self.assertNotIn("Traceback", bad["content"][0]["text"])
 
 
 for _name in [n for n in dir(ft.FormTest) if n.startswith("test_")]:

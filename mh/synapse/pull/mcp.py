@@ -79,8 +79,30 @@ def _session(args):
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or args.get("session") or ""
 
 
+HIDDEN = ("session", "cwd")       # 宿主、测试传的，不在 schema 里
+
+
+class ArgError(ValueError):
+    """参数不对：直接回给调用方，不带调用栈（2026-10-24：relive 写成 handle 时什么都不回，看不出错在哪）。"""
+
+
+def check_args(name, args):
+    spec = next((t["inputSchema"] for t in TOOLS if t["name"] == name), None)
+    if spec is None:
+        return
+    props = spec["properties"]
+    extra = [k for k in args if k not in props and k not in HIDDEN]
+    missing = [k for k in spec.get("required", []) if args.get(k) in (None, "", [])]
+    if extra or missing:
+        bad = "；".join([*(f"没有参数 {k}" for k in extra), *(f"缺 {k}" for k in missing)])
+        want = "，".join(f"{k}（{v.get('description', v.get('type', ''))}）" if k in spec.get("required", []) else k
+                        for k, v in props.items())
+        raise ArgError(f"{name} 参数不对：{bad}。参数有：{want}")
+
+
 def call(conn, name, args):
     """执行一个工具，返回文字。"""
+    check_args(name, args)
     kw = dict(session=_session(args), purpose="interactive", cwd=args.get("cwd") or os.getcwd(), note=args.get("note") or "")
     if name in ("evoke", "relive", "roam"):
         return _call_new(conn, name, args, kw)
@@ -145,6 +167,8 @@ def handle(conn, msg):
         p = msg.get("params") or {}
         try:
             text, err = call(conn, p.get("name"), p.get("arguments") or {}), False
+        except ArgError as e:
+            text, err = str(e), True
         except Exception as e:
             text, err = f"出错：{e!r}\n{traceback.format_exc(limit=3)}", True
         result = {"content": [{"type": "text", "text": text}], "isError": err}

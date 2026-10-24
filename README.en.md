@@ -51,10 +51,16 @@ Not every conversation deserves a word-by-word read. observe previews first, the
 The further in, the stricter and more mechanical: the program locates citations, supersession is auditable, and model outputs are never scored. The further out, the more human: memories arrive as the assistant's own recollection, and a word that memory has never seen gets an honest “doesn't ring a bell” instead of a guess:
 
 ```text
-<Synapse>「thinkterm」没印象，记忆里还没有，当新的看。</Synapse>
+<memory-harness>
+「thinkterm」没印象，记忆里还没有，当新的看。
+</memory-harness>
 ```
 
 (“No memory of ‘thinkterm’ yet — treat it as new.”) Writing and recall share one set of expression rules that keep authors, addressees and readers apart and preserve who said each quote.
+
+### Start with the core and recent progress
+
+Each session starts with the core text (`core.md`), recall tool instructions, workspace status and the current environment, in that order. Workspace status lists recently paused sessions with topic handles to help resume work. With core-editing hooks enabled, the core is normally read-only; the user can authorize edits for one turn with `/mhcore` (`$mhcore` in Codex), and changes are appended to a kernel log. See [the usage guide](docs/usage.en.md#core-and-session-start-context) for installation and host support.
 
 ### Complements the host's own memory
 
