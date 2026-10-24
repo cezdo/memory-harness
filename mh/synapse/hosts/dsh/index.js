@@ -1,7 +1,7 @@
 // memory-harness Synapse 接入 dsh（web profile 的 bundle；2026-10-15：把 Claude 那套推送换进 dsh，前后对照）。
 //
 // 三件事，Python 侧与 Claude 共用同一套入口，只在 JSON 里多带 host: "dsh"：
-// - 开场推送：agent/created → `python3 -m mh inject`（常态记忆 + 工具与常用入口 + 项目现状），作为一条 user 消息注入；
+// - 开场推送：agent/created → `python3 -m mh inject`（开场映像：内核 + 工具 + 项目现状 + 环境），作为一条 user 消息注入；
 // - 联想：agent/pre-step → `python3 -m mh.synapse.push.associate`。只把 source.kind 为 user 的话送去联想；
 //   goal、子代理通知、别的 agent 发来的消息记成宿主事件（host_kind），工作区说明、运行时快照这类每步都有的不送；
 // - 拉取：自己连 `python3 -m mh.synapse.pull.mcp`（stdio，一行一条 JSON-RPC），工具名照 Claude 的 mcp__mh__search/get/map，
@@ -9,7 +9,7 @@
 //   不用 dsh-mcp-client：一个进程里的会话共用一个服务进程、环境被清洗，服务拿不到是哪段会话在拉取。
 //
 // 不走 dsh-hooks-claude-code 桥接：桥接把一步里所有待处理消息不分来源拼成 prompt（工作区说明会触发联想），
-// SessionStart 也是脱离运行、可能赶不上第一轮。这里 agent/created 被等待，常态记忆一定在第一轮之前。
+// SessionStart 也是脱离运行、可能赶不上第一轮。这里 agent/created 被等待，开场映像一定在第一轮之前。
 //
 // 只用 node 内置模块：本包经 link: 指向仓库，import 按真实路径解析，找不到 profile 的 node_modules。
 import { spawn } from "node:child_process";

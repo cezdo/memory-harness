@@ -145,12 +145,13 @@ def commit_files(repo, h):
 
 
 def commits(repo, since, until):
-    """时间窗里全部分支的提交：[(哈希, UTC 时间, 说明)]。工作区不是 git 仓库时返回空。"""
+    """时间窗里全部分支的提交：[(哈希, UTC 时间, 说明)]，早的在前（同一轮的几次提交按先后列，最后一条是最后提交）。
+    工作区不是 git 仓库时返回空。"""
     if not repo or not Path(repo).is_dir():
         return []
     if subprocess.run(["git", "-C", repo, "rev-parse"], capture_output=True).returncode:
         return []
-    out = subprocess.run(["git", "-C", repo, "log", "--all", f"--since={since}", f"--until={until}",
+    out = subprocess.run(["git", "-C", repo, "log", "--all", "--reverse", f"--since={since}", f"--until={until}",
                           "--date=format-local:%Y-%m-%dT%H:%M:%S.000Z", "--format=%H%x09%ad%x09%s"],
                          capture_output=True, text=True, env={"TZ": "UTC", "PATH": "/usr/bin:/bin"}).stdout
     return [tuple(x.split("\t", 2)) for x in out.splitlines() if x.count("\t") >= 2]

@@ -129,7 +129,7 @@ class ExpressionDeliveryTest(unittest.TestCase):
                 r = c.execute('SELECT * FROM use_detail ORDER BY occurrence DESC LIMIT 1').fetchone()
                 self.assertEqual(delivered, r['shown'])
                 self.assertIn(text, delivered)
-                self.assertIn(f"送达 use {r['occurrence']}", delivered)
+                self.assertTrue(delivered.startswith(f'<memory-harness use="{r["occurrence"]}" source="原话">'))
                 meta = json.loads(r['meta'])['expression']
                 self.assertEqual(meta['text_hash'], hashlib.sha256(delivered.encode()).hexdigest())
                 self.assertTrue(meta['source_raw'])

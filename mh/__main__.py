@@ -68,7 +68,7 @@ def main():
         x.add_argument("--session", default="", help="当前会话编号（开场推送会写进命令）")
         x.add_argument("--purpose", default="interactive", choices=list(synapse.PURPOSES))
         x.add_argument("--note", default="", help="一句话意见：好用、别扭、找不到……")
-    bl = sub.add_parser("standing", help="常态记忆：看某个工作区开场实际推送的文本（design/synapse/常态记忆.md + 记忆工具与常用入口 + 项目现状）")
+    bl = sub.add_parser("boot", aliases=["standing"], help="开场映像：看某个工作区开场实际推送的文本（design/synapse/core.md + 工具 + 项目现状 + 环境）")
     bl.add_argument("--cwd", default=os.getcwd())
     bl.add_argument("--host", default="claude", help="按哪个宿主看（宿主自己给了的节不给）")
     mp = sub.add_parser("roam", help="走记忆的地图（同 MCP 工具 roam）")
@@ -216,11 +216,9 @@ def main():
             print(pull.relive(conn, hs, said=args.said, source=args.source, recall=recall, **kw))
         else:
             print(pull.roam(conn, args.node, **kw))
-    elif args.cmd == "standing":
-        from .synapse import pull, push
-        from .synapse.push import status
-        now = status.read(push.workspace(args.cwd), host=args.host)
-        print(push.standing(args.cwd, push.entry(pull.layers(synapse.library()), args.cwd)) + ("\n\n" + now if now else ""))
+    elif args.cmd in ("boot", "standing"):
+        from .synapse import push
+        print(push.render(args.cwd, args.host))
     elif args.cmd == "backfill":
         from .engram import store as estore
         from .synapse import track

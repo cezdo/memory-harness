@@ -83,7 +83,7 @@ class Layers:
             self.nodes.setdefault(sid, e)                      # 还没挂上线的会话入口也能取到
         self.kids = defaultdict(list)
         for nid, n in self.nodes.items():
-            if n["parent"]:
+            if n["parent"] and not n.get("retired"):            # 清空了的线不列（旧句柄照样能打开）
                 self.kids[n["parent"]].append(nid)
         self.by_session = {n["session"]: nid for nid, n in self.nodes.items() if n["kind"] == "entry"}
         self.number(conn)
@@ -221,10 +221,24 @@ def _node_line(L, nid):
     if n["kind"] == "entry":
         return f"{L.where(nid)} {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n["kind"] == "line":
-        kids = [k for k in L.kids[nid] if L.nodes[k]["kind"] == "entry"]
-        last = max((L.nodes[k]["date"] for k in kids), default="")
-        return f"{nid} {n['name']}（{len(kids)} 个话题" + (f"，最近 {_day(last)}" if last else "") + "）"
+        return f"{nid} {n['name']}（{_size(L, nid)}）"
     return f"{nid} {n['name']}（骨架）"
+
+
+def _size(L, nid):
+    """线的规模：子线几条、下面一共几个话题、最近的日期（中间层的线下面是子线，2026-10-24）。"""
+    subs = [k for k in L.kids[nid] if L.nodes[k]["kind"] == "line"]
+    ents, todo = [], [nid]
+    while todo:
+        k = todo.pop()
+        ents += [x for x in L.kids[k] if L.nodes[x]["kind"] == "entry"]
+        todo += [x for x in L.kids[k] if L.nodes[x]["kind"] == "line"]
+    last = max((L.nodes[k]["date"] for k in ents), default="")
+    out = (f"{len(subs)} 条子线，共 " if subs else "") + f"{len(ents)} 个话题" + (f"，最近 {_day(last)}" if last else "")
+    if L.nodes[nid].get("retired"):
+        heads = [f"L{h}" for h in form.line_heads(L.conn, L.nodes[nid]["row"]) if f"L{h}" != nid] if L.conn else []
+        out += "；已清空，话题都改挂走了" + (f"，接替它的是 {'、'.join(heads)}" if heads else "")
+    return out
 
 
 _WIN = contextvars.ContextVar("pull_window", default=(SHOW, 1))     # 这次调用每页几条、第几页
@@ -293,7 +307,7 @@ def show_node(L, nid, recall=None, conn=None, start=0):
     kids = L.kids[nid]
     sub = _recent(L, [k for k in kids if L.nodes[k]["kind"] != "entry"])
     ents = sorted((k for k in kids if L.nodes[k]["kind"] == "entry"), key=lambda k: L.nodes[k]["date"], reverse=True)
-    kind = "骨架" if n["kind"] == "node" else f"{len(ents)} 个话题"
+    kind = "骨架" if n["kind"] == "node" else _size(L, nid)
     out = [f"[{nid}] {n['name']}（{n['ws'] or '工作区未知'}，{kind}）"]
     out += _cap([f"- {_node_line(L, k)}" for k in sub + ents], len(sub) + len(ents))
     ins = defaultdict(list)
@@ -585,7 +599,7 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", limit
     big = [w for w in words if L.corpus.share(w, ws) >= retrieve.UBIQUITOUS]   # 几乎处处都有的词：BM25 几路不拿它查（v0.12）；
     # 索引词那一路照旧拿全部查词，大词（两成以上）由它自己处理
     text_q = " ".join(w for w in words if w not in big)
-    rem = {"node": [nid for nid, _ in retrieve.search(words, text_q, L.nodes, ws, L.corpus, deep=True)
+    rem = {"node": [nid for nid, _ in retrieve.search(words, text_q, {k: v for k, v in L.nodes.items() if not v.get("retired")}, ws, L.corpus, deep=True)
                     if L.nodes[nid]["kind"] in GRAINS[g]],
            "stmt": [sid for sid, _ in L.stmt_index.top(text_q, None)] if g == "S" else []}
     for _ in range(p):
@@ -631,7 +645,7 @@ def _roam(conn, node, session, purpose, cwd, note):
     ins = {}
     if not node:
         def count(ws, kind):
-            return sum(1 for n in L.nodes.values() if n["ws"] == ws and n["kind"] == kind)
+            return sum(1 for n in L.nodes.values() if n["ws"] == ws and n["kind"] == kind and not n.get("retired"))
         order = sorted(roots, key=lambda w: (w != here, -count(w, "entry")))
         text = "\n".join(f"- {ws}{'（当前）' if ws == here else ''}：{count(ws, 'line')} 条话题线，{count(ws, 'entry')} 个话题"
                          for ws in order)

@@ -33,16 +33,16 @@ name = "用户"
 aliases = []
 
 [resources]
-standing = "~/.config/memory-harness/standing.md"
+core = "~/.config/memory-harness/core.md"
 glossary = "~/.config/memory-harness/glossary.md"
 workspace_status = "~/.config/memory-harness/workspace-status"
 ```
 
-These optional texts are maintained by each user: standing context is injected at session start; glossary aliases use headings such as `**Full name / alias**`; workspace status uses `<workspace>.md` files. The distribution excludes personal profiles, real conversations and private design documents.
+These optional texts are maintained by each user: the core text (`core.md`) opens every session; glossary aliases use headings such as `**Full name / alias**`; workspace status uses `<workspace>.md` files. The distribution excludes personal profiles, real conversations and private design documents.
 
 Project design, interfaces, contributor rules and public introductions use “user” for the role. Replies, reports and documents addressed directly to a person use “you” and their preferred name when a name is needed. The model refers to itself as “I”. Choose wording for the audience, purpose and narrative viewpoint; preserve a document’s viewpoint when presenting it to a model. Runtime records and prompts use `[user].name` (default: “用户”); `[user].aliases` supplies other recognized names. Keep personal names and naming preferences in instance configuration or a profile outside the repository. Original conversations and existing memories retain their recorded names.
 
-Writing prompts and memory delivery share the expression rules in `mh.express`. Source bodies remain intact; viewpoint notes distinguish authors, addressees and readers. Input and delivery records retain the naming context and rule version. Private aliases supply retrieval candidates and separate naming hints; context distinguishes namesakes. Use the `use` ID at the end of a memory response for wording feedback: `feedback(scope="presentation", use=<id>, reason="...")`. Default record feedback handles errors in the underlying record. Presentation feedback preserves source records and does not count as a new memory exposure. Private instances continue using configured names; this feature does not guarantee anonymous model inputs.
+Writing prompts and memory delivery share the expression rules in `mh.express`. Source bodies remain intact, with viewpoints understood by author, addressee and reader. Input and delivery records retain the naming context and rule version. Private aliases supply retrieval candidates and separate naming hints; context distinguishes namesakes. Memory sent to a model is wrapped in `<memory-harness use="…">`; verbatim source text also carries `source="原话"`. Use the tag's `use` ID for wording feedback: `feedback(scope="presentation", use=<id>, reason="...")`. Default record feedback handles errors in the underlying record. Presentation feedback preserves source records and does not count as a new memory exposure. Private instances continue using configured names; this feature does not guarantee anonymous model inputs.
 
 | Environment variable | Purpose |
 |---|---|
@@ -56,6 +56,19 @@ Writing prompts and memory delivery share the expression rules in `mh.express`. 
 
 Optional tools default to paths under `/usr/local/mh-tools/`: `ltp/venv/bin/python`, `ltp/model`, `lexicon/`, `typesafe/venv/bin/python` and `mh-count/mh-count`. Install tools, model weights and lexicons separately; they are excluded from the distribution. LTP and TypeSafe helper Python processes execute scripts bundled with the package.
 
+## Core and session-start context
+
+`[resources].core` selects the core file. Without an explicit setting, it reads `core.md` next to the instance configuration, with fallback support for the old `standing` setting and `standing.md`. Session-start context contains the core, tool instructions, workspace status and environment, in that order. Environment fields include time, host, model and startup mode; unavailable host fields are omitted. The tidy loop updates workspace status with recently paused sessions; a resumed session excludes itself.
+
+Install the core-editing command and hooks separately. Preview first, then apply if wanted:
+
+```sh
+python3 -m mh.synapse.push.elevate
+python3 -m mh.synapse.push.elevate --apply
+```
+
+The installer adds a command or skill and hooks for Claude Code and Codex. Trust new Codex hooks in `/hooks`. Enter `/mhcore <request>` in Claude Code or `$mhcore <request>` in Codex to allow core edits for that turn. The window closes at turn end, on the next input, or after 30 minutes. Changes are logged in `$MH_HOME/kernel-log.jsonl`. Granting and blocking have been tested in Claude Code; Codex host enforcement still needs live verification, and dsh support is pending. Hooks check edit-tool target paths; shell writes are recorded by later comparison. Hook errors allow the operation and write an error log.
+
 ## Use and integration
 
 ```sh
@@ -67,6 +80,8 @@ mh relive L3:T5 --said
 ```
 
 `collect` reads local host conversations and saves their original text to the instance. Confirm the data directory first. Originals may contain credentials and other sensitive content; keep databases and generated reading pages private. `evoke` searches by words, `relive` expands handles and traces original statements, and `roam` browses workspaces, lines and topics.
+
+`mh boot` previews session-start context for the current workspace; `mh standing` remains an alias. Topic lines can contain child lines; reading shows child-line counts, total topics and the latest date. Emptied lines are excluded from search and maps, while old handles still open and show replacement lines. MCP calls with unknown argument names or missing required arguments return specific errors and the supported arguments.
 
 Configure an MCP host with this standard-input/output server command:
 

@@ -91,3 +91,61 @@ class SentWordsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RecentTest(unittest.TestCase):
+    """最近停下的几件事：fork 去重、一行的写法、开场去掉当前会话。"""
+
+    def item(self, session, first, last, title='?unknown', said='接着做'):
+        from datetime import datetime
+        human = [{'text': first, 'user': '第一句', 'started': '2026-10-24T01:00:00Z'},
+                 {'text': first + 'x', 'user': said, 'started': '2026-10-24T02:00:00Z'}]
+        return {'source': 'claude', 'session': session, 'title': title, 'human': human,
+                'last': datetime.fromisoformat(last)}
+
+    def test_forks_collapse_to_latest(self):
+        from . import recent
+        items = [self.item('b', 't1', '2026-10-24T03:00:00+00:00'), self.item('a', 't1', '2026-10-24T02:00:00+00:00'),
+                 self.item('c', 't2', '2026-10-24T01:00:00+00:00')]
+        self.assertEqual([x['session'] for x in recent.dedupe(items)], ['b', 'c'])
+
+    def test_line_falls_back_to_first_words_and_cuts(self):
+        from . import recent
+        x = self.item('a', 't', '2026-10-24T03:00:00+00:00', said='长' * 80)
+        got = recent.line(x, 'L44:T1', '提交说明')
+        self.assertIn('第一句（2 轮，L44:T1）', got)
+        self.assertIn('最后提交：提交说明；你最后说：' + '长' * recent.SAID + '……', got)
+
+    def test_drop_self_and_cut(self):
+        from . import recent
+        body = '\n'.join(f'- 10-24 0{i}:00 · Claude Code · 事{i}（1 轮，claude:s{i}，还没整理）\n  - 你最后说：好 <!-- claude:s{i} -->'
+                         for i in range(4))
+        text = '## 项目现状\n\n### 服务\n- 在跑\n\n' + recent.TITLE + '\n' + body
+        got = recent.drop_self(text, 'claude', 's0')
+        self.assertNotIn('事0', got)
+        self.assertEqual(got.count('\n- 10-24'), recent.N)
+        self.assertNotIn('<!--', got)
+        self.assertIn('### 服务\n- 在跑', got)
+        self.assertEqual(recent.drop_self('没有这一节', 'claude', 's0'), '没有这一节')
+
+
+class BootTest(unittest.TestCase):
+    """开场映像的几处程序生成：检查只推变了的、环境段。"""
+
+    def test_check_only_changes(self):
+        from datetime import datetime
+        from .status import changed
+        now = "检查了 10 份原文\n- 指向按要求删掉的（条数）：10\n- observe：待观测（还没预览）：28（例：x）\n- 记下的引用未命中（event，条数）：80"
+        before = "检查了 9 份原文\n- 指向按要求删掉的（条数）：10\n- observe：待观测（还没预览）：3（例：y）\n- 记下的引用未命中（event，条数）：79"
+        at = datetime(2026, 10, 24, 17, 4)
+        self.assertEqual(changed(now, (at, before)), ["- 记下的引用未命中（event，条数）：80（上次：79）"])
+        self.assertEqual(changed(before, (at, before)), ["- 和上一次（10-24 17:04）比没有变化"])
+        self.assertEqual(len(changed(now, None)), 4)                    # 没有上一次：全推
+        self.assertIn("（新出现）", changed(now + "\n- 新的一类（条数）：1", (at, now))[0])
+
+    def test_environment(self):
+        from datetime import datetime
+        from . import environment
+        got = environment("claude", "compact", "claude-opus-5-5", now=datetime(2026, 10, 24, 17, 40))
+        self.assertEqual(got, "## 环境\n\n2026-10-24 17:40 Sat | Claude Code | claude-opus-5-5 | compact")
+        self.assertEqual(environment("dsh", now=datetime(2026, 10, 24, 17, 40)), "## 环境\n\n2026-10-24 17:40 Sat | dsh")

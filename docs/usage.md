@@ -33,16 +33,16 @@ name = "用户"
 aliases = []
 
 [resources]
-standing = "~/.config/memory-harness/standing.md"
+core = "~/.config/memory-harness/core.md"
 glossary = "~/.config/memory-harness/glossary.md"
 workspace_status = "~/.config/memory-harness/workspace-status"
 ```
 
-这三类文本由使用者自行维护，可省略：常态记忆用于开场推送；词典用于术语别名，词头形如 `**完整名字 / alias**`；项目现状目录放 `<工作区>.md`。发行包不包含个人 profile、真实对话和开发设计文档。
+这三类文本由使用者自行维护，可省略：内核（`core.md`）放在每次开场的最前面；词典用于术语别名，词头形如 `**完整名字 / alias**`；项目现状目录放 `<工作区>.md`。发行包不包含个人 profile、真实对话和开发设计文档。
 
 项目设计、接口、协作规则和公开介绍用“用户”描述角色；直接给本人阅读的回复、报告和文档用“你”，需要称呼时按私有偏好使用名字。模型自称“我”。人称按读者、用途和叙述视角选择，模型读取文档时保留该文档的视角。运行时记录和提示词使用 `[user].name`（默认“用户”），识别其他称呼使用 `[user].aliases`。个人名字和称呼偏好放在仓库外的实例配置或 profile；原始对话与已有记忆保留原来的称呼。
 
-写入提示词与记忆读取共用 `mh.express` 的表达规范。程序保留正文，附上作者、受话人和读者的视角提示；当次称呼及规则版本随输入和送达记录保存。个人别名也会作为检索候选和单独的称呼线索供给模型，同名对象按上下文判断。记忆返回末尾的 `use` 编号可用于呈现反馈：`feedback(scope="presentation", use=<编号>, reason="...")`；记录内容有误时使用默认的记录反馈。呈现反馈不改源记录、不计作一次新的记忆曝光。私有实例继续使用配置中的名字，本功能不提供输入匿名化保证。
+写入提示词与记忆读取共用 `mh.express` 的表达规范。程序保留正文，按作者、受话人和读者理解视角；当次称呼及规则版本随输入和送达记录保存。个人别名也会作为检索候选和单独的称呼线索供给模型，同名对象按上下文判断。送给模型的记忆包在 `<memory-harness use="…">` 标签内，原话另带 `source="原话"`。标签中的 `use` 编号可用于呈现反馈：`feedback(scope="presentation", use=<编号>, reason="...")`；记录内容有误时使用默认的记录反馈。呈现反馈不改源记录、不计作一次新的记忆曝光。私有实例继续使用配置中的名字，本功能不提供输入匿名化保证。
 
 | 环境变量 | 用途 |
 |---|---|
@@ -56,6 +56,19 @@ workspace_status = "~/.config/memory-harness/workspace-status"
 
 可选工具的缺省路径位于 `/usr/local/mh-tools/`：`ltp/venv/bin/python`、`ltp/model`、`lexicon/`、`typesafe/venv/bin/python`、`mh-count/mh-count`。工具、模型权重与词库需自行准备，发行包不附带。LTP 和 TypeSafe 的辅助 Python 进程直接执行包内脚本。
 
+## 内核与开场映像
+
+`[resources].core` 指向内核文件；没有显式配置时读取实例配置旁的 `core.md`，兼容旧的 `standing` 配置和 `standing.md`。开场映像依次包含内核、工具说明、项目现状和环境（时间、宿主、模型、启动方式；宿主未提供的字段省略）。项目现状由整理循环更新，包含最近停下的会话；恢复会话时不列自己。
+
+内核态的命令与钩子需要另行安装，先预览，再按需执行：
+
+```sh
+python3 -m mh.synapse.push.elevate
+python3 -m mh.synapse.push.elevate --apply
+```
+
+安装器为 Claude Code 和 Codex 添加命令或 skill 及钩子；Codex 新钩子还需在 `/hooks` 中信任。用户在 Claude Code 输入 `/mhcore <要求>`，在 Codex 输入 `$mhcore <要求>`，允许这一轮修改内核；轮次结束、下次输入或超过 30 分钟时关闭窗口。日志在 `$MH_HOME/kernel-log.jsonl`。Claude Code 的提权与拦截已实测，Codex 的宿主拦截效果待实测，dsh 尚未接入。钩子检查编辑工具的目标路径，shell 写入由事后比对记录；钩子出错时放行并写错误日志。
+
 ## 使用与接入
 
 ```sh
@@ -67,6 +80,8 @@ mh relive L3:T5 --said
 ```
 
 `collect` 会读取本机宿主会话并将原文保存到实例中；执行前确认数据目录。原文可能含凭据等敏感内容，数据库和输出阅读页应私有保存。`evoke` 按词找，`relive` 按句柄展开并回到原话，`roam` 浏览工作区、话题线和话题。
+
+`mh boot` 预览当前工作区的开场映像，旧命令 `mh standing` 仍可用。话题线可包含子线，读取时显示子线数、话题总数和最近日期；清空的线不再列入检索与地图，旧句柄仍能打开并查看接替线。MCP 调用写错参数名或缺少必填参数时，会返回具体错误和可用参数说明。
 
 需要 MCP 的宿主可将服务命令配置为：
 

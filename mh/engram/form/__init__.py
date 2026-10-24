@@ -23,6 +23,7 @@ import collections
 import concurrent.futures
 import hashlib
 import json
+import math
 import re
 import sys
 import types
@@ -44,8 +45,8 @@ PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数
 CURRENT = {"pack": ("sol-low", "pack-v0.3"),   # v0.3：结构标记写『引用：』『文件：』（2026-10-22，用户看过样本）
            "label": ("sol-low", "label-v0.2"),
-           "attach": ("sol-low", "attach-v0.2"),               # 有骨架的工作区（v0.2：句柄写 L3，2026-10-19）
-           "attach_lines": ("sol-low", "attach-lines-v0.2"),   # 没骨架的工作区：只有线（v0.2：已有的入口可能比新文件夹晚，2026-10-19）
+           "attach": ("sol-low", "attach-v0.3"),               # 有骨架的工作区（v0.3：判据是以后能不能找到，目标只是线索，2026-10-24 L44）
+           "attach_lines": ("sol-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
            "restate": ("sol-low", "restate-v0.1")}             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
 STEP_OF = {"attach_lines": "attach"}                           # act 里记的 step
 MODELS = {"sol-low": lambda: invoke.whole(Codex("gpt-6.1-sol", "low"))}
@@ -53,6 +54,7 @@ DESC = {"sol-low": "gpt-6.1-sol low（经 codex exec）"}          # 环境里�
 MAX_FAILURES = 3
 IDLE = 3600              # 会话最后一轮开始后这么久没有新的一轮，就算告一段落
 MAX_CHARS = 40000        # 一个单位的 E 最多这么多字，超过按轮切开
+LINE_SHARE = 0.2         # 线的索引词：至少这么多比例（且至少两个）的子入口都有的组（2026-10-24，L44：取全集时 69 个话题攒了 210 组、41% 的挂线候选里有它）
 NEW_SCALES = ("turns", "segment")     # 新做法读出的 E（一轮或多轮）；segment 是 2026-10-17 上线当天的写法
 
 
@@ -66,7 +68,7 @@ def window_params(step):
         return {"terms": "label.terms-v7", "aliases": "glossary", "similar": "retrieve.word_hits(名字)", "similar_top": label.SIMILAR_TOP,
                 "dedup": "label.dedup", "fork": "shared-statements-v1"}
     return {"key_top": retrieve.KEY_TOP, "handles": "L3/T5", "bm25_top": retrieve.BM25_TOP, "big": retrieve.BIG, "aliases": "glossary",
-            "skeleton": step == "attach", **({"reach": "store.reachable-v2"} if step.startswith("attach") else {})}
+            "skeleton": step == "attach", "line_share": LINE_SHARE, **({"reach": "store.reachable-v2"} if step.startswith("attach") else {})}
 
 
 def operator(conn, step):
@@ -457,9 +459,12 @@ def entries(conn, h=None):
 
 
 def line_words(pool, line):
-    """线的索引词由程序从子会话入口合成：线名一组，再加至少两个子会话入口都有的组（归一后的词有交集算同一组）。"""
+    """线的索引词由程序从子会话入口合成：线名一组，再加足够多子会话入口都有的组（归一后的词有交集算同一组）：
+    至少两个、且至少 LINE_SHARE 的子入口。只要两个就收的话，成员越多并集越大、越常进候选、挂进来的越多（L44）。"""
     groups = []
-    for kid in [e for e in pool.values() if e["parent"] == line and e["kind"] == "entry"]:
+    kids = [e for e in pool.values() if e["parent"] == line and e["kind"] == "entry"]
+    need = max(2, math.ceil(LINE_SHARE * len(kids)))
+    for kid in kids:
         for items in kid["words"]["lists"]:
             w = {retrieve.norm(a) for a in items}
             g = next((g for g in groups if g["words"] & w), None)
@@ -469,7 +474,7 @@ def line_words(pool, line):
                 g["kids"].add(kid["id"])
             else:
                 groups.append({"words": set(w), "items": list(items), "kids": {kid["id"]}})
-    return {"lists": [[pool[line]["name"]]] + [g["items"] for g in groups if len(g["kids"]) >= 2], "constraints": []}
+    return {"lists": [[pool[line]["name"]]] + [g["items"] for g in groups if len(g["kids"]) >= need], "constraints": []}
 
 
 def pool(conn):
@@ -496,6 +501,14 @@ def pool(conn):
             out[fid] = f
     for lid in [k for k, e in out.items() if e["kind"] == "line"]:
         out[lid]["words"] = line_words(out, lid)
+    live = set()                                    # 下面（含子线）还有话题的线；没有的是清空了的（话题都改挂走了，2026-10-24）
+    for e in out.values():
+        p = e["parent"] if e["kind"] == "entry" else None
+        while p and p not in live and out.get(p, {}).get("kind") == "line":
+            live.add(p)
+            p = out[p]["parent"]
+    for lid in [k for k, e in out.items() if e["kind"] == "line" and k not in live]:
+        out[lid]["retired"] = True
     return out
 
 
@@ -687,7 +700,7 @@ def build_attach(conn, u, label_act, the_pool, corpus):
     flat = [a for g in words["lists"] for a in g]
     reach = st.reachable(conn, ws)                   # 候选和检查用同一个范围：看得到的都挂得上
     home = lambda e: the_pool[e["parent"]]["ws"] if e["kind"] == "entry" and e["parent"] in the_pool else e["ws"]
-    view = {k: e for k, e in the_pool.items() if home(e) in reach}   # 会话入口按它所在的线算：模型挂的是那条线
+    view = {k: e for k, e in the_pool.items() if home(e) in reach and not e.get("retired")}   # 会话入口按它所在的线算：模型挂的是那条线
     picks = [eid for eid, _ in retrieve.search(flat, f["name"] + " " + f["topic"] + " " + " ".join(flat), view, ws, corpus)]
     entry = attach.entry_text(f["name"], f["topic"], stops, words, _date(conn, f["record"]))
     ns = skeleton.nodes(ws, conn)
@@ -715,6 +728,11 @@ def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_po
             error = f"content_error: {target} 不是已有的线"
         elif name is None and the_pool[target]["ws"] not in st.reachable(conn, u["session"]["workspace"]):
             error = f"content_error: {target} 属于别的工作区"
+        elif ns and node == ns[""]["id"] and "global" in ns:                    # 根下不挂线（2026-10-24）：跨模块的挂 global
+            node = ns["global"]["id"]
+            meta["root_to_global"] = True
+            if name is None and the_pool[target]["parent"] != node:
+                error = f"content_error: {target} 不在 global 下（根下不挂线）"
         elif ns and (not node or node not in {n["id"] for n in ns.values()}):
             error = f"content_error: 节点 {node} 不在骨架里"
         elif ns and name is None and the_pool[target]["parent"] != node:
@@ -978,10 +996,13 @@ def feedback_entry(conn, operator_id, entry_id, reason, name=None, topic=None, s
     return new
 
 
-def feedback_attach(conn, operator_id, entry_id, reason, line=None, new_line=None, node=None, holder="我"):
+def feedback_attach(conn, operator_id, entry_id, reason, line=None, new_line=None, node=None, holder="我",
+                    workspace=None, parent_line=None, from_=()):
     """挂线的反馈（主会话直写，2026-10-20 第一次用在 Synapse 换库的两段会话上）：把一个会话入口改挂到已有的线 line（L 编号），
     或者新起一条线 new_line（名字），有骨架的工作区要给节点 node（k-…）。一次 form 的 act（step = feedback，cause = manual），
-    新写一条挂线（同一个入口以最后一条为准），原来的挂线留着。线的工作区按这段会话的工作区（st.session_workspace）。返回挂到的线编号。"""
+    新写一条挂线（同一个入口以最后一条为准），原来的挂线留着。线的工作区按这段会话的工作区（st.session_workspace）。返回挂到的线编号。
+    2026-10-24（L44 按索引粗分）：workspace 把新线建在目标所属的项目（不按在哪个目录开的）；parent_line 让新线挂在一条线下面
+    （中间层，不占骨架节点）；from_ 是新线接替的旧线（搬线：C 的引用、旧句柄顺着 from 找到现在的线），和它们重名不算重名。"""
     f = conn.execute("SELECT * FROM session_entry WHERE id=?", (entry_id,)).fetchone()
     if f is None:
         raise ValueError(f"没有这个会话入口：T{entry_id}")
@@ -991,29 +1012,66 @@ def feedback_attach(conn, operator_id, entry_id, reason, line=None, new_line=Non
     if not reason.strip() or (line is None) == (new_line is None):
         raise ValueError("挂线的反馈要给理由，并且只给一个去处：已有的线，或者新线的名字")
     cwd = conn.execute("SELECT cwd FROM session_detail WHERE source=? AND session=?", (f["source"], f["session"])).fetchone()[0]
-    ws = st.session_workspace(f["source"], f["session"], cwd)
+    ws = workspace or st.session_workspace(f["source"], f["session"], cwd)
     ns = skeleton.nodes(ws, conn)
-    path = NA
+    path, par = NA, NA
     if new_line is not None:
-        if ns:
+        if parent_line is not None:
+            par = int(handle_of(parent_line)[1:])
+            if conn.execute("SELECT 1 FROM topic_line WHERE id=?", (par,)).fetchone() is None:
+                raise ValueError(f"没有这条线：{parent_line}")
+        elif ns:
             path = next((p for p, n in ns.items() if n["id"] == node), None)
             if path is None:
                 raise ValueError(f"节点 {node} 不在 {ws} 的骨架里")
-        if any(label.norm(l["name"]) == label.norm(new_line) for l in pool(conn).values() if l["kind"] == "line" and l["ws"] == ws):
+        old = {f"L{int(handle_of(x)[1:])}" for x in from_}
+        if any(label.norm(l["name"]) == label.norm(new_line) for k, l in pool(conn).items()
+               if l["kind"] == "line" and l["ws"] == ws and k not in old and not l.get("retired")):
             raise ValueError(f"「{new_line}」和 {ws} 已有的线重名：挂到那条线上")
     else:
         lid = int(handle_of(line)[1:])
         if conn.execute("SELECT 1 FROM topic_line WHERE id=?", (lid,)).fetchone() is None:
             raise ValueError(f"没有这条线：{line}")
-    change = {"line": line} if line is not None else {"new_line": new_line, "node": node}
+    change = {"line": line} if line is not None else {"new_line": new_line, "node": node, "workspace": ws,
+                                                        "parent_line": parent_line, "from": list(from_)}
     act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="session", inputs={"act": [f["born"]]},
                      cause="manual", outcome="ok")
     conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
                  (act, "form", "feedback", dumps({"entry": entry_id}), dumps(change), "", dumps({"reason": reason, "holder": holder})))
     if new_line is not None:
         lid = conn.execute('INSERT INTO topic_line(born, name, workspace, node, parent, "from") VALUES(?,?,?,?,?,?)',
-                           (act, new_line, ws, path, NA, "[]")).lastrowid
+                           (act, new_line, ws, path, par, dumps([int(handle_of(x)[1:]) for x in from_]))).lastrowid
     conn.execute("INSERT INTO attachment(born, entry, line, why) VALUES(?,?,?,?)", (act, entry_id, lid, f"反馈：{reason}"))
+    conn.commit()
+    return lid
+
+
+def feedback_line(conn, operator_id, name, reason, workspace, node=None, parent_line=None, from_=(), holder="我"):
+    """只建一条线的反馈（2026-10-24，L44 按索引粗分）：中间层的线下面先没有话题，只挂子线。有骨架的工作区给节点 node（k-…）
+    或父线 parent_line（L…），二者给一个；from_ 是它接替的旧线。一次 form 的 act（step = feedback，cause = manual）。返回线编号。"""
+    if not reason.strip() or not name.strip():
+        raise ValueError("建线的反馈要给名字和理由")
+    ns = skeleton.nodes(workspace, conn)
+    path, par = NA, NA
+    if parent_line is not None:
+        par = int(handle_of(parent_line)[1:])
+        if conn.execute("SELECT 1 FROM topic_line WHERE id=?", (par,)).fetchone() is None:
+            raise ValueError(f"没有这条线：{parent_line}")
+    elif ns:
+        path = next((p for p, n in ns.items() if n["id"] == node), None)
+        if path is None:
+            raise ValueError(f"节点 {node} 不在 {workspace} 的骨架里")
+    old = {f"L{int(handle_of(x)[1:])}" for x in from_}
+    if any(label.norm(l["name"]) == label.norm(name) for k, l in pool(conn).items()
+           if l["kind"] == "line" and l["ws"] == workspace and k not in old and not l.get("retired")):
+        raise ValueError(f"「{name}」和 {workspace} 已有的线重名")
+    act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="session", inputs={},
+                     cause="manual", outcome="ok")
+    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
+                 (act, "form", "feedback", dumps({"line": name}), dumps({"new_line": name, "node": node, "workspace": workspace,
+                  "parent_line": parent_line, "from": list(from_)}), "", dumps({"reason": reason, "holder": holder})))
+    lid = conn.execute('INSERT INTO topic_line(born, name, workspace, node, parent, "from") VALUES(?,?,?,?,?,?)',
+                       (act, name, workspace, path, par, dumps([int(handle_of(x)[1:]) for x in from_]))).lastrowid
     conn.commit()
     return lid
 

@@ -12,7 +12,6 @@ SOURCES = resource("workspace_status", Path(__file__).resolve().parents[3] / "de
 ACTIVE_DAYS = 3          # 近几天有提交算活跃
 COMMITS = 6              # 最近的提交列几条
 DIRTY = 6                # 没提交的改动列几个文件
-RECENT_TMP = 4           # tmp 里最近动过的列几个
 CUT = 72                 # 一行最多几个字
 ERR_HOURS = 6            # 服务看近几个小时的出错
 ERR = re.compile(r"：(env_error|timeout|content_error)：|出错：|Traceback")   # act 失败（observe、form 的日志行）、循环出错
@@ -62,30 +61,26 @@ def source(ws):
 
 
 def _dirs(repo, notes):
+    """目录压成一行（2026-10-24：说明和 AGENTS.md 重复，只留活跃度）：近几天有提交的、不进 git 的、很久没动的。"""
     since = (datetime.now() - timedelta(days=ACTIVE_DAYS)).strftime("%Y-%m-%d")
-    lines = []
     names = sorted(p.name + ("/" if p.is_dir() else "") for p in repo.iterdir() if not p.name.startswith("."))
     names = [n for n in names if n in notes or n.rstrip("/") in {x.rstrip("/") for x in notes}] + \
             [n for n in names if n not in notes and n.endswith("/")]
+    active, ignored, still = [], [], []
     for n in dict.fromkeys(names):
-        tags = []
         if subprocess.run(["git", "check-ignore", "-q", n], cwd=repo).returncode == 0:
-            tags.append("不进 git")
-            if n == "tmp/":
-                subs = sorted((p for p in (repo / "tmp").iterdir() if p.is_dir()), key=lambda p: -p.stat().st_mtime)
-                if subs:
-                    tags.append(f"{len(subs)} 个；最近：" + "、".join(f"{p.name}（{datetime.fromtimestamp(p.stat().st_mtime):%m-%d}）"
-                                                               for p in subs[:RECENT_TMP]))
+            ignored.append(n)
+            continue
+        k = len(_run(["git", "log", f"--since={since}", "--format=%h", "--", n], repo).splitlines())
+        if k:
+            active.append(f"{n}（{k}）")
         else:
-            k = len(_run(["git", "log", f"--since={since}", "--format=%h", "--", n], repo).splitlines())
-            if k:
-                tags.append(f"活跃，近 {ACTIVE_DAYS} 天 {k} 次提交")
-            else:
-                last = _run(["git", "log", "-1", "--format=%cs", "--", n], repo)
-                tags.append(f"{last[5:]} 以后没动" if last else "没进过提交")
-        note = notes.get(n) or notes.get(n.rstrip("/")) or ""
-        lines.append(f"- {n} [{'；'.join(tags)}]" + (f" {note}" if note else ""))
-    return lines
+            last = _run(["git", "log", "-1", "--format=%cs", "--", n], repo)
+            still.append(f"{n}（{last[5:]} 起）" if last else n)
+    bits = [f"近 {ACTIVE_DAYS} 天有提交：" + "、".join(active)] if active else []
+    bits += ["不进 git：" + "、".join(ignored)] if ignored else []
+    bits += ["没动：" + "、".join(still)] if still else []
+    return ["- " + "；".join(bits)] if bits else []
 
 
 def _worktrees(repo):
@@ -108,19 +103,21 @@ def _worktrees(repo):
 
 
 def _services(names):
-    out = []
+    """都在跑、近几个小时没出错就压成一行；有异常的才单列（2026-10-24：只推异常）。"""
+    ok, bad = [], []
     for s in names:
-        st = _run(["systemctl", "--user", "show", s, "-p", "ActiveState", "-p", "ActiveEnterTimestamp", "--value"]).splitlines()
+        st = _run(["systemctl", "--user", "show", s, "-p", "ActiveState", "--value"]).strip()
         if not st:
             continue
-        state, since = (st + ["", ""])[:2]
-        last = _run(["journalctl", "--user", "-u", s, "-n", "1", "-o", "cat", "--no-pager"])
         errs = [x for x in _run(["journalctl", "--user", "-u", s, "--since", f"-{ERR_HOURS}h", "-o", "short-iso",
                                  "--no-pager"]).splitlines() if ERR.search(x)]
-        out.append(f"- {s}：{'在跑' if state == 'active' else state}" + (f"（{since.split(' ')[1][5:]} {since.split(' ')[2][:5]} 起）"
-                                                                          if state == "active" and len(since.split(" ")) > 2 else "")
-                   + (f"；最近：{_cut(last, 50)}" if last else "") + _errors(errs))
-    return out
+        short = s.removeprefix("memory-harness-")
+        if st == "active" and not errs:
+            ok.append(short)
+        else:
+            bad.append(f"- {s}：{'在跑' if st == 'active' else st}" + (_errors(errs) if errs else ""))
+    head = [f"- {'、'.join(ok)} {'都' if len(ok) > 1 else ''}在跑，近 {ERR_HOURS} 小时没有出错"] if ok else []
+    return head + bad
 
 
 def _errors(lines):
@@ -138,14 +135,14 @@ def compile(ws, home=None):
     if not cfg or not cfg["repo"] or not (cfg["repo"] / ".git").exists():
         return None
     repo = cfg["repo"]
-    parts = ["### 目录（[活跃] = 近 %d 天有提交）" % ACTIVE_DAYS, *_dirs(repo, cfg["notes"])]
+    parts = ["### 目录", *_dirs(repo, cfg["notes"])]
     wts = _worktrees(repo)
     if wts:
         parts.append("- 别处的 worktree：" + "；".join(wts))
     log = _run(["git", "log", f"-{COMMITS}", "--format=%h %cd %s", "--date=format:%m-%d %H:%M"], repo).splitlines()
     if log:
         parts += ["", "### 最近的提交", *[f"- {_cut(x)}" for x in log]]
-    dirty = [x[3:] for x in _run(["git", "status", "--porcelain"], repo).splitlines() if x.strip()]
+    dirty = [x[3:] for x in _run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], repo).splitlines() if x.strip()]
     parts += ["", "### 没提交的改动"] + ([f"- {len(dirty)} 个文件（可能是别的会话做到一半）：" + "、".join(dirty[:DIRTY])
                                          + ("……" if len(dirty) > DIRTY else "")] if dirty else ["- 没有"])
     svc = _services(cfg["services"])
@@ -154,8 +151,26 @@ def compile(ws, home=None):
     check = _read_stamped((home or _out()) / f"{ws}.check") if cfg["check"] else None
     if check:
         at, body = check
-        parts += ["", f"### 检查（`{cfg['check']}`，{at:%m-%d %H:%M} 跑）", *(x for x in body.splitlines() if x.strip())]
+        prev = _read_stamped((home or _out()) / f"{ws}.check.prev")
+        parts += ["", f"### 检查（`{cfg['check']}`，{at:%m-%d %H:%M} 跑）", *changed(body, prev)]
+    near = _recent(ws)                 # 放最后：开场时 recent.drop_self 只切这一节
+    if near:
+        parts += ["", near]
     return "\n".join(parts)
+
+
+def _recent(ws):
+    """最近停下的几件事（recent.py）；读库出任何错都不给这一节，不影响项目现状。"""
+    try:
+        from .. import library
+        from . import recent
+        conn = library()
+        try:
+            return recent.compile(conn, ws)
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 def run_check(ws, home=None):
@@ -170,8 +185,32 @@ def run_check(ws, home=None):
         text = f"（超过 {CHECK_TIMEOUT} 秒没跑完）"
     d = home or _out()
     d.mkdir(parents=True, exist_ok=True)
+    if (d / f"{ws}.check").exists():                    # 上一次的留一份，编现状时只推变了的
+        (d / f"{ws}.check").replace(d / f"{ws}.check.prev")
     (d / f"{ws}.check").write_text(f"<!-- 编于 {datetime.now(timezone.utc).isoformat(timespec='seconds')} -->\n{text}\n")
     return True
+
+
+VOLATILE = ("observe：待观测",)       # 每次都在变、不算异常的项
+
+
+def _key(line):
+    """一行检查结果的键：数字前面那部分（“- 记下的引用未命中（event，条数）”）。"""
+    return re.split(r"：\s*\d", line, 1)[0]
+
+
+def changed(body, prev):
+    """检查结果只推和上一次相比变了的项（2026-10-24）：新出现的、数字变了的；第一行的总数和 VOLATILE 不算。
+    没有上一次就全推；都没变就一行。"""
+    lines = [x for x in body.splitlines() if x.strip().startswith("- ")]
+    if not prev:
+        return [x for x in body.splitlines() if x.strip()]
+    at, old = prev
+    before = {_key(x): x for x in old.splitlines() if x.strip().startswith("- ")}
+    was = lambda k: before[k][len(k):].lstrip("：").strip()[:30]
+    diff = [x + (f"（上次：{was(_key(x))}）" if _key(x) in before else "（新出现）")
+            for x in lines if before.get(_key(x)) != x and not any(v in x for v in VOLATILE)]
+    return diff or [f"- 和上一次（{at:%m-%d %H:%M}）比没有变化"]
 
 
 def _read_stamped(f):
