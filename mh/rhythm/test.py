@@ -160,5 +160,43 @@ class RhythmTest(unittest.TestCase):
         self.assertEqual(form_once(conn, log=io.StringIO(), models=models), (0, 0))
         self.assertFalse(conn.in_transaction)
 
+class QuotaCacheTest(unittest.TestCase):
+    """Claude 的额度接口限流：读到的缓存 CLAUDE_TTL 秒，期间不再请求；读不到退回缓存并注明。"""
+
+    def setUp(self):
+        from . import quota
+        self.quota, self.old = quota, quota.CLAUDE_CACHE
+        self.tmp = tempfile.TemporaryDirectory()
+        quota.CLAUDE_CACHE = Path(self.tmp.name) / "quota-claude.json"
+
+    def tearDown(self):
+        self.quota.CLAUDE_CACHE = self.old
+        self.tmp.cleanup()
+
+    def test_cache_then_stale(self):
+        import ssl, urllib.error
+        q, calls = {"name": "claude", "plan": "pro", "windows": [], "ok": True}, []
+
+        def ok():
+            calls.append(1)
+            return q
+
+        def cut():
+            raise urllib.error.URLError(ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred"))
+        self.assertEqual(self.quota.claude(fetch=ok, now=1000), q)
+        self.assertEqual(self.quota.claude(fetch=ok, now=1000 + 60), q)              # TTL 内不再请求
+        self.assertEqual(len(calls), 1)
+        got = self.quota.claude(fetch=cut, now=1000 + self.quota.CLAUDE_TTL + 60)    # 过了 TTL、被掐断：退回缓存
+        self.assertIn("限流", got["stale"])
+        self.assertIn("（", self.quota.text([got]))
+
+    def test_no_cache_limited(self):
+        def cut():
+            raise urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+        import urllib.error
+        with self.assertRaisesRegex(RuntimeError, "限流"):
+            self.quota.claude(fetch=cut, now=0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 // memory-harness Synapse 接入 dsh（web profile 的 bundle；2026-10-15：把 Claude 那套推送换进 dsh，前后对照）。
 //
 // 三件事，Python 侧与 Claude 共用同一套入口，只在 JSON 里多带 host: "dsh"：
-// - 开场推送：agent/created → `python3 -m mh inject`（开场映像：内核 + 工具 + 项目现状 + 环境），作为一条 user 消息注入；
+// - 手记推送：agent/created → `python3 -m mh inject`（手记：内核 + 工具 + 项目现状 + 环境），作为一条 user 消息注入；
 // - 联想：agent/pre-step → `python3 -m mh.synapse.push.associate`。只把 source.kind 为 user 的话送去联想；
 //   goal、子代理通知、别的 agent 发来的消息记成宿主事件（host_kind），工作区说明、运行时快照这类每步都有的不送；
 // - 拉取：自己连 `python3 -m mh.synapse.pull.mcp`（stdio，一行一条 JSON-RPC），工具名照 Claude 的 mcp__mh__search/get/map，
@@ -9,7 +9,7 @@
 //   不用 dsh-mcp-client：一个进程里的会话共用一个服务进程、环境被清洗，服务拿不到是哪段会话在拉取。
 //
 // 不走 dsh-hooks-claude-code 桥接：桥接把一步里所有待处理消息不分来源拼成 prompt（工作区说明会触发联想），
-// SessionStart 也是脱离运行、可能赶不上第一轮。这里 agent/created 被等待，开场映像一定在第一轮之前。
+// SessionStart 也是脱离运行、可能赶不上第一轮。这里 agent/created 被等待，手记一定在第一轮之前。
 //
 // 只用 node 内置模块：本包经 link: 指向仓库，import 按真实路径解析，找不到 profile 的 node_modules。
 import { spawn } from "node:child_process";
@@ -23,7 +23,7 @@ export const inject = ["tools"];
 
 // 仓库根：本包在仓库的 mh/synapse/hosts/dsh/ 下，从模块目录往上找含 mh/__init__.py 的那一层。
 // 不写死层数：E2 把插件从 mh/synapse/dsh/ 搬到 hosts/dsh/ 后，三层上变成了 mh/，
-// 三个 python 入口全部 No module named mh，开场推送、联想、拉取一起静默失效（2026-10-22）。
+// 三个 python 入口全部 No module named mh，手记推送、联想、拉取一起静默失效（2026-10-22）。
 function repoRoot(start) {
   for (let d = start; ; d = dirname(d)) {
     if (existsSync(join(d, "mh", "__init__.py"))) return d;
@@ -139,7 +139,7 @@ export async function apply(ctx, config) {
   // 仓库根认错时三个入口会一起失败，只剩日志里的一行 warn；启动时先说清楚（2026-10-22 的 E2 就是这样漏过去的）
   if (!existsSync(join(cfg.repo, "mh", "__init__.py"))) log.warn(`mh-synapse: 仓库根不对（${cfg.repo} 下没有 mh/__init__.py），python 入口会失败`);
 
-  // 开场推送
+  // 手记推送
   ctx.on("agent/created", async ({ agent, source }) => {
     try {
       const h = agent.session.header;
@@ -147,11 +147,11 @@ export async function apply(ctx, config) {
       const r = await runPy(cfg, ["-m", "mh", "inject"], {
         session_id: h.id, cwd: h.cwd ?? "", source, host: "dsh", hook_event_name: "SessionStart", transcript_path: "",
       }, cfg.injectTimeoutMs);
-      if (!r.ok) log.warn(`mh-synapse: 开场推送失败：${r.err.slice(-500)}`);
+      if (!r.ok) log.warn(`mh-synapse: 手记推送失败：${r.err.slice(-500)}`);
       const text = contextOf(r);
       if (text) agent.inject(message("SessionStart", "assist", text));
     } catch (e) {
-      log.warn(`mh-synapse: 开场推送出错：${e?.message || e}`);
+      log.warn(`mh-synapse: 手记推送出错：${e?.message || e}`);
     }
   });
 

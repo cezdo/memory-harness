@@ -70,8 +70,8 @@ def _line(ev):
     """一行里放人看的东西；jsonl 里有而这里没有的字段（目录、正文、Atlas 版本以外的细节）去 jsonl 找。"""
     body = []
     if ev["kind"] == "assist":
-        head = f"**{ev['at'][11:19]}** · {ev.get('host') or '?'} · 开场推送"
-        body.append(ev.get("summary", "").removeprefix("开场推送："))
+        head = f"**{ev['at'][11:19]}** · {ev.get('host') or '?'} · 手记推送"
+        body.append(ev.get("summary", "").removeprefix("手记推送："))
         if ev.get("knowledge"):
             body.append("推送 " + "、".join(f"K{k}" for k in ev["knowledge"]))
         if ev.get("workspace"):

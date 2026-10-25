@@ -94,7 +94,7 @@ if __name__ == '__main__':
 
 
 class RecentTest(unittest.TestCase):
-    """最近停下的几件事：fork 去重、一行的写法、开场去掉当前会话。"""
+    """最近停下的几件事：fork 去重、一行的写法、送手记时去掉当前会话。"""
 
     def item(self, session, first, last, title='?unknown', said='接着做'):
         from datetime import datetime
@@ -130,7 +130,7 @@ class RecentTest(unittest.TestCase):
 
 
 class BootTest(unittest.TestCase):
-    """开场映像的几处程序生成：检查只推变了的、环境段。"""
+    """手记的几处程序生成：检查只推变了的、环境段。"""
 
     def test_check_only_changes(self):
         from datetime import datetime

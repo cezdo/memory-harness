@@ -1,6 +1,6 @@
-"""开场推送的“项目现状”（design/synapse/设计.md，2026-10-20）：新会话一开头要 ls、git log、看服务、跑检查才摸得清项目，
+"""手记推送的“项目现状”（design/synapse/设计.md，2026-10-20）：新会话一开头要 ls、git log、看服务、跑检查才摸得清项目，
 这些由程序事先编好。手写的部分在 design/synapse/workspace-status/<工作区>.md（仓库、服务、检查命令、目录说明），其余从 git、
-systemd 和检查命令读。整理循环（rhythm --tidy）定时调 write 编好、调 run_check 跑检查，都存进数据目录；开场推送只读编好的（read），
+systemd 和检查命令读。整理循环（rhythm --tidy）定时调 write 编好、调 run_check 跑检查，都存进数据目录；手记推送只读编好的（read），
 按宿主去掉它自己给了的节，读不到就不给这一节。纯程序。"""
 import re
 import subprocess
@@ -16,7 +16,7 @@ CUT = 72                 # 一行最多几个字
 ERR_HOURS = 6            # 服务看近几个小时的出错
 ERR = re.compile(r"：(env_error|timeout|content_error)：|出错：|Traceback")   # act 失败（observe、form 的日志行）、循环出错
 CHECK_TIMEOUT = 300      # 检查命令最多跑几秒
-# 宿主自己在开场给了的，不再给（2026-10-20）：Claude Code 自带 git 状态和最近 5 次提交
+# 宿主自己在会话接入时给了的，不再给（2026-10-20）：Claude Code 自带 git 状态和最近 5 次提交
 HOST_GIVES = {"claude": ("最近的提交", "没提交的改动")}
 
 
@@ -153,7 +153,7 @@ def compile(ws, home=None):
         at, body = check
         prev = _read_stamped((home or _out()) / f"{ws}.check.prev")
         parts += ["", f"### 检查（`{cfg['check']}`，{at:%m-%d %H:%M} 跑）", *changed(body, prev)]
-    near = _recent(ws)                 # 放最后：开场时 recent.drop_self 只切这一节
+    near = _recent(ws)                 # 放最后：送手记时 recent.drop_self 只切这一节
     if near:
         parts += ["", near]
     return "\n".join(parts)
@@ -236,7 +236,7 @@ def write(ws, home=None):
 
 
 def read(ws, home=None, host=None):
-    """开场推送用：编好的项目现状，带编好的时刻，去掉这个宿主自己给了的节（HOST_GIVES）；没有就返回 ""。"""
+    """手记推送用：编好的项目现状，带编好的时刻，去掉这个宿主自己给了的节（HOST_GIVES）；没有就返回 ""。"""
     got = _read_stamped((home or _out()) / f"{ws}.md")
     if not got:
         return ""
@@ -245,7 +245,7 @@ def read(ws, home=None, host=None):
     if drop:
         body = "\n\n".join(p for p in re.split(r"\n\n(?=### )", body)
                            if not any(p.startswith(f"### {h}") for h in drop)).strip()
-    return f"## 项目现状（{ws}，{at:%m-%d %H:%M} 编）\n\n{body}" if at else f"## 项目现状（{ws}）\n\n{body}"
+    return f"## 近况（{ws}，{at:%m-%d %H:%M} 编）\n\n{body}" if at else f"## 近况（{ws}）\n\n{body}"
 
 
 def workspaces():

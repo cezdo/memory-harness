@@ -1,16 +1,60 @@
 import argparse
 import json
 import os
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from . import synapse
 
 
+def _cols(t):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in t)
+
+
+class Formatter(argparse.HelpFormatter):
+    """按显示宽度折行（中文占两列，argparse 按字数算会超出终端），说明里的“；”另起一行。"""
+    TOKEN = re.compile(r"\s+|[^\s\u2e80-\uffef]+[，。；：、）」』〗]*|.[，。；：、）」』〗]*")
+
+    def _split_lines(self, text, width):
+        lines = []
+        for part in re.split(r"(?<=；)", self._whitespace_matcher.sub(" ", text).strip()):
+            line = ""
+            for tok in self.TOKEN.findall(part.strip()):
+                if line and _cols(line + tok.rstrip()) > width:
+                    lines.append(line.rstrip())
+                    line = ""
+                if line or not tok.isspace():
+                    line += tok
+            if line.strip():
+                lines.append(line.rstrip())
+        return lines
+
+
+class Parser(argparse.ArgumentParser):
+    def __init__(self, *a, **k):
+        k.setdefault("formatter_class", Formatter)
+        super().__init__(*a, **k)
+
+
+ENGRAM = ["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve", "correct", "feedback", "skeleton"]
+SYNAPSE = ["inject", "evoke", "relive", "boot", "standing", "roam", "backfill"]
+
+
+def _grouped(argv):
+    """engram、synapse 可写可不写（两边的命令不重名）：mh check 即 mh engram check，mh evoke 即 mh synapse evoke。"""
+    if argv and argv[0] in ENGRAM:
+        return ["engram"] + argv
+    if argv and argv[0] in SYNAPSE:
+        return ["synapse"] + argv
+    return argv
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="mh")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    eg = sub.add_parser("engram", help="新库 engram.db（重构后的原语与存储）：check 检查不变量与覆盖；"
+    ap = Parser(prog="mh", description="engram、synapse 可省略：mh check 即 mh engram check，mh evoke 即 mh synapse evoke")
+    top = ap.add_subparsers(dest="cmd", required=True)
+    eg = top.add_parser("engram", help="写：check 检查不变量与覆盖；"
                                        "show <E|J|C编号…> 沿 Occurrence 回溯；page <来源> <会话前缀> 生成一段会话的阅读页；"
                                        "collect 采集；observe 跑一批观察；form 跑一批形成（--redo 看待重做清单）；常驻循环是 mh rhythm；"
                                        "request <给哪个过程> <被质疑的：E编号 | form_record:编号 | pack:act编号（那次整理的全部陈述）…> "
@@ -20,8 +64,7 @@ def main():
                                        "correct [--limit N]：按给 observe 的点名申请纠正那几条 E（C1b）；"
                                        "skeleton --workspace … --root … --file … --section … --placements …：按文件申请骨架（--dry-run 预览）；"
                                        "feedback T<入口> --name …|--topic … --reason … --model …：主会话直写的反馈（会话入口）")
-    eg.add_argument("action", choices=["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve",
-                                       "correct", "feedback", "skeleton"])
+    eg.add_argument("action", choices=ENGRAM)
     eg.add_argument("--workspace", help="skeleton：骨架所属的工作区")
     eg.add_argument("--root", type=Path, help="skeleton：工作区根目录")
     eg.add_argument("--file", help="skeleton：相对工作区的架构文件")
@@ -48,13 +91,15 @@ def main():
     eg.add_argument("--title", help="page：页面标题（默认用会话标题）")
     eg.add_argument("--note", default="", help="page：导语后面补一句为什么选这一片")
     eg.add_argument("--out", type=Path, help="page：写入文件；默认打印")
-    rh = sub.add_parser("rhythm", help="节律：常驻的观察循环（采集 → observe 跑一批 → 休眠），memory-harness-observe.service 跑它；"
+    rh = top.add_parser("rhythm", help="节律：常驻的观察循环（采集 → observe 跑一批 → 休眠），memory-harness-observe.service 跑它；"
                                        "--form 是形成循环（form 跑一批 → 休眠），memory-harness-form.service 跑它")
     rh.add_argument("--form", action="store_true", help="跑形成循环，不跑观察循环")
-    rh.add_argument("--tidy", action="store_true", help="跑整理循环（维护开场推送的项目现状、检查……），memory-harness-tidy.service 跑它")
+    rh.add_argument("--tidy", action="store_true", help="跑整理循环（维护手记推送的项目现状、检查……），memory-harness-tidy.service 跑它")
     rh.add_argument("--once", action="store_true", help="只跑一轮就退出")
     rh.add_argument("--engram-db", type=Path, default=None, help="新库路径（默认数据目录下的 engram.db）")
-    sub.add_parser("inject", help="Claude Code SessionStart hook：从标准输入读宿主 JSON，输出开场推送")
+    sy = top.add_parser("synapse", help="读：inject、evoke、relive、boot、roam、backfill")
+    sub = sy.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("inject", help="Claude Code SessionStart hook：从标准输入读宿主 JSON，输出手记推送")
     se = sub.add_parser("evoke", help="按词找记忆（同 MCP 工具 evoke）")
     se.add_argument("words", nargs="*")
     se.add_argument("--grain", default=None, choices=["L", "T", "S"], help="最小给到哪一层：L 线和骨架、T 话题、S 陈述（默认）")
@@ -65,10 +110,10 @@ def main():
     gt.add_argument("--recall", nargs="?", const="all", default=None, metavar="N|all",
                     help="历史：all 或数字 N")
     for x in (se, gt):
-        x.add_argument("--session", default="", help="当前会话编号（开场推送会写进命令）")
+        x.add_argument("--session", default="", help="当前会话编号（手记推送会写进命令）")
         x.add_argument("--purpose", default="interactive", choices=list(synapse.PURPOSES))
         x.add_argument("--note", default="", help="一句话意见：好用、别扭、找不到……")
-    bl = sub.add_parser("boot", aliases=["standing"], help="开场映像：看某个工作区开场实际推送的文本（design/synapse/core.md + 工具 + 项目现状 + 环境）")
+    bl = sub.add_parser("boot", aliases=["standing"], help="手记：看某个工作区实际推送的手记（扉页 core.md + 工具 + 近况 + 环境）")
     bl.add_argument("--cwd", default=os.getcwd())
     bl.add_argument("--host", default="claude", help="按哪个宿主看（宿主自己给了的节不给）")
     mp = sub.add_parser("roam", help="走记忆的地图（同 MCP 工具 roam）")
@@ -80,11 +125,11 @@ def main():
         x.add_argument("--limit", type=int, default=None, help="每页几条（默认 8，最多 30）")
         x.add_argument("--page", type=int, default=None, help="第几页，从 1 起")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
-    qa = sub.add_parser("quota", help="三家订阅的额度（codex / claude / ark），只读，不发模型请求")
+    qa = top.add_parser("quota", help="三家订阅的额度（codex / claude / ark），只读，不发模型请求")
     qa.add_argument("names", nargs="*", help="只看这几家")
     qa.add_argument("--json", action="store_true")
     qa.add_argument("--wait", action="store_true", help="只看一家：用完了就打印要等到的 unix 秒，没用完打印 0，读不到打印 -1")
-    args = ap.parse_args()
+    args = ap.parse_args(_grouped(sys.argv[1:]))
     if args.cmd == "engram":
         from .engram import store as estore
         from .engram import check as echeck, show

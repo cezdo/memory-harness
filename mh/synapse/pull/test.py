@@ -1,4 +1,4 @@
-"""Synapse 换库（E1a）的测试：新库上的 search / get / map、旧 J 和会话入口的重叠、足迹（use）与旧足迹的补录、开场推送、MCP。
+"""Synapse 换库（E1a）的测试：新库上的 search / get / map、旧 J 和会话入口的重叠、足迹（use）与旧足迹的补录、手记推送、MCP。
 数据照 form 的测试造（假模型），旧系统导入的 J 手写一条。python3 -m unittest mh.synapse.pull.test
 """
 import json
@@ -213,7 +213,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
     def test_push(self):
         out = push.hook(self.conn, {"session_id": "t", "cwd": "/w", "host": "dsh"})
         text = out["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("### 工具\n", text)
+        self.assertIn("# 手记\n\n## 扉页\n", text)                     # 2026-10-25：core 是扉页，标题降一级，工具到第四级
+        self.assertIn("\n#### 工具\n", text)
         self.assertIn("roam w", text)                                # 常用入口 2026-10-24 并进“最近停下的几件事”，这里只留 roam 的提示
         self.assertNotIn("- L1 X 升级", text)
         self.assertTrue(text.startswith('<memory-harness use="') and text.endswith("</memory-harness>"))
@@ -251,7 +252,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_status(self):
         """项目现状：手写的部分（仓库、检查命令、目录说明）加上从 git 读的（活跃、不进 git、最近的提交、没提交的改动）和检查的结果；
-        不推操作文档；开场推送只读编好的，按宿主去掉它自己给了的节，没有就不给这一节。"""
+        不推操作文档；手记推送只读编好的，按宿主去掉它自己给了的节，没有就不给这一节。"""
         import subprocess
         from unittest import mock
         from ..push import status
@@ -279,7 +280,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             self.assertTrue(status.run_check("w", home=self.dir / "status"))
             self.assertTrue(status.write("w", home=self.dir / "status"))
         full = status.read("w", home=self.dir / "status", host="dsh")
-        self.assertIn("## 项目现状（w，", full)
+        self.assertIn("## 近况（w，", full)
         self.assertIn("### 最近的提交", full)
         self.assertIn("跑）\n检查了 3 份\n- 没有发现事件", full)                 # 检查的结果去掉空行
         cc = status.read("w", home=self.dir / "status", host="claude")       # Claude Code 自带 git 状态和最近的提交
