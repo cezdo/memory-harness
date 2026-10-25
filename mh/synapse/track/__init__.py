@@ -37,7 +37,7 @@ BORN = {"session_entry": "session_entry", "topic_line": "topic_line"}    # 不�
 
 def _split(conn, got):
     """取到的 → (inputs, 看到的句柄)。inputs 只写 Claim（E、陈述、J……）和 act：会话入口、话题线照 form 的写法
-    记成写出它的 act（mh engram check 按这个查来源），骨架、工作区不进 inputs；具体给看了哪些另记在 meta 里。"""
+    记成写出它的 act（mh check 按这个查来源），骨架、工作区不进 inputs；具体给看了哪些另记在 meta 里。"""
     inputs, handles = {}, {}
     for kind, ids in got.items():
         if kind in BORN:

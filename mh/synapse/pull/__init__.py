@@ -143,7 +143,7 @@ class Layers:
         cur = self.by_session.get(k)
         return f"{self.where(cur) if cur else 'L?:T?'}:S{self.sseq[rid]}"
 
-    # 下面几样只有拉取用得上，开场推送不建（省一半内存）
+    # 下面几样只有拉取用得上，手记推送不建（省一半内存）
     @functools.cached_property
     def cites(self):
         """E 编号 → 引用它的陈述。"""
@@ -200,7 +200,7 @@ def layers(conn):
 
 
 # ---- 排版 ----
-# 只给主要内容（2026-10-19）：来源、原话、历史、话题里的其余陈述都不带，怎么取写在工具说明和开场推送里，要看再取。
+# 只给主要内容（2026-10-19）：来源、原话、历史、话题里的其余陈述都不带，怎么取写在工具说明和手记推送里，要看再取。
 # 返回记录的措辞以后再设计。
 
 def _day(t):

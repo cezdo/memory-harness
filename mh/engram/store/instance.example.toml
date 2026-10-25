@@ -29,6 +29,6 @@ quiet = []                                       # 不当“查不到的词”�
 # dsh_test = "~/dsh-test"                        # dsh 测试实例（精读、粗读的 headless 模式）
 
 [resources]                                     # 私有文本，独立于代码和发行包
-# core = "~/.config/memory-harness/core.md"         # 内核（开场映像里不变的那部分）；2026-10-24 前叫 standing
+# core = "~/.config/memory-harness/core.md"         # 内核（手记里不变的那部分）；2026-10-24 前叫 standing
 # glossary = "~/.config/memory-harness/glossary.md"
 # workspace_status = "~/.config/memory-harness/workspace-status"

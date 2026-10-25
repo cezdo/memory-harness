@@ -1,5 +1,5 @@
 """hosts：各宿主的接入（Claude Code、Codex、dsh），适配层，不是过程（design/synapse/设计.md“hosts”）。
-- 宿主的入口：Claude Code 和 dsh 调 `python3 -m mh inject`（开场推送）、`-m mh.synapse.push.associate`（联想）、`-m mh.synapse.pull.mcp`
+- 宿主的入口：Claude Code 和 dsh 调 `python3 -m mh inject`（手记推送）、`-m mh.synapse.push.associate`（联想）、`-m mh.synapse.pull.mcp`
   （拉取）；Codex 经 `-m mh.synapse.hosts.codex`；dsh 的插件在 dsh/，流水经 `-m mh.synapse.track.pushes`。
 - 读上下文：各宿主自己的会话记录各一个 read_context（claude.py、codex/、dsh_log.py），返回 (上下文文本, 宿主注入的类型或 None, 找到这一句没有)。
 - 这里：认出宿主注入的轮次（不是用户在说话），记下是哪类宿主事件。

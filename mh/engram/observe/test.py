@@ -185,7 +185,14 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(sizes, [4000, 5000, 4000])                    # 13000 字：三段，平均，不是 4000+4000+4000+1000
         self.assertEqual(drr.amount({1: {"U1": "短", "A1": "长" * 40, "A2": "长" * 50}}), (2, 4))        # 用户说了话至少算 1 条
         self.assertEqual(drr.amount({1: {f"A{i}": "长" * 40 for i in range(10)}}), (7, 13))
-        self.assertEqual(drr.amount({1: {f"A{i}": "长" * 40 for i in range(10)}}, {1: {"read": ["a.py"]}}), (1, 2))   # 读过文件：只算 1 条指路（没有用户的话）
+        about = {1: {**{f"A{i}": "长" * 40 + "见 a.py" for i in range(4)}, **{f"A{i}": "长" * 40 for i in range(4, 10)}}}
+        self.assertEqual(drr.amount(about, {1: {"read": ["mh/a.py"]}}), (5, 9))         # 提到附上文件的 4 段合算 1 条指路，其余 6 段照常（2026-10-25）
+        self.assertEqual(drr.amount({1: {f"A{i}": "长" * 40 for i in range(10)}}, {1: {"read": ["a.py"]}}), (7, 13))   # 读过文件但段落没提到：照常算
+        self.assertEqual(drr.amount({1: {"A1": "短"}}, {1: {"read": ["a.py"]}}), (1, 2))
+        self.assertEqual(drr.amount({1: {f"A{i}": "长" * 40 for i in range(200)}}), (37, 69))   # 单轮自成一窗：中心不超过 LONG_CAP
+        self.assertEqual(drr.amount({1: {f"A{i}": "长" * 40 for i in range(40)}, 2: {f"A{i}": "长" * 40 for i in range(40)}}), (56, 104))   # 多轮不受限  # 只读了文件、没有有内容的段落：1 条指路
+        self.assertEqual(drr.file_names({"read": ["tmp/x/", "mh/engram/observe/"], "wrote": ["写了 a/b.md", "提交 1a2b「runbook：改 c.py」：d/e.py、f/g.md"]}),
+                         {"observe", "b.md", "e.py", "g.md"})                      # 太短的目录名（x）不认；提交说明里的不算
         self.assertEqual(written_files.bash_reads("cd tmp/x; sed -n 1,40p a.py && cat $f-v0.1.md | head"), ["tmp/x", "a.py"])
         self.assertEqual(drr.file_note({"read": ["a.py", "tmp/x/"], "wrote": []}), ["这一轮“我”读过：a.py、tmp/x/"])
         events = [{"text": f"{U}说明脚本的四步。", "segments": ["8:A1"]}, {"text": f"{U}决定先做 A。", "segments": ["8:U1"]},
@@ -305,6 +312,52 @@ class ObserveTest(unittest.TestCase):
         self._collect(rows, sid="long")                                    # 轮数不设上限：80 轮整段一次
         self.assertEqual([len(w) for w, _ in observe.ready(self.conn, op, session="long", now=later)], [80])
 
+    def test_fast(self):
+        """快道（runbook I7，2026-10-25）：没告一段落的会话按写窗口封窗粗读，尾巴等；之后照常预览：判粗读的不再读、快道 E 是终稿，
+        判精读的读完后快道 E 退场，判不读的收回。"""
+        t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+        at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._collect([Turn("一", "回" * 3000, closed=True, started=at(0)), Turn("二", "回" * 1500, closed=True, started=at(5)),
+                       Turn("三", "回" * 4100, closed=True, started=at(10)), Turn("四", "回" * 300, closed=True, started=at(15))],
+                      started=at(0))
+        turns = [r[0] for r in self.conn.execute("SELECT occurrence FROM turn_detail ORDER BY ordinal")]
+        self.assertEqual([[r["ordinal"] for r in w] for w in observe.fast_ready(self.conn, now=t0 + timedelta(minutes=20))], [[0, 1], [2]])
+        fakes = self._fakes([], [], [f"### 事件1\n{U}说了一。\n来源：1:U1\n\n### 事件2\n{U}说了二。\n来源：2:U1",
+                                     f"### 事件1\n{U}说了三。\n来源：3:U1"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO(), now=t0 + timedelta(minutes=20))
+        fast = [a for a in self._acts() if json.loads(a["window"]).get("fast")]
+        self.assertEqual([json.loads(a["window"])["turns"] for a in fast], [turns[:2], [turns[2]]])        # 尾巴（第 4 轮）等
+        self.assertIn("还没有预览", fast[0]["input"])
+        self.assertNotEqual(fast[0]["operator"], observe.operator(self.conn, "rough")[0])                  # 快道是另一个 Operator
+        self.assertEqual(len(observe.frame(self.conn)["events"]), 3)
+        self.assertEqual(set(states(self.conn).values()), {"not_previewed"})                               # form 照样等预览
+        observe.run(self.conn, workers=1, models=self._fakes([], [], []), log=io.StringIO(), now=t0 + timedelta(minutes=30))
+        self.assertEqual(len([a for a in self._acts() if json.loads(a["window"]).get("fast")]), 2)          # 读过的不再排
+        # 告一段落：照常预览。第 1 轮精读、第 2 轮粗读（快道读过，不再读）、第 3 轮不读、第 4 轮粗读
+        plan = "### 第 1 轮\n类型：讨论\n读法：精读\n\n### 第 2 轮\n类型：执行\n读法：粗读\n\n### 第 3 轮\n类型：执行\n读法：不读\n\n" \
+               "### 第 4 轮\n类型：执行\n读法：粗读\n\n### 精读顺序\n第 1 轮\n"
+        fakes = self._fakes([plan], [f"### 事件1\n{U}细说了一。\n来源：1:U1"], [f"### 事件1\n{U}说了四。\n来源：4:U1"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO(), now=t0 + timedelta(hours=4))
+        rough = [json.loads(a["window"])["turns"] for a in self._acts() if a["step"] == "rough" and not json.loads(a["window"]).get("fast")]
+        self.assertEqual(rough, [[turns[3]]])                                                                # 第 2 轮没有再读
+        self.assertEqual(sorted(e["text"] for e in observe.frame(self.conn)["events"]),
+                         sorted([f"{U}细说了一。", f"{U}说了二。", f"{U}说了四。"]))     # 一：精读取代；三：收回；二：快道 E 留着
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM event").fetchone()[0], 5)                   # 退场的不删
+        self.assertEqual(states(self.conn), dict(zip(turns, ["read", "read", "not_read", "read"])))
+        self.assertEqual(waiting(self.conn), [])
+
+    def test_seal(self):
+        rows = lambda sizes: [{"occurrence": i, "assistant": "x" * n, "commentary": "[]"} for i, n in enumerate(sizes)]
+        ids = lambda got: ([[r["occurrence"] for r in w] for w in got[0]], [r["occurrence"] for r in got[1]])
+        self.assertEqual(ids(observe.seal(rows([1500, 1500, 1500, 300]))), ([[0, 1, 2]], [3]))     # 满 4000 封，不够就等
+        self.assertEqual(ids(observe.seal(rows([2000, 1500, 2000]))), ([[0, 1]], [2]))             # 加进来超过 5000：先封
+        self.assertEqual(ids(observe.seal(rows([500, 6000, 100]))), ([[0], [1]], [2]))             # 一轮超长自成一窗
+        r = rows([1200, 900, 2500, 700, 4100, 300, 3000, 1800])
+        full = ids(observe.seal(r))[0]
+        for n in range(1, len(r) + 1):                                                              # 不看未来：每轮只读一次
+            part = ids(observe.seal(r[:n]))[0]
+            self.assertEqual(part, full[:len(part)])
+
     def test_preview_pool(self):
         """预览按给的先后用池里的模型（2026-10-20）：前一个环境错误就换下一个，同一窗口接着预览；各是一个 Operator。"""
         self._collect([Turn("一", "答", closed=True), Turn("二", "答", closed=True)])
@@ -377,6 +430,33 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(observe.previews_of(self.conn, "dsh", "s1"), [pid])        # 补读不算模型的预览
         todo = observe.to_read(self.conn)
         self.assertEqual([(p, s["from"], s["to"], step) for p, s, step in todo], [(got[1], 2, 2, "rough")])
+
+    def test_reread_old(self):
+        """重读旧粗读组（2026-10-25）：同样的几轮按现在的做法再读，读过的轮次更早的 E 整轮被取代，form 只看到新 E。"""
+        self._collect([Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在报告里", closed=True)])
+        fakes = self._fakes(["### 第 1–2 轮\n类型：讨论\n读法：粗读\n"],
+                            [f"### 事件1\n{U}提出先做一版。\n来源：1:U1\n\n### 事件2\n我说明结果在报告里。\n来源：2:A1\n"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        old = [a for a in self._acts() if a["step"] == "rough"][0]
+        old_e = [r[0] for r in self.conn.execute("SELECT id FROM event WHERE born=? ORDER BY id", (old["id"],))]
+        w = json.loads(old["window"])
+        rows = self.conn.execute(observe.TURNS + f" WHERE d.occurrence IN ({','.join('?' * len(w['turns']))}) ORDER BY d.ordinal",
+                                 w["turns"]).fetchall()
+        group = {"turns": w["turns"], "from": rows[0]["ordinal"] + 1, "to": rows[-1]["ordinal"] + 1, "how": "粗读", "plan": "计划"}
+        tables, mask, text = observe.build_read(self.conn, group, "rough", FakeModel([]))
+        op = observe.operator(self.conn, "rough")[0]
+        out = (f"### 事件1\n{U}提出先做一版看看，理由是还没有现成的。\n来源：1:U1\n\n"
+               f"### 事件2\n我说明结果在报告里，并给出两个数字。\n来源：2:A1\n")
+        observe.store_read(self.conn, op, None, group, "rough", tables, mask, text, out, {}, None, {}, cause="manual",
+                           reread=old["id"])
+        new = [a for a in self._acts() if a["step"] == "rough"][-1]
+        self.assertGreater(new["id"], old["id"])
+        self.assertEqual(json.loads(new["window"])["reread"], old["id"])
+        self.assertEqual(observe.superseded(self.conn), set(old_e))                       # 这几轮更早的 E 整轮被取代
+        self.assertEqual([e["text"] for e in observe.frame(self.conn, "dsh", "s1")["events"]],
+                         [f"{U}提出先做一版看看，理由是还没有现成的。", "我说明结果在报告里，并给出两个数字。"])
+        self.assertEqual(observe.reread_reads(self.conn)[self.conn.execute(
+            "SELECT text FROM turn_detail WHERE ordinal=0").fetchone()[0]], new["id"])
 
     def test_previous(self):
         """会话续上：之前预览定下的分组给新的预览接着划分，前面的原话不再给，前面的轮次不重看。"""

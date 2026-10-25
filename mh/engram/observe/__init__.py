@@ -72,22 +72,23 @@ def window_params(step):
                 "host_skip": preview.HOST_SKIP, "host_floor": preview.HOST_FLOOR, "host_hidden": True}
     if step == "rough":
         return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.TOOLS[step], "masked": True, "cap": deep_rough_read.ROUGH_CAP,
-                "split": [deep_rough_read.ROUGH_MIN, deep_rough_read.ROUGH_MAX], "rho": deep_rough_read.ROUGH_RHO, "float": deep_rough_read.ROUGH_FLOAT, "content_min": deep_rough_read.CONTENT_MIN,
-                "files": True, "notice": NOTICE}
+                "split": [deep_rough_read.ROUGH_MIN, deep_rough_read.ROUGH_MAX], "rho": deep_rough_read.ROUGH_RHO, "float": deep_rough_read.ROUGH_FLOAT, "content_min": deep_rough_read.CONTENT_MIN, "long_cap": deep_rough_read.LONG_CAP,
+                "files": "mention", "notice": NOTICE}      # files：附上读写的文件；mention（2026-10-25）：只有提到它们的段落合算 1 条
     return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.TOOLS[step], "masked": True, "notice": NOTICE}
 
 
-def operator(conn, step="preview", register_new=True, name=None, prompt=None):
+def operator(conn, step="preview", register_new=True, name=None, prompt=None, fast=False):
     """登记并返回 (编号, 名字)。名字 = 模型定义/提示词.隔离-摘要，摘要覆盖提示词、隔离和窗口参数（window_params）；
     任何一项变了就是新的 Operator，旧结果照样留着。register_new=False 只查不登记（只读的接口用），没登记过的编号是 None。
-    name：用 POOL 里的另一个模型定义（默认 CURRENT 里的）。prompt：换一个提示词（纠正用 correct-v0.1，模型和窗口参数沿用这一步的）。"""
+    name：用 POOL 里的另一个模型定义（默认 CURRENT 里的）。prompt：换一个提示词（纠正用 correct-v0.1，模型和窗口参数沿用这一步的）。
+    fast：快道的粗读（不经预览、按封窗读，runbook I7）：窗口参数多一项 fast，是另一个 Operator。"""
     default, current = CURRENT[step]
     prompt = prompt or current
     name = name or default
     body = (PROMPTS / f"{prompt}.md").read_bytes()   # 模板属于做法；实际称呼在 act 的表达上下文中
     model = MODELS[name]()
     iso = getattr(model, "isolation", "") or NA
-    wp = {**window_params(step), "expression": express.signature()}
+    wp = {**window_params(step), **({"fast": FAST} if fast else {}), "expression": express.signature()}
     full = f"{name}/{prompt}.{iso}-{hashlib.sha256(body + iso.encode() + dumps(wp).encode()).hexdigest()[:8]}"
     params = {"definition": name, "platform": getattr(model, "platform", UNKNOWN), "step": step, **wp}
     if not register_new:
@@ -279,6 +280,115 @@ def store_preview(conn, op_id, rows, text, output, meta, error, last, cause="new
     return f"{len(groups)} 组（精读 {n['精读']}、粗读 {n['粗读']}、不读 {n['不读']}）"
 
 
+# ---- 快道（runbook I7，2026-10-25）----
+# 会话还没告一段落（没到 IDLE）时，已经结束的轮次按粗读的写窗口攒：累计回复满 ROUGH_CAP 封窗，下一轮加进来超过 ROUGH_MAX 的先封，
+# 一轮超长的自成一窗；封上才粗读，不够就等，尾巴留给 IDLE 后的正常预览。快道没有自己的预览，不必完整：读失败不重试、
+# 不进待重做清单，漏掉的由正常流程补。之后照常预览：判粗读的不再读（快道 E 就是终稿），判精读的读完后快道 E 退场，
+# 判不读的快道 E 收回（留在库里作备份）。
+FAST = {"cap": deep_rough_read.ROUGH_CAP, "max": deep_rough_read.ROUGH_MAX, "plan": "fast-v1"}
+FAST_PLAN = "按已结束的轮次直接粗读（还没有预览），保留以后需要回想的内容。"
+
+
+def seal(rows, cap=deep_rough_read.ROUGH_CAP, hi=deep_rough_read.ROUGH_MAX):
+    """已经结束的轮次（按顺序）→ (封上的窗口, 尾巴)。只用已经结束的，不看未来：前缀的结果是整体结果的前缀，每轮只读一次。"""
+    sealed, tail, size = [], [], 0
+    for r in rows:
+        n = deep_rough_read.reply_chars(r)
+        if tail and size + n > hi:
+            sealed.append(tail)
+            tail, size = [], 0
+        tail.append(r)
+        size += n
+        if size >= cap:
+            sealed.append(tail)
+            tail, size = [], 0
+    return sealed, tail
+
+
+def _fast_acts(conn):
+    """快道的读：[(act, 结果, 轮次)]。"""
+    return [(oid, result, json.loads(window)["turns"]) for oid, _, result, step, window, _ in conn.execute(ACTS)
+            if step == "rough" and json.loads(window).get("fast")]
+
+
+def fast_texts(conn, ok_only=True):
+    """快道读过的原文：ok_only 只算成功（或被过滤）的，正常流程据此不再粗读；False 连失败的也算，快道据此不再排（失败不重试）。"""
+    text_of = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
+    return {text_of.get(t) for _, result, turns in _fast_acts(conn)
+            if not ok_only or result in ("ok", "filtered") for t in turns} - {None}
+
+
+def fast_ready(conn, session=None, now=None):
+    """快道该读的窗口：[几轮]。只看人直接参与、开着观察、还没告一段落的会话；轮次是还没处理（没预览、没被旧版本观察、
+    快道没排过）、已经结束、写出了文字的，开关那一轮和不显示的轮（宿主消息后回复不到 100 字）不算；同一份原文只排一次。"""
+    h = history(conn)
+    skip = h.done | fast_texts(conn, ok_only=False)
+    off = switch.states(conn)
+    now = now or datetime.now(timezone.utc)
+    sql, args = TURNS + " WHERE s.kind='user'", []
+    if session:
+        sql += " AND d.session LIKE ?"
+        args.append(session + "%")
+    by = collections.defaultdict(list)
+    for row in conn.execute(sql + " ORDER BY so.started, d.source, d.session, d.ordinal", args):
+        by[(row["source"], row["session"])].append(row)
+    out, taken = [], set()
+    for key, rows in by.items():
+        if off.get(key) == "off":
+            continue
+        started = st.iso(rows[-1]["started"])
+        if absent(started) or (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds() >= IDLE.get(key[0], IDLE_DEFAULT):
+            continue                                   # 告一段落了：走正常预览
+        hidden = preview.hidden(rows)
+        ok = [r for i, r in enumerate(rows) if (r["closed"] or i < len(rows) - 1) and r["assistant"] and not switch.switch(r["user"])
+              and r["text"] not in skip and r["text"] not in taken and r["ordinal"] + 1 not in hidden]
+        sealed, _ = seal(ok)
+        for w in sealed:
+            taken |= {r["text"] for r in w}
+            out.append(w)
+    return out
+
+
+def _without_fast(conn, group, fast):
+    """预览定下的一组去掉快道已经读过的轮（按原文认）→ 剩下的组；全被读过返回 None。"""
+    if not fast:
+        return group
+    text_of = {t: x for t, x in conn.execute(f"SELECT occurrence, text FROM turn_detail WHERE occurrence IN ({','.join('?' * len(group['turns']))})",
+                                              group["turns"])}
+    left = [t for t in group["turns"] if text_of.get(t) not in fast]
+    if len(left) == len(group["turns"]):
+        return group
+    if not left:
+        return None
+    ords = dict(conn.execute(f"SELECT occurrence, ordinal FROM turn_detail WHERE occurrence IN ({','.join('?' * len(left))})", left))
+    return {**group, "turns": left, "from": min(ords.values()) + 1, "to": max(ords.values()) + 1}
+
+
+def _rough_parts(conn, group, fast):
+    """粗读的一组 → 要读的几段（去掉快道读过的轮，再按写窗口切开）；全被快道读过的返回 []。to_read、progress、fast_retired 共用。"""
+    g = _without_fast(conn, group, fast)
+    return _split(conn, g) if g else []
+
+
+def fast_retired(conn):
+    """快道写的、现在退场的 E：预览判不读的那几轮（收回，留作备份），判精读、精读已经读完的那几轮（由精读取代）。按原文认。"""
+    acts = {oid for oid, result, _ in _fast_acts(conn) if result == "ok"}
+    if not acts:
+        return set()
+    h = history(conn)
+    text_of = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
+    gone = set()
+    sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome='ok'")
+    for _, _, _, _, _, meta in conn.execute(sql):
+        for g in reads(json.loads(meta)):
+            if g["how"] == "不读" or g["how"] == "精读" and h.finished.get(("turns", tuple(g["turns"]))) == "ok":
+                gone |= {text_of.get(t) for t in g["turns"]}
+    if not gone:
+        return set()
+    return {eid for eid, born, turn in conn.execute(f"SELECT id, born, turn FROM event WHERE born IN ({','.join('?' * len(acts))})", list(acts))
+            if text_of.get(turn) in gone}
+
+
 def to_read(conn, session=None):
     """该观察的几组轮次：[(预览 act, 这一组, 步骤)]。成功或被过滤过的不再挑；当前 Operator 下失败满次数的进待重做清单；
     预览之后会话被关掉了观察的，不读。"""
@@ -286,6 +396,7 @@ def to_read(conn, session=None):
     fails, finished = h.fails, h.finished
     off = {k for k, v in switch.states(conn).items() if v == "off"}
     ops = {step: operator(conn, step)[0] for step in ("deep", "rough")}
+    fast = fast_texts(conn)
     sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome='ok'")
     out = []
     for pid, _, _, _, window, meta in conn.execute(sql):
@@ -295,7 +406,7 @@ def to_read(conn, session=None):
             continue
         for g in reads(m):
             step = deep_rough_read.STEPS.get(g["how"])
-            for s in (_split(conn, g) if step == "rough" else [g]):
+            for s in (_rough_parts(conn, g, fast) if step == "rough" else [g]):      # 快道读过的轮不再粗读
                 key = ("turns", tuple(s["turns"]))
                 if step and key not in finished and not _failed(fails, key, ops[step]):
                     out.append((pid, s, step))
@@ -347,21 +458,37 @@ def build_read(conn, group, step, model):
     return deep_rough_read.build(head, label.environment(rows[0], model), group, rows, files)
 
 
-def store_read(conn, op_id, pid, group, step, tables, mask, text, output, meta, error, last, cause="new_text"):
-    """写一次观察：act，以及解析出的 event（出处是来源里第一个解析到的轮次，都没解析到就记在这几轮的第一轮）。"""
+def store_read(conn, op_id, pid, group, step, tables, mask, text, output, meta, error, last, cause="new_text", fast=False,
+               reread=None, commit=True):
+    """写一次观察：act，以及解析出的 event（出处是来源里第一个解析到的轮次，都没解析到就记在这几轮的第一轮）。
+    reread：重读（2026-10-25），值是旧粗读的 act；inputs 带上它，读过的轮次更早的 E 整轮被取代（reread_reads）。
+    commit=False：由调用方把一段会话的几次读写一起提交（form 不会看到半段）。"""
     restored, seconds = mask.restore(output), meta.get("seconds")
     events, nothing = parse.parse_turns(restored, {n: t for n, (_, t) in tables.items()}) if error is None else ([], False)
     meta.update(masked=dict(mask.back), read=group["how"], empty=nothing, **({"part": group["part"]} if group.get("part") else {}))
+    if reread:
+        meta["reread"] = reread
     if step == "rough" and error is None:
         first = conn.execute("SELECT source, session FROM turn_detail WHERE occurrence=?", (group["turns"][0],)).fetchone()
         got = touched(conn, first["source"], first["session"]) if first else {}
         files = {n: got[occ] for n, (occ, _) in tables.items() if occ in got}
         meta.update(checks=deep_rough_read.checks(events, {n: t for n, (_, t) in tables.items()}, files))
-    act, result, err = _act(conn, op_id, step, {"turns": group["turns"], "preview": pid},
-                            {"turn": group["turns"], "act": [pid]}, text, output, meta, error, last, ("turns", tuple(group["turns"])),
-                            cause)
+    window = {"turns": group["turns"]}
+    if fast:
+        window["fast"] = True
+    elif pid:
+        window["preview"] = pid
+    if reread:
+        window["reread"] = reread
+    inputs = {"turn": group["turns"]}
+    if pid and not fast:
+        inputs["act"] = [pid]
+    if reread:
+        inputs["reread"] = [reread]
+    act, result, err = _act(conn, op_id, step, window, inputs, text, output, meta, error, last, ("turns", tuple(group["turns"])), cause)
     write_events(conn, act, events, tables, group["turns"][0])
-    conn.commit()
+    if commit:
+        conn.commit()
     return f"{result}：{err[:160]}" if result != "ok" else f"{len(events)} 条 event，{seconds}s"
 
 
@@ -666,6 +793,7 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
     obs = dict(models) if models else {step: MODELS[name]() for step, (name, _) in CURRENT.items()}   # 复制：下面会换预览模型
     ops = {step: operator(conn, step) for step in CURRENT}
     preview_ops = pool_ops(conn)
+    fast_op = operator(conn, "rough", fast=True)[0]
     order = [n for n in (order or [CURRENT["preview"][0]]) if n in preview_ops] or [CURRENT["preview"][0]]
     if not (models and "preview" in models):
         obs["preview"], ops["preview"] = MODELS[order[0]](), operator(conn, "preview", name=order[0])
@@ -717,19 +845,29 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
                 conn.commit()
         if env:
             return done, env
-        # 观察
+        # 观察：预览定下的几组，加上快道封上的窗口
         jobs = []
         for pid, group, step in to_read(conn, session):
             tables, mask, text = build_read(conn, group, step, obs[step])
             jobs.append((pid, group, step, tables, mask, text))
-        futures = {pool.submit(_call, obs[j[2]], j[5]): j for j in jobs}
+        for w in fast_ready(conn, session, now):
+            group = {"turns": [r["occurrence"] for r in w], "from": w[0]["ordinal"] + 1, "to": w[-1]["ordinal"] + 1,
+                     "how": "粗读", "plan": FAST_PLAN}
+            tables, mask, text = build_read(conn, group, "rough", obs["rough"])
+            jobs.append((None, group, "fast", tables, mask, text))
+        futures = {pool.submit(_call, obs["rough" if j[2] == "fast" else j[2]], j[5]): j for j in jobs}
         for f in concurrent.futures.as_completed(futures):
             pid, group, step, tables, mask, text = futures[f]
             output, meta, error = f.result()
-            state = store_read(conn, ops[step][0], pid, group, step, tables, mask, text, output, meta, error, last, cause)
+            if step == "fast":
+                state = store_read(conn, fast_op, None, group, "rough", tables, mask, text, output, meta, error, last, cause, fast=True)
+            else:
+                state = store_read(conn, ops[step][0], pid, group, step, tables, mask, text, output, meta, error, last, cause)
             env += state.startswith("env_error")
             done += 1
-            print(f"[{group['how']}] {_session_of(conn, group)} 第 {group['from']}–{group['to']} 轮（预览 {pid}）：{state}", file=log, flush=True)
+            tag = "快道" if step == "fast" else group["how"]
+            where = "" if step == "fast" else f"（预览 {pid}）"
+            print(f"[{tag}] {_session_of(conn, group)} 第 {group['from']}–{group['to']} 轮{where}：{state}", file=log, flush=True)
     return done, env
 
 
@@ -827,6 +965,7 @@ def progress(conn, session=None):
     # 预览定下的分组 → 每份原文的决定（按原文，fork 的副本跟着走）
     turn_text = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
     by_text = {}
+    fast = fast_texts(conn)
     sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome IN ('ok','filtered')")
     for _, _, result, _, window, meta in conn.execute(sql):
         if result == "filtered":
@@ -835,7 +974,11 @@ def progress(conn, session=None):
             continue
         for g in reads(json.loads(meta)):
             step = deep_rough_read.STEPS.get(g["how"])
-            for part in (_split(conn, g) if step == "rough" else [g]):   # 粗读超过写窗口的组切开读：按切开的每一段查（同 to_read）
+            if step == "rough":                                          # 快道读过的：判粗读就算读过了（快道 E 是终稿）
+                for t in g["turns"]:
+                    if turn_text.get(t) in fast:
+                        by_text[turn_text.get(t)] = "read"
+            for part in (_rough_parts(conn, g, fast) if step == "rough" else [g]):   # 粗读超过写窗口的组切开读：按切开的每一段查（同 to_read）
                 key = ("turns", tuple(part["turns"]))
                 if step is None:
                     d = "not_read"
@@ -976,9 +1119,26 @@ def range_reads(conn):
     return out
 
 
+def reread_reads(conn):
+    """重读旧粗读组的读：{原文 ID: 最近一次读的 act}（inputs 带 reread，2026-10-25，runbook I7 旧粗读重读）。
+    按原文认：同一份原文出现在几处（fork、副本）一起取代。"""
+    text_of = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
+    out = {}
+    for oid, inputs in conn.execute("SELECT o.id, o.inputs FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                    "WHERE a.process='observe' AND a.step='rough' AND o.outcome='ok' "
+                                    "AND o.inputs LIKE '%\"reread\"%'"):
+        for t in json.loads(inputs).get("turn", []):
+            if t in text_of:
+                out[text_of[t]] = max(out.get(text_of[t], 0), oid)
+    return out
+
+
 def superseded_by_turn(conn):
-    """范围申请推出的取代：{被取代的 E: 取代它的那次读}。"""
+    """按轮次推出的取代：{被取代的 E: 取代它的那次读}。范围申请（再观察）和重读（2026-10-25）都用这一条：
+    读过的每一轮（按原文认）更早出生的 E 整轮被取代。"""
     reads = range_reads(conn)
+    for text, oid in reread_reads(conn).items():
+        reads[text] = max(reads.get(text, 0), oid)
     if not reads:
         return {}
     return {eid: reads[text] for eid, born, text in conn.execute(
@@ -989,7 +1149,7 @@ def superseded_by_turn(conn):
 def frame(conn, source=None, session=None):
     """现在交给上一层（form）的 E，和撤下的说明。返回 {"events": [...], "withdrawn": [...]}：
     events     [{id, turn, source, session, ordinal, text, segments, unresolved, speaker, mode, qualifier, modes, act, operator,
-                 marks}]，按会话、轮次、出生排；不含 withheld（会话关着观察）和按申请被取代的（superseded）。
+                 marks}]，按会话、轮次、出生排；不含 withheld（会话关着观察）、按申请被取代的（superseded）和退场的快道 E（fast_retired）。
                  speaker、mode、qualifier 是 modes.read 从正文读出的（modes 是那一版读法），模型自己写过的以模型写的为准。
                  marks：这条 E 在 observe → form 边界上的记录 [{step: withdraw | restore, act, reason}]，恢复后交出去的带着它。
                  step：读出它的那一步（deep、rough、correct……）；纠正写的 E 只经修订提示进 form（2026-10-21）。
@@ -997,7 +1157,7 @@ def frame(conn, source=None, session=None):
                  turn 是旧版本逐轮观察。
     withdrawn  [{event, act, reason}]：已经被 form 读过、现在因为开关撤下的 E（最后一次记的是 withdraw）。
     source、session 给了就只看那一个会话（session 是完整的会话 ID）。"""
-    hidden = withheld(conn) | superseded(conn)
+    hidden = withheld(conn) | superseded(conn) | fast_retired(conn)
     marks_by = collections.defaultdict(list)
     for oid, step, inputs, meta in conn.execute(
             "SELECT o.id, a.step, o.inputs, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "

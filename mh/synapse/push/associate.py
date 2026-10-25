@@ -306,7 +306,7 @@ def cached(conn):
     return data
 
 
-TAG = "memory-harness"    # 对话中途注入的内容用 <memory-harness>…</memory-harness> 包起来，和开场、拉取同一个标签；core 的图例说明它不是用户说的话（2026-10-24，原来是 <Synapse>）
+TAG = "memory-harness"    # 对话中途注入的内容用 <memory-harness>…</memory-harness> 包起来，和手记、拉取同一个标签；core 的图例说明它不是用户说的话（2026-10-24，原来是 <Synapse>）
 
 
 def recall_note(lost):

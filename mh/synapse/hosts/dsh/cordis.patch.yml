@@ -7,7 +7,7 @@
       name: 'mh-synapse'
       config:
         python: /usr/bin/python3
-        injectTimeoutMs: 30000      # 开场推送（mh inject）；Claude 那边 SessionStart 没设，按宿主默认
+        injectTimeoutMs: 30000      # 手记推送（mh inject）；Claude 那边 SessionStart 没设，按宿主默认
         associateTimeoutMs: 30000   # 联想（同 Claude 的 UserPromptSubmit timeout: 30）；超时这一轮不加
         toolTimeoutMs: 60000        # 拉取工具每次调用（同 dsh-mcp-client 默认）
         resume: false               # 恢复会话时不再推基准（dsh 的注入会写进会话日志，历史里已有）

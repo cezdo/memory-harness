@@ -4,14 +4,16 @@
 - codex：codex app-server 的 JSON-RPC account/rateLimits/read；独立 CODEX_HOME，里面只有认证的符号链接。
 - claude：GET api.anthropic.com/api/oauth/usage，令牌取自 ~/.claude/.credentials.json（Claude Code 自己会刷新；
   过期时这里只报过期，不代为刷新）。接口未公开，要带 User-Agent claude-code/<版本>，否则容易 429。
+  2026-10-25：这个接口按出口限流（不带令牌也 429），被限时也可能不回 429、在 TLS 握手时掐断（SSL EOF）。所以读到的
+  结果落盘缓存 CLAUDE_TTL 秒，期间不再请求；读不到时退回上次读到的，注明是多久以前的（"stale"）。
 - ark：2026-10-13：没有 AK/SK 就不查（不大量用用不完）。接口是火山引擎 OpenAPI GetAFPUsage（Agent Plan；Coding Plan 是 GetCodingPlanUsage），要账号 AccessKey（AK/SK，
   只需 ArkReadOnlyAccess），不能用 API Key。AK/SK 放 ~/.config/memory-harness/volc.json：{"ak": "...", "sk": "..."}。
   不要用 Plan 的 API Key 直接打推理接口探额度：方舟说明 Plan 只能在 AI 编程工具里用。
 
 每家统一成 {"name", "plan", "windows": [{"name": "5h" | "week" | "month", "used": 0–100, "resets": unix 秒}], "ok": 能不能用}；
-读不到时 {"name", "error"}。
+读不到时 {"name", "error"}；退回旧结果时多一个 "stale"（多久以前、为什么）。
 """
-import hashlib, hmac, json, os, subprocess, time, urllib.parse, urllib.request
+import hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +23,8 @@ from ..engram.store.instance import CODEX              # codex CLI 的路径：�
 CODEX_HOME = HOME / "codex-quota-home"
 CLAUDE_CRED = Path.home() / ".claude/.credentials.json"
 VOLC = Path.home() / ".config/memory-harness/volc.json"
+CLAUDE_CACHE = HOME / "quota-claude.json"
+CLAUDE_TTL = 600        # Claude 额度读一次管多久（秒）：接口限流，不必高频查
 
 
 def codex():
@@ -53,7 +57,35 @@ def codex():
             "ok": bool(r.get("ordinaryUsageAllowed", True)) and not rl.get("rateLimitReachedType")}
 
 
-def claude():
+def _limited(e):
+    """被限流：429，或握手被掐断（SSL EOF）。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code == 429
+    return "UNEXPECTED_EOF" in str(e) or "EOF occurred" in str(e)
+
+
+def claude(fetch=None, now=None):
+    """先看缓存：CLAUDE_TTL 内直接用；过了才请求，读不到就退回缓存并注明。fetch、now：测试替换。"""
+    now = time.time() if now is None else now
+    try:
+        cache = json.loads(CLAUDE_CACHE.read_text())
+    except (OSError, ValueError):
+        cache = None
+    if cache and now - cache["at"] < CLAUDE_TTL:
+        return cache["q"]
+    try:
+        q = (fetch or _claude_fetch)()
+    except Exception as e:
+        why = "接口限流，过几分钟再查" if _limited(e) else str(e)[:200]
+        if not cache:
+            raise RuntimeError(why) from e
+        return dict(cache["q"], stale=f"{(now - cache['at']) / 60:.0f} 分钟前读到的；这次读不到：{why}")
+    CLAUDE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_CACHE.write_text(json.dumps({"at": now, "q": q}, ensure_ascii=False))
+    return q
+
+
+def _claude_fetch():
     cred = json.loads(CLAUDE_CRED.read_text())["claudeAiOauth"]
     if cred.get("expiresAt", 0) / 1000 < time.time():
         raise RuntimeError("Claude Code 的令牌已过期（打开一次 Claude Code 会自动刷新）")
@@ -148,5 +180,6 @@ def text(qs):
             continue
         ws = "；".join(f"{w['name']} 已用 {w['used']:g}%" + (f"，{datetime.fromtimestamp(w['resets']):%m-%d %H:%M} 重置" if w["resets"] else "")
                       for w in q["windows"])
-        lines.append(f"{q['name']}（{q['plan']}）：{ws}" + ("" if q["ok"] else "　← 用完了"))
+        lines.append(f"{q['name']}（{q['plan']}）：{ws}" + ("" if q["ok"] else "　← 用完了")
+                     + (f"（{q['stale']}）" if q.get("stale") else ""))
     return "\n".join(lines)

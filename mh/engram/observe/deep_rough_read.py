@@ -42,6 +42,7 @@ ROUGH_MIN, ROUGH_MAX = 3000, 5000   # 切开后每段平均落在这个范围（
 ROUGH_RHO = 1.0              # 条数范围的中心：每个有内容的段落大约一条（Luna 不给范围时约 0.7，给 1.2 时约 0.9–1.2 都放得开）
 ROUGH_FLOAT = 0.3            # 范围上下浮动三成（用户：只给一个数要求太高）
 CONTENT_MIN = 40             # 有内容的段落：至少这么多字
+LONG_CAP = 53                # 单轮自成一窗的条数中心上限（临时兜底，2026-10-25）：ROUGH_MAX × 有内容段落 p90 密度 10.6/千字；runbook I7a 长轮预览上线后撤
 STEPS = {"精读": "deep", "粗读": "rough"}       # 读法 → 步骤；不读的不调用
 TOOLS = {"deep": f"\n环境里唯一能用的命令是 {guard.COUNT}（数字数：参数或 here-doc 给文字）；别的命令都会让这次观察作废。\n",
          "rough": "\n不要使用任何工具或命令：用了，这次观察就作废。\n"}
@@ -77,17 +78,38 @@ def split(group, rows, cap=ROUGH_CAP, lo=ROUGH_MIN, hi=ROUGH_MAX):
              "part": f"{i + 1}/{k}"} for i, p in enumerate(parts)]
 
 
+_PATH = re.compile(r"[\w./~@+-]*[\w~@+-]")
+
+
+def file_names(files):
+    """一轮附上的读写文件 → 认段落用的名字：文件取带扩展名的文件名，目录取至少 4 个字的目录名（太短的会误认普通的词）。"""
+    names = set()
+    for x in (files or {}).get("read", []) + (files or {}).get("wrote", []):
+        for p in _PATH.findall(x.split("」：", 1)[-1] if x.startswith("提交 ") else x):
+            if "/" not in p and "." not in p:
+                continue
+            base = p.rstrip("/").rsplit("/", 1)[-1]
+            if ("." in base.strip(".") and len(base) >= 3) or ("." not in base and len(base) >= 4):
+                names.add(base)
+    return names
+
+
 def amount(tables, files=None):
     """条数范围 (a, b)：有内容的段落数 × ROUGH_RHO，上下浮动 ROUGH_FLOAT；至少 1 条、至少差 1。
-    “我”读过、写过文件的轮，“我”的段落多半在复述文件，只算用户有内容的段落 + 1 条指路的（2026-10-19：范围按全部段落算，
-    下限会逼着把文件的内容写回来）。"""
+    “我”读过、写过文件的轮，提到这些文件的“我”的段落多半在复述文件，合算 1 条指路（2026-10-19：范围按全部段落算，
+    下限会逼着把文件的内容写回来）；没提到的照常算（2026-10-25 修：原来整轮只算 1 条，读代码来回答问题的讨论也被压掉，
+    tmp/observe-fast-v2/ 的 3290ad：33 个段落只有 7 个提到附上的文件，范围却是 4–8）。"""
     def count(n, t):
         # 用户说了话的轮至少算 1 条（用户的话常常很短，不到 CONTENT_MIN，2026-10-19 不算时用户的条目少了三成多）
         user = max(1 if any(k.startswith("U") and v.strip() for k, v in t.items()) else 0,
                    sum(1 for k, v in t.items() if k.startswith("U") and len(v) >= CONTENT_MIN))
-        mine = sum(1 for k, v in t.items() if k.startswith("A") and len(v) >= CONTENT_MIN)
-        return user + (1 if (files or {}).get(n) else mine)
+        mine = [v for k, v in t.items() if k.startswith("A") and len(v) >= CONTENT_MIN]
+        names = file_names((files or {}).get(n))
+        about = [v for v in mine if any(x in v for x in names)]
+        return user + len(mine) - len(about) + (1 if about or (files or {}).get(n) and not mine else 0)
     n = max(1, round(ROUGH_RHO * sum(count(n, t) for n, t in tables.items())))
+    if len(tables) == 1:
+        n = min(n, LONG_CAP)
     lo = max(1, round((1 - ROUGH_FLOAT) * n))
     return lo, max(lo + 1, round((1 + ROUGH_FLOAT) * n))
 

@@ -1,4 +1,4 @@
-"""push：开场推送（常态记忆）。重构 E1a（2026-10-19）起从旧的 mh/synapse/__init__.py 搬来常态记忆的编译和工作区判断，
+"""push：手记推送（常态记忆）。重构 E1a（2026-10-19）起从旧的 mh/synapse/__init__.py 搬来常态记忆的编译和工作区判断，
 地图入口换成新库的话题线（见 entry），推送的足迹记成新库的 use。联想（associate.py）还在旧库上，见 runbook E1a。
 """
 import re
@@ -48,6 +48,8 @@ def _text(path):
 
 
 MEMORY_SECTION = "## 记忆与认知"
+TITLE = "# 手记"          # 整份推送（用户 2026-10-25：不用“开场”“开机”这类会话开关的说法，目标是无感切换会话）
+FLYLEAF = "## 扉页"       # core.md：写在扉页上给自己的话，几乎不改；它的二级标题推出去降一级，和近况、环境分开
 
 
 def _sections(text):
@@ -71,7 +73,8 @@ def standing(cwd="", memory=""):
         if MEMORY_SECTION not in [x[0] for x in secs]:
             secs.append([MEMORY_SECTION, []])
         secs[[x[0] for x in secs].index(MEMORY_SECTION)][1] += ["", memory]
-    parts = ["# core", "\n".join(head).strip()] + [h + "\n\n" + "\n".join(lines).strip() for h, lines in secs]
+    down = lambda s: re.sub(r"^(#+ )", r"#\1", s, flags=re.M)       # 扉页里的标题都降一级
+    parts = [TITLE, FLYLEAF, "\n".join(head).strip()] + [down(h + "\n\n" + "\n".join(lines).strip()) for h, lines in secs]
     return "\n\n".join(x for x in parts if x)
 
 
@@ -88,7 +91,7 @@ def environment(host, start="", model="", now=None):
     return "## 环境\n\n" + " | ".join(bits)
 
 
-# ---- 新库上的开场推送（E1a）----
+# ---- 新库上的手记推送（E1a）----
 
 TOOL = "mcp__mh__"       # 宿主给 MCP 工具起的名字：mcp__<服务名>__<工具名>
 
@@ -104,7 +107,7 @@ def entry(L, cwd):
 
 
 def render(cwd, host="claude", session="", start="", model=""):
-    """开场映像的正文（还没包 <memory-harness>）：内核 + 工具 → 项目现状 → 环境，稳定的在前、易变的在后。
+    """手记的正文（还没包 <memory-harness>）：内核 + 工具 → 项目现状 → 环境，稳定的在前、易变的在后。
     钩子和 `mh boot` 共用。项目现状是整理循环编好的，宿主自己给了的节去掉；读不到就不给（宿主不能报错）。"""
     from . import status
     text = standing(cwd, entry(None, cwd))
@@ -120,7 +123,7 @@ def render(cwd, host="claude", session="", start="", model=""):
 
 
 def hook(conn, payload):
-    """开场推送（Claude Code SessionStart、codex start、dsh 的 agent/created 用同一个入口）：内核 + 工具 + 项目现状 + 环境，
+    """手记推送（Claude Code SessionStart、codex start、dsh 的 agent/created 用同一个入口）：内核 + 工具 + 项目现状 + 环境，
     稳定的在前、易变的在后；记一条 use（push / assist），再写进推送流水（pushes.py）。返回宿主要的 JSON。"""
     from .. import track
     from ..track import pushes
@@ -133,7 +136,7 @@ def hook(conn, payload):
               {"topic_line": [int(x) for x in lines]}, session=session, purpose="interactive",
               cwd=cwd, channel="push", meta={"host": host})
     try:                 # 流水出了任何错都不影响推送（pushes.py 的纪律）
-        pushes.note("assist", host, session, cwd, True, summary=f"开场推送：{len(text)} 字",
+        pushes.note("assist", host, session, cwd, True, summary=f"手记推送：{len(text)} 字",
                     version=VERSION, chars=len(text), workspace=workspace(cwd))
     except Exception:
         pass

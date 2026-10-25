@@ -157,8 +157,7 @@ def handle(conn, msg):
         want = (msg.get("params") or {}).get("protocolVersion") or PROTOCOL
         from .. import pull
         result = {"protocolVersion": want, "capabilities": {"tools": {}},
-                  "serverInfo": {"name": NAME, "version": pull.VERSION},
-                  "instructions": "记忆：evoke 按词找，relive 按句柄读，roam 走地图，feedback 改正取到的话题。"}
+                  "serverInfo": {"name": NAME, "version": pull.VERSION}}             # 不给 instructions：用法在手记的“工具”里，这里再写一遍就重复了（用户 2026-10-25）
     elif method == "ping":
         result = {}
     elif method == "tools/list":
