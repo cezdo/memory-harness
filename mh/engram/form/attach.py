@@ -13,9 +13,24 @@ import re
 from . import glossary, label, skeleton
 
 
-def entry_text(name, topic, stops, words, date):
+def entry_text(name, topic, stops, words, date, where=""):
+    """where：程序数的工作区线索（cross_note），没有就不写。"""
     return (f"名字：{name}\n主题：{topic}\n" + "\n".join(f"停在：{s}" for s in stops)
-            + "\n索引词：\n" + label.show(words) + f"\n时间：{date[:10]}")
+            + "\n索引词：\n" + label.show(words) + f"\n时间：{date[:10]}" + (f"\n{where}" if where else ""))
+
+
+def complaint_text(line, why, reasons):
+    """挂线级的申请（2026-10-27，J2）：原来的挂线被指出有问题，重新挂时给模型看（原来挂到哪、当时的理由、被指出的问题）。"""
+    return ("\n\n这段会话原来挂在" + (f" {line}" if line else "：没有挂上") + (f"（理由：{why}）" if why else "")
+            + "，有人指出不对：" + "；".join(reasons) + "。重新选，别照抄原来的。")
+
+
+def cross_note(ws, counts):
+    """{工作区: 碰过的路径数} → 一行线索；只有本工作区就不写。"""
+    if not any(w != ws for w in counts):
+        return ""
+    return f"工作区：在 {ws} 开的；工具调用里碰过的路径（程序数的，不分读写）：" + "、".join(
+        f"{w} {n} 处" for w, n in sorted(counts.items(), key=lambda x: -x[1]))
 
 
 def path(pool, eid):
@@ -31,8 +46,8 @@ def _last(pool, line):
     return (max(kids, key=lambda x: x["date"])["name"] if kids else "（还没有段）"), len(kids)
 
 
-def candidates(pool, picks):
-    """检索挑出的入口，连同它们往上的线和节点（各给一次）。"""
+def candidates(pool, picks, ws=None):
+    """检索挑出的入口，连同它们往上的线和节点（各给一次）。ws：会话的工作区；别的工作区的入口前面标工作区名（2026-10-26）。"""
     ids = list(picks)
     for eid in list(ids):
         p = pool[eid]["parent"]
@@ -45,12 +60,13 @@ def candidates(pool, picks):
         e = pool[eid]
         if e["kind"] == "node":
             continue
+        where = f"{e['ws']} › " if ws and e.get("ws") and e["ws"] != ws else ""
         if e["kind"] == "line":
             last, n = _last(pool, eid)
-            lines.append(f"[{eid}]〔线〕{path(pool, eid)}｜下面 {n} 段，最近一段：{last}")
+            lines.append(f"[{eid}]〔线〕{where}{path(pool, eid)}｜下面 {n} 段，最近一段：{last}")
         else:
             st = "；".join(e["stops"])[:300]
-            lines.append(f"[{eid}]〔段〕{path(pool, eid)}｜{e['date'][:10]}" + (f"｜主题：{e['topic']}" if e["topic"] else "")
+            lines.append(f"[{eid}]〔段〕{where}{path(pool, eid)}｜{e['date'][:10]}" + (f"｜主题：{e['topic']}" if e["topic"] else "")
                          + (f"｜停在：{st}" if st else ""))
     return "\n".join(lines) or "（没有）"
 
@@ -70,15 +86,15 @@ def hint(nodes_count, ns):
     return "、".join(f"{ns[p]['id']}（{c} 个文件）" for p, c in sorted(nodes_count.items(), key=lambda x: -x[1]))
 
 
-def build(prompt, entry, pool, picks, ns=None, nodes_count=None):
-    """ns：骨架（skeleton.nodes），没有就是没骨架的写法。"""
+def build(prompt, entry, pool, picks, ns=None, nodes_count=None, ws=None):
+    """ns：骨架（skeleton.nodes），没有就是没骨架的写法。ws：会话的工作区（候选里标出别的工作区）。"""
     if ns:
         segs = [e for e in picks if pool[e]["kind"] == "entry"]
         cand = candidates(pool, segs) if segs else "（没有）"
         body = ("\n\n## 新文件夹\n\n" + entry + "\n\n## 骨架\n\n" + skeleton_tree(pool, ns)
                 + "\n\n## 程序按写进的文件算出的落点\n\n" + hint(nodes_count, ns) + "\n\n## 检索挑出的段\n\n" + cand)
     else:
-        cand = candidates(pool, [e for e in picks if pool[e]["kind"] != "node"])
+        cand = candidates(pool, [e for e in picks if pool[e]["kind"] != "node"], ws)
         body = "\n\n## 新文件夹\n\n" + entry + "\n\n## 候选\n\n" + cand
     return prompt + body + glossary.text(entry.replace("\n索引词：\n", "\n") + cand)   # 格式里的标题不算用到
 

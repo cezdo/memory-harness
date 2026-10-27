@@ -46,9 +46,14 @@ class EngramTest(unittest.TestCase):
         turns = [Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在报告里", closed=True), Turn("再说", "嗯", closed=True)]
         sess = Session("dsh", "s1", str(f), started="2026-01-01T00:00:00Z", cwd="/w", title="一段会话")
         collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(), modules={"dsh": Source(f, sess, turns)})
-        models = {"preview": Model(["### 第 1–2 轮\n类型：讨论\n读法：粗读\n"]), "deep": Model([]),
+        models = {"preview": Model(["### 第 1–2 轮\n类型：讨论\n读法：粗读\n", "### 第 3 轮\n类型：闲聊\n读法：不读\n"]), "deep": Model([]),
                   "rough": Model([f"### 事件1\n{U}提出先做一版。\n来源：1:U1\n\n### 事件2\n我说明结果在报告里。\n来源：2:A1"])}
         observe.run(self.conn, workers=1, models=models, log=io.StringIO())
+        g = self.dir / "s2.jsonl"                          # 另一段会话，还没预览：待观测（预览漏分组的轮次现在同一批里重新预览，不再停在待观测）
+        g.write_text("x")
+        sess2 = Session("dsh", "s2", str(g), started="2026-01-02T00:00:00Z", cwd="/w", title="另一段")
+        collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(),
+                    modules={"dsh": Source(g, sess2, [Turn("还没看", "嗯", closed=True)])})
         self.e1, self.e2 = [r[0] for r in self.conn.execute("SELECT id FROM event ORDER BY id")]
 
     def _form(self, events, judgments=(("判断一", []),)):
@@ -65,6 +70,22 @@ class EngramTest(unittest.TestCase):
             out.append(cur.lastrowid)
         self.conn.commit()
         return out
+
+    def test_check_skips_replaced_violations(self):
+        """重写后仍不合规的 pack：现行的列出；被重做取代以后不再列（2026-10-27：act 36640 重做后还在清单里）。"""
+        op = st.operator(self.conn, "form-test-pack", "form", "former")
+
+        def pack(violations):
+            a = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"event": [self.e1]})
+            meta = {"violations": [[0, "有 25 条事件没有落在任何陈述上"]]} if violations else {}
+            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
+                              (a, "form", "pack", st.dumps({"unit": ["dsh", "s1", self.e1]}), "", "名字：x\n", st.dumps(meta)))
+            self.conn.commit()
+            return a
+        bad = pack(True)
+        self.assertIn(f"act {bad}", check.check(self.conn, self.db).split("覆盖（")[1])      # 现行的违规
+        pack(False)                                                                          # 重做了，违规的被取代
+        self.assertNotIn("不合 pack 的检查", check.check(self.conn, self.db).split("覆盖（")[1])
 
     def test_check(self):
         report = check.check(self.conn, self.db)

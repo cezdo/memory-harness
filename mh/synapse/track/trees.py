@@ -66,14 +66,18 @@ def shows(inputs, meta):
 
 def sessions(conn):
     """有新版本真实取用的会话（会话编号对上采集里唯一一段）→ [(来源, 会话)]，按第一次取用排。"""
+    from . import rebound
+    moved, first = rebound(conn), {}
+    for oid, sid in conn.execute(f"""SELECT d.occurrence, d.session FROM use_detail d
+                                     JOIN occurrence o ON o.id=d.occurrence JOIN operator p ON p.id=o.operator
+                                     WHERE d.purpose IN ({','.join('?' * len(PURPOSES))}) AND p.name NOT LIKE 'legacy/%'
+                                     AND d.channel!='track' ORDER BY d.occurrence""", PURPOSES):
+        first.setdefault(moved.get(oid, sid), oid)       # /clear 后记错会话的，按更正算
     out = []
-    for sid, n, src in conn.execute(f"""SELECT d.session, count(DISTINCT s.source), min(s.source) FROM use_detail d
-                                        JOIN session_detail s ON s.session=d.session
-                                        JOIN occurrence o ON o.id=d.occurrence JOIN operator p ON p.id=o.operator
-                                        WHERE d.purpose IN ({','.join('?' * len(PURPOSES))}) AND p.name NOT LIKE 'legacy/%'
-                                        GROUP BY d.session ORDER BY min(d.occurrence)""", PURPOSES):
-        if n == 1:
-            out.append((src, sid))
+    for sid in sorted(first, key=first.get):
+        srcs = {r[0] for r in conn.execute("SELECT source FROM session_detail WHERE session=?", (sid,))}
+        if len(srcs) == 1:
+            out.append((srcs.pop(), sid))
     return out
 
 
@@ -82,12 +86,14 @@ def steps(conn, L, source, sid):
     starts = [r[0][:19] for r in conn.execute(
         "SELECT o.started FROM turn_detail d JOIN occurrence o ON o.id=d.occurrence WHERE d.source=? AND d.session=? "
         "ORDER BY d.ordinal", (source, sid))]
+    from . import by_session
     out = []
+    where, args = by_session(conn, sid)
     for oid, started, inputs, mode, query, meta, op in conn.execute(
             f"""SELECT o.id, o.started, o.inputs, d.mode, d.query, d.meta, p.name FROM use_detail d
                 JOIN occurrence o ON o.id=d.occurrence JOIN operator p ON p.id=o.operator
-                WHERE d.session=? AND d.purpose IN ({','.join('?' * len(PURPOSES))}) AND d.channel IN ('push','pull')
-                ORDER BY substr(o.started, 1, 19), o.id""", (sid, *PURPOSES)):     # 读取与送达构成路径；引用回填和呈现反馈另留记录
+                WHERE {where} AND d.purpose IN ({','.join('?' * len(PURPOSES))}) AND d.channel IN ('push','pull')
+                ORDER BY substr(o.started, 1, 19), o.id""", (*args, *PURPOSES)):     # 读取与送达构成路径；引用回填和呈现反馈另留记录
         q, m = json.loads(query), json.loads(meta)
         if op.startswith("legacy/"):                       # 换库前补进来的旧足迹：只有旧 J，没有层级
             continue

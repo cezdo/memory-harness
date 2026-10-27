@@ -43,6 +43,13 @@ def previous_text(name, topic, stops, lists, kind):
                      + [f"停在：{s}" for s in stops] + ["索引词："] + ["- " + "｜".join(g) for g in lists])
 
 
+def complaint_text(reasons):
+    """入口级的申请（2026-10-27，J2）：原来的入口被指出有问题，重新起名时给模型看；没有就不附。"""
+    if not reasons:
+        return ""
+    return "\n\n## 原来的入口被指出的问题\n\n" + "\n".join(f"- {why}" for _, why in reasons) + "\n\n按这些改，别的好的地方照旧。"
+
+
 def merge(old, new):
     """续上时索引词和原来的合并：新的一组和原来某组有同一个叫法（归一后），就并进那一组；没有就加在后面。"""
     out = [list(g) for g in old]

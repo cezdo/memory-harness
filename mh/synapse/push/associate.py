@@ -422,9 +422,11 @@ def _seen(conn, session):
     out = set()
     if not session:
         return out
+    from ..track import by_session
+    where, args = by_session(conn, session)
     for inputs, mode, query in conn.execute(
             "SELECT o.inputs, d.mode, d.query FROM use_detail d JOIN occurrence o ON o.id=d.occurrence "
-            "WHERE d.session=? AND d.purpose IN ('interactive', 'prefetch')", (session,)):
+            f"WHERE {where} AND d.purpose IN ('interactive', 'prefetch')", args):
         if mode == "associate" and json.loads(query).get("associate", {}).get("shadow", True):
             continue
         ins = json.loads(inputs)

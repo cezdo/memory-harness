@@ -129,11 +129,18 @@ def hook(conn, payload):
     from ..track import pushes
     from ..pull import VERSION
     host, session, cwd = payload.get("host") or "claude", payload.get("session_id", ""), payload.get("cwd", "")
+    if host == "claude":
+        try:                                 # /clear 以后 MCP 按这个认会话；出错不影响推送
+            from ..hosts import claude
+            claude.bind(session)
+        except Exception:
+            pass
     model = payload.get("model")
     text = render(cwd, host, session, str(payload.get("source") or ""), model if isinstance(model, str) else "")
-    lines = sorted(set(re.findall(r"\bL(\d+):T\d+", text)))
+    pairs = re.findall(r"(?<![A-Za-z0-9_:])L(\d+|\?):T(\d+)(?![0-9])", text.replace(entry(None, cwd), ""))  # 写出的话题和线算送达，工具节的示例不算
+    got = {"topic_line": sorted({int(x) for x, _ in pairs if x != "?"}), "session_entry": sorted({int(t) for _, t in pairs})}
     text = track.deliver(conn, VERSION, "assist", {"push": "standing"}, text,
-              {"topic_line": [int(x) for x in lines]}, session=session, purpose="interactive",
+              {k: v for k, v in got.items() if v}, session=session, purpose="interactive",
               cwd=cwd, channel="push", meta={"host": host})
     try:                 # 流水出了任何错都不影响推送（pushes.py 的纪律）
         pushes.note("assist", host, session, cwd, True, summary=f"手记推送：{len(text)} 字",

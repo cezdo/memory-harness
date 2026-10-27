@@ -7,7 +7,7 @@ import json
 import tempfile
 import unittest
 from unittest.mock import patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .. import check, form, observe
@@ -80,6 +80,13 @@ class FormTest(unittest.TestCase):
                                  "VALUES(?,?,?,?,?,?,?,?,?)", (r["born"], r["idx"] + 100, r["turn"], f"{U}还提到要先备份。", r["mode"],
                                                               r["qualifier"], r["speaker"], r["segments"], r["unresolved"])).lastrowid
 
+    def test_pack_languages(self):
+        from .pack import e_block
+        evs = [{"id": 1, "ordinal": 0, "speaker": "我", "mode": "告知", "segments": ["A1"], "text": "我说明已经停了。"}]
+        out = e_block(evs, {1: ["a.md"]}, {0: "这一轮我换成英文回复（上一轮用中文）。", 1: "这一轮我换成中文回复（上一轮用英文）。"})
+        self.assertIn("我说明已经停了。\n这一轮我换成英文回复", out)
+        self.assertNotIn("换成中文", out)                  # 没有 E 的轮次不单独写语言
+
     def test_continue_and_insert(self):
         a = self._session("s1", "2026-10-17T08:00:00Z")
         self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
@@ -116,6 +123,10 @@ class FormTest(unittest.TestCase):
         self.assertTrue(rows[-1]["why"].startswith("待审视：") and f"E{late}" in rows[-1]["why"])
         self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='attach'").fetchone()[0], 1)
         self.assertEqual(form.units(self.conn, self.now), [])
+        self.assertTrue(form.entries(self.conn)["T3"]["review"].startswith("待审视："))          # 读的一侧看得到（J6）
+        me = st.main_operator(self.conn, "m")                                                   # 主会话看过：改挂到同一条线，标记就清掉
+        form.feedback_attach(self.conn, me, 3, "带着新内容看过了，挂得对", line="L1")
+        self.assertEqual(form.entries(self.conn)["T3"]["review"], "")
         text = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
         self.assertIn("（重新整理：", text)
         self.assertIn(["回退", "rollback"], form.entries(self.conn)["T3"]["words"]["lists"])   # 续上部分的词没丢
@@ -306,6 +317,183 @@ class FormTest(unittest.TestCase):
 
     def _run(self, fakes, **kw):
         return form.run(self.conn, workers=1, models=fakes, log=io.StringIO(), now=self.now, **kw)
+
+    def test_pack_check(self):
+        """pack-v0.4 的检查（2026-10-27）：范围、不在输入里、超过两页、两页跨了预览的组。"""
+        evs = [{"id": i, "turn": 100 + i // 10, "ordinal": i // 10} for i in range(1, 30)]
+        groups = {100: ("p", 1, 1, "a"), 101: ("p", 2, 2, "b"), 102: ("p", 3, 3, "c")}
+        it = lambda n, basis, **kw: {"n": n, "text": "", "basis": basis, "quotes": [], "files": [], **kw}
+        got = dict(pack.check([it(1, [1, 2], ranges=True), it(2, [1, 99]), it(3, list(range(1, 20))),
+                               it(4, list(range(1, 11))), it(5, list(range(10, 20))), it(6, [1, 2, 3])], evs, groups))
+        self.assertIn("范围", got[1])
+        self.assertIn("E99", got[2])
+        self.assertIn("拆成几条", got[3])
+        self.assertIn("跨了第 1 轮、第 2 轮", got[4])                                       # 9–16 条跨了两组
+        self.assertNotIn(5, got)                                                           # 9–16 条在同一组（第 2 轮）
+        self.assertNotIn(6, got)
+        few = [dict(e, speaker=U if e["id"] == 2 else "我") for e in evs[:3]]                  # 覆盖（检查 v2）
+        cov = pack.check([it(1, [1])], few, groups)
+        self.assertTrue(any(n == 0 and "E2" in why and "总要保留" in why for n, why in cov))
+        self.assertTrue(any(n == 0 and "2 条事件没有落在" in why for n, why in cov))
+        self.assertEqual(pack.check([it(1, [1, 2, 3])], few, groups), [])
+        _, _, items, _, _ = pack.parse("名字：x\n主题：y\n### 陈述1\nz\n来源：E1-E3\n", evs)
+        self.assertTrue(items[0].get("ranges"))
+
+    def test_pack_rewrite(self):
+        """检查出不合规的陈述，带着问题当场重写一次；重写后的入库，第一次的输出和问题留在 meta。"""
+        e = self._session("s1", "2026-10-17T08:00:00Z")
+        bad = PACK.format(a=e[0], b=e[1]).replace(f"来源：E{e[0]}\n", f"来源：E{e[0]}-E{e[1]}\n", 1)
+        fakes = self._fakes([bad, PACK.format(a=e[0], b=e[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"])
+        self._run(fakes)
+        meta = json.loads(self.conn.execute("SELECT meta FROM act_detail WHERE step='pack' ORDER BY occurrence DESC").fetchone()[0])
+        self.assertEqual(len(meta["rewrite"]), 1)
+        self.assertIn("范围", meta["rewrite"][0]["problems"][0][1])
+        self.assertNotIn("violations", meta)
+        basis = json.loads(self.conn.execute("SELECT structures FROM form_record ORDER BY id LIMIT 1").fetchone()[0])["basis"]
+        self.assertEqual(basis, [e[0]])
+
+    def test_repack_keeps_entry(self):
+        """只重做陈述（2026-10-27，方案一）：form 写给自己的申请点名陈述，从 pack 起重做，入口（含手动改过的名字）和挂线由程序沿用，
+        不调模型起名、挂线；停在按 E 的重合换到新陈述。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        me = st.main_operator(self.conn, "m")
+        (t,) = form.entries(self.conn)
+        form.feedback_entry(self.conn, me, int(str(t).lstrip("T")), "名字太泛", name="X 升级与回退")
+        line = self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0]
+        recs = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")]
+        rid = form.request_repack(self.conn, recs[:1], "来源超过两页")
+        self.conn.commit()
+        self.assertEqual([u["request"] for u in form.units(self.conn, self.now)], [[rid]])
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [], []))           # 起名、挂线的假模型是空的：调用就会出错
+        (e,) = form.entries(self.conn).values()
+        self.assertEqual(e["name"], "X 升级与回退")
+        self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
+        new = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")][len(recs):]
+        stops = json.loads(self.conn.execute("SELECT stops FROM session_entry ORDER BY id DESC").fetchone()[0])
+        self.assertTrue(stops and set(stops[0]["basis"]) <= set(new) and stops[0]["basis"])
+        self.assertEqual(st.requests(self.conn, "form"), [])                  # 认领过了
+
+    def test_auto_repack_capped(self):
+        """页对齐检查重写后仍不合规的，form 自动给自己写一张重做申请（沿用入口和挂线）；重做以后还不合规就不再写（J4，防环）。"""
+        e = self._session("s1", "2026-10-17T08:00:00Z")
+        bad = PACK.format(a=e[0], b=e[1]).replace(f"来源：E{e[0]}\n", f"来源：E{e[0]}-E{e[1]}\n", 1)
+        self._run(self._fakes([bad, bad], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))       # 重写一次仍违规，入库
+        n_rec = self.conn.execute("SELECT count(*) FROM form_record").fetchone()[0]
+        self.assertEqual(form.auto_repack(self.conn, log=io.StringIO()), 1)
+        self.assertEqual(form.auto_repack(self.conn, log=io.StringIO()), 0)                     # 还没认领：不重复写
+        self.conn.commit()
+        self._run(self._fakes([bad, bad], [], []))                                               # 重做，仍违规；入口、挂线沿用
+        self.assertGreater(self.conn.execute("SELECT count(*) FROM form_record").fetchone()[0], n_rec)
+        self.assertEqual(form.auto_repack(self.conn, log=io.StringIO()), 0)                     # 已写过 REPACK_MAX 张：不再自动重做
+        reqs = [r for r in st.requests(self.conn, "form", "all") if r["from"] == "form"]
+        self.assertEqual(len(reqs), form.REPACK_MAX)
+
+    def test_relabel_sees_old_entry(self):
+        """看着指定的旧入口重新起名（2026-10-27）：主会话申请重做后另起了线，relabel 拿旧入口重新起名，挂回旧入口那时的线。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        (t_old,) = form.entries(self.conn)
+        old_line = self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0]
+        me = st.main_operator(self.conn, "m")
+        recs = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")]
+        st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1]}, "来源超过两页", me, cause="manual")
+        self.conn.commit()
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], ["名字：X 的另一种说法\n停在：升级（陈述1）\n索引词：\n- X\n"],
+                              ["挂到：新线 X 升级（二）｜为什么：新的目标"]))
+        self.assertNotEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], old_line)
+        state = form.relabel(self.conn, "dsh", "s1", int(str(t_old).lstrip("T")), model=FakeModel([LABEL]), log=io.StringIO())
+        self.assertIn("X 升级", state)
+        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        self.assertIn("## 这段会话原来的会话入口", lab)                           # 模型看得到旧入口
+        self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], old_line)
+
+    def test_main_request_level(self):
+        """申请按级别定下游（J2，2026-10-27）：主会话写的 level = statement，沿用入口（含手动改的名字）和挂线，不调模型起名；
+        level = unit（或以前没写级别的主会话申请）才从起名、挂线从头来。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        me = st.main_operator(self.conn, "m")
+        (t,) = form.entries(self.conn)
+        form.feedback_entry(self.conn, me, int(str(t).lstrip("T")), "名字太泛", name="X 升级与回退")
+        line = self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0]
+        recs = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")]
+        rid = st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1], "level": ["statement"]}, "来源超过两页", me, cause="manual")
+        self.conn.commit()
+        u = form.units(self.conn, self.now)[0]
+        self.assertTrue(form._keep_entry(self.conn, u))
+        self.assertFalse(form._restart(self.conn, u))
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [], []))           # 起名、挂线的假模型是空的：调用就会出错
+        (e,) = form.entries(self.conn).values()
+        self.assertEqual(e["name"], "X 升级与回退")
+        self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
+        # 单位级、以前没写级别的主会话申请：从头来
+        recs = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")]
+        st.request(self.conn, st.MAIN, "form", {"form_record": recs[-1:], "level": ["unit"]}, "会话被切成两份", me, cause="manual")
+        self.conn.commit()
+        u = form.units(self.conn, self.now)[0]
+        self.assertTrue(form._restart(self.conn, u) and not form._keep_entry(self.conn, u))
+        self.assertEqual(form._levels(self.conn, [rid]), ["statement"])
+
+    def _formed(self):
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        recs = [r[0] for r in self.conn.execute("SELECT id FROM form_record ORDER BY id")]
+        line = self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0]
+        return st.main_operator(self.conn, "m"), recs, line
+
+    def _acts(self, step):
+        return self.conn.execute("SELECT count(*) FROM act_detail WHERE step=?", (step,)).fetchone()[0]
+
+    def test_entry_level_redo(self):
+        """入口级的申请（J2，2026-10-27）：只重新起名，陈述留着（不再 pack）、挂线沿用（不再 attach）；模型看得到被指出的问题；
+        起名认领这张申请。"""
+        me, recs, line = self._formed()
+        rid = st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1], "level": ["entry"]}, "名字太泛，要带上回退", me, cause="manual")
+        self.conn.commit()
+        u = form.units(self.conn, self.now)[0]
+        self.assertEqual(u["request"], [rid])
+        self.assertFalse(form._restart(self.conn, u) or form._keep_entry(self.conn, u))
+        new = "名字：X 升级与回退演练\n停在：定下按 b 做法升级（陈述1、陈述2）\n索引词：\n- X 升级｜升级 X\n"
+        self._run(self._fakes([], [new], []))                       # pack、attach 的假模型是空的：调用就会出错
+        (e,) = form.entries(self.conn).values()
+        self.assertEqual(e["name"], "X 升级与回退演练")
+        self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
+        self.assertEqual((self._acts("pack"), self._acts("label"), self._acts("attach")), (1, 2, 1))
+        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        self.assertIn("原来的入口被指出的问题", lab)
+        self.assertIn("名字太泛", lab)
+        self.assertEqual(st.requests(self.conn, "form", "open"), [])       # 认领了
+        self.assertEqual(form.units(self.conn, self.now), [])
+
+    def test_attach_level_redo(self):
+        """挂线级的申请（J2，2026-10-27）：只重新挂线，陈述和入口留着（不再 pack、起名）；模型看得到原来的挂线和被指出的问题。"""
+        me, recs, line = self._formed()
+        rid = st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1], "level": ["attach"]}, "线名起窄了，应当另起一条", me, cause="manual")
+        self.conn.commit()
+        u = form.units(self.conn, self.now)[0]
+        self.assertEqual(u["request"], [rid])
+        self._run(self._fakes([], [], ["挂到：新线 X 升级的另一条线｜为什么：目标不同"]))
+        self.assertEqual(form.entries(self.conn)["T1"]["name"], "X 升级")
+        self.assertNotEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
+        self.assertEqual((self._acts("pack"), self._acts("label"), self._acts("attach")), (1, 1, 2))
+        att = self.conn.execute("SELECT input FROM act_detail WHERE step='attach_lines' OR step='attach' ORDER BY occurrence DESC").fetchone()[0]
+        self.assertIn("有人指出不对：线名起窄了", att)
+        self.assertIn(f"L{line}", att)
+        self.assertEqual(st.requests(self.conn, "form", "open"), [])
+        self.assertEqual(form.units(self.conn, self.now), [])
+
+    def test_entry_and_attach_levels_together(self):
+        """同时有入口级和挂线级的申请：起名认领入口级、不沿用挂线，挂线认领挂线级。"""
+        me, recs, line = self._formed()
+        st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1], "level": ["entry"]}, "名字太泛", me, cause="manual")
+        st.request(self.conn, st.MAIN, "form", {"form_record": recs[:1], "level": ["attach"]}, "线挂错了", me, cause="manual")
+        self.conn.commit()
+        new = "名字：X 升级与回退演练\n停在：定下按 b 做法升级（陈述1、陈述2）\n索引词：\n- X 升级｜升级 X\n"
+        self._run(self._fakes([], [new], ["挂到：新线 另一条｜为什么：换了"]))
+        self.assertEqual((self._acts("pack"), self._acts("label"), self._acts("attach")), (1, 2, 2))
+        self.assertEqual(st.requests(self.conn, "form", "open"), [])
+        self.assertNotEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
 
     def test_parse(self):
         name, topic, items, dropped, unknown = pack.parse(PACK.format(a=1, b=2), [{"id": 1}, {"id": 2}, {"id": 3}])
@@ -508,6 +696,50 @@ class FormTest(unittest.TestCase):
                     modules={"dsh": FakeSource(f, sess, [Turn("还没看", "嗯", closed=True, started="2026-10-17T07:00:00Z")])})
         self.assertEqual(form.units(self.conn, self.now), [])
 
+    def test_active_session_does_not_gate(self):
+        """还在进行的会话（没到 IDLE）的未预览轮不挡门槛（2026-10-27：另一段会话的未预览轮从更早的时间钉住门槛两个多小时）；
+        告一段落了还没预览的才挡。"""
+        self._session("s1", "2026-10-17T08:00:00Z")
+        f = self.dir / "s0.jsonl"
+        f.write_text("x")
+        sess = Session("dsh", "s0", str(f), started="2026-10-17T07:00:00Z", cwd="/w")
+        began = (self.now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(),
+                    modules={"dsh": FakeSource(f, sess, [Turn("早先的", "嗯", closed=True, started="2026-10-17T07:00:00Z"),
+                                                         Turn("还在做", "嗯", closed=True, started=began)])})
+        self.assertEqual([u["unit"][1] for u in form.units(self.conn, self.now)], ["s1"])
+
+    def test_switched_off_session_unreadable(self):
+        """/no-observe 在 form 读过之后（J5，2026-10-27）：会话入口读不到（pool、entries 都不列，线跟着清空），/do-observe 后回来。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        self.assertEqual(len(form.entries(self.conn)), 1)
+
+        def say(command, when):
+            f = self.dir / "s1.jsonl"
+            sess = Session("dsh", "s1", str(f), started="2026-10-17T08:00:00Z", cwd="/w")
+            turns = [Turn("把 X 升级一下（s1）", "好", closed=True, started="2026-10-17T08:00:00Z"),
+                     Turn("写下来（s1）", "写进 docs/x.md 了", closed=True, started="2026-10-17T08:00:00Z")]
+            turns += [Turn(c, "", closed=True, started=t) for c, t in self.said + [(command, when)]]
+            self.said.append((command, when))
+            collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(), modules={"dsh": FakeSource(f, sess, turns)})
+        self.said = []
+        say("/no-observe", "2026-10-17T09:00:00Z")
+        self.assertEqual(form.entries(self.conn), {})
+        got = form.pool(self.conn).values()
+        self.assertFalse([e for e in got if e["kind"] == "entry"])
+        self.assertTrue(all(e.get("retired") for e in got if e["kind"] == "line"))
+        say("/do-observe", "2026-10-17T10:00:00Z")
+        self.assertEqual(len(form.entries(self.conn)), 1)
+
+    def test_wait_follows_observe_idle(self):
+        """form 等会话告一段落按 observe 的 IDLE（dsh 3 小时），不是自己的 60 分钟：J1 以后还在进行的会话不进门槛，
+        只靠 60 分钟的话，快道读过的 E 会先被整理，预览读完的再变成续上或中间插入（J8，2026-10-27）。"""
+        self._session("s1", "2026-10-17T08:00:00Z")
+        for hours, want in ((1.5, []), (2.5, []), (3.5, ["s1"])):
+            now = datetime(2026, 10, 17, 8, 0, tzinfo=timezone.utc) + timedelta(hours=hours)
+            self.assertEqual([u["unit"][1] for u in form.units(self.conn, now)], want, hours)
+
     def test_failures(self):
         a = self._session("s1", "2026-10-17T08:00:00Z")
         b = self._session("s2", "2026-10-17T09:00:00Z")
@@ -520,6 +752,21 @@ class FormTest(unittest.TestCase):
         self.assertEqual([r[0] for r in form.redo(self.conn)], ["pack"])
         self.assertEqual([tuple(r) for r in self.conn.execute("SELECT entry, line FROM attachment")], [(1, 1)])
 
+    def test_capacity_retries_then_recovers(self):
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        busy = RuntimeError("Selected model is at capacity. Please try a different model.")
+        fakes = self._fakes([busy] * 3 + [PACK.format(a=a[0], b=a[1])], [LABEL],
+                            ["挂到：新线 X 升级｜为什么：新的目标"])
+        for _ in range(3):
+            self._run(fakes)
+        rows = self.conn.execute("SELECT o.outcome FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                 "WHERE a.process='form' AND a.step='pack' ORDER BY o.id").fetchall()
+        self.assertEqual([r[0] for r in rows], ["env_error"] * 3)
+        self.assertEqual(form.redo(self.conn), [])
+        self._run(fakes)
+        self.assertEqual(len(form.history(self.conn).packed), 2)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM attachment").fetchone()[0], 1)
+
     def test_bad_attach(self):
         a = self._session("s1", "2026-10-17T08:00:00Z")
         fakes = self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：L9｜为什么：没有这条线", "挂到：新线 X 升级｜为什么：新的"])
@@ -528,6 +775,24 @@ class FormTest(unittest.TestCase):
         rows = self.conn.execute("SELECT o.outcome FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
                                  "WHERE a.step='attach' ORDER BY o.id").fetchall()
         self.assertEqual([r[0] for r in rows], ["content_error", "ok"])
+
+    def test_cross_workspace_attach(self):
+        """在 proj 开、碰过 other 3 处以上的会话，other 的线进候选、挂得上，输入里写明工作区线索；碰得少的挂上去算错（2026-10-26）。"""
+        from unittest import mock
+        a = self._session("s1", "2026-10-17T08:00:00Z", cwd="/home/u/other")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的"]))
+        b = self._session("s2", "2026-10-17T09:00:00Z", cwd="/home/u/proj")
+        c = self._session("s3", "2026-10-17T10:00:00Z", cwd="/home/u/proj")
+        touched = {"s2": {"other": 5, "proj": 2}, "s3": {"other": 1}}
+        with mock.patch.object(form, "crossed", lambda conn, u: touched[u["unit"][1]]):
+            self._run(self._fakes([PACK.format(a=b[0], b=b[1]), PACK.format(a=c[0], b=c[1])], [LABEL, LABEL],
+                                  ["挂到：L1｜为什么：同一次升级", "挂到：L1｜为什么：同一次升级", "挂到：新线 Y｜为什么：新的"]))
+        rows = self.conn.execute("SELECT o.outcome, a.input FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()
+        self.assertEqual([r[0] for r in rows], ["ok", "ok", "content_error"])           # 出错的下一批再试
+        self.assertIn("工作区：在 proj 开的；工具调用里碰过的路径（程序数的，不分读写）：other 5 处、proj 2 处", rows[1][1])
+        self.assertNotIn("工作区：", rows[2][1])                                   # other 只碰过 1 处：不进范围，也不写线索
+        self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id").fetchall()[1][0], 1)
 
     def test_skeleton(self):
         design = self.dir / "design"

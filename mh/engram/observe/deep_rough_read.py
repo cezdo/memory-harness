@@ -5,7 +5,7 @@
 - 精读 deepseek-ark-web-deep：常驻 dsh web（端口 3085），minimal 预设原样带 bash，只放行字数命令（白名单外判失败），high；
 - 粗读 deepseek-ark-web-rough：另起的 dsh web（端口 3086），bare 预设去掉全部工具，low（到 2026-10-19）。
 2026-10-19 起（tmp/window/ 实验三到六，用户：粗读是常态、精读是精品，各用所长）：
-- 粗读 luna-codex-rough：codex exec 上的 Luna，low，用了工具就作废；提示词 rough-read-v0.1。
+- 粗读 luna-codex-rough：codex exec 上的 Luna，low，用了工具就作废；提示词 rough-read-v0.2（10-26 前 v0.1）。
   一次最多读 ROUGH_CAP 字的回复（写窗口：一次读得越多写得越粗），超出的组按轮切开分几次读（切开的各段都带这组的计划）；
   提示词给一个条数范围（有内容的段落数 × ROUGH_RHO，上下浮动 ROUGH_FLOAT），不给字数；
   每一轮开头附上这一轮“我”读过、写过的文件和提交（程序从工具调用里认，written_files），复述文件的说明只写一条指路的。

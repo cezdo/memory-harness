@@ -11,11 +11,14 @@ IDE 标签（<ide_opened_file>…、<ide_selection>…）加在用户的话前�
 task-id、tool-use-id、output-file 和固定说明的 note 不给。预览、精读粗读、回溯的段落编号都经 user_text，切法一致。
 压缩总结只留一个标记，正文不给（2026-10-20：对话的上下文是充足的，信息量只在压缩后的回复里）；以前读过总结的观察
 留下的段落编号照旧认（回溯按那次观察的 Operator 参数决定切法，show.segments）。
+语言：这一轮用的语言和记录语言（中文）不同、或者“我”和上一轮换了语言的，由 language_note() 写进这一轮的说明（2026-10-26）。
 转述：用户贴进来的别处文本（另一个模型的回复、别处起草的题目），由 relayed() 认出，说话人写“转来的文本”（2026-10-08；
 2026-10-17 起由 observe 标在 E 上，form 从 E 读）。
 """
+import json
 import re
 
+from . import guard
 from ..store.instance import USER_NAME, USER_ALIASES   # 称呼在实例配置里：写记录用 USER_NAME，匹配时认 USER_ALIASES 里任何一个
 PLATFORMS = {"codex": "Codex", "dsh": "dsh（DeepSeek Harness）", "claude": "Claude Code"}
 
@@ -140,3 +143,92 @@ def relayed(text):
         head.append(line)
     preface = re.match(r"[^。！？：:]*[。！？：:]?", "\n".join(head).strip()).group(0)   # 引语常和转述连在同一行，截到第一句
     return preface if len(preface) <= 300 else ""
+
+
+# 语言（2026-10-26，起因：中文提问、英文回答的轮次，E 全译成中文，原来的提法和“用英文答了”这件事都没留下）。
+RECORD_LANGUAGE = "中文"     # 记录语言：提示词和 E 用的语言（runbook H6 做成实例配置前写死在这里）
+# 一段话用什么语言，按句子的骨架认，不按字数（用户 2026-10-26）：谓语、修饰这些语法算子是骨干语言，名词、术语、引的原话
+# 可能更长，但不算在用的语言（“我把 replay 停了”是中文，“I stopped the 回放”是英文）。骨架词是封闭的一类：
+# 中文取语法算子坐标表 v0.2 的表层锚点（design/engram/form/shelved/语法算子.md），加上判断词、处置、被动；
+# 英文、日文按同样的算子配各自的虚词、助动词、系词（没有坐标表，按算子的分组列）。锚点落在实词里也会算上，只用来比哪种多。
+SKELETON = {
+    "中文": """不 没 未 非 而且 并且 又 或者 或 要么 如果 就 只要 只有 才 因为 所以 由于 因此 为了 以便 好让 但是 不过 而
+虽然 即使 也 有的 某个 每 所有 都 各 分别 一半 多数 少数 通常 一般 只 仅 唯独 还 同样 连 甚至 有点 稍微 很 非常 更 比 不如
+一样 最 至少 至多 超过 不到 约 大约 差不多 将近 越 愈 可能 也许 或许 一定 必定 必然 可以 不妨 必须 应当 应该 得 能 能够
+愿意 想要 希望 认为 觉得 看来 据说 听说 现在 当时 之前 之后 同时 先 再 了 正在 正 在 着 过 曾经 开始 变得 不再 仍然 继续
+重新 经常 偶尔 总是 使 让 令 从 到 向 往 地 的 所 吗 是否 什么 谁 请 别 吧 是 把 被 呢 已经""".split(),
+    "英文": """not no never n't nor and or if unless because so since therefore for to but however although though while
+even some any every all each both either neither only just also too very quite rather more less than as most least about
+around nearly almost may might maybe perhaps probably could must should ought need can cannot able will would shall want
+hope wish think believe seem seems apparently now then before after when until already still yet again often always usually
+sometimes ever make makes let lets in on at from into onto of by with without through over under the a an this that these
+those which who whom whose what where why how whether please is are was were be been being am do does did have has had""".split(),
+    "日文": """は が を に で と へ から まで より の も や か ね よ な ない ず ません ます です でした だ だった た て ている
+いる ある れる られる せる させる たい ので のに けど けれど でも しかし また もし なら ば たら ても だけ しか さえ ほど くらい
+ように こと もの""".split(),
+}
+SKELETON_MIN = 5             # 骨架词至少这么多个才判断，短的不判
+SKELETON_LEAD = 2.0          # 最多的那种语言至少是第二多的这么多倍；骨架本身混得分不清的不判
+_CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.S)
+_HAN_RUN = re.compile(r"[㐀-鿿]+")
+_HIRA_RUN = re.compile(r"[ぁ-ゟ]+")
+_WORD = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]+(?:'[A-Za-z]+)?(?![A-Za-z0-9_])")    # A1、v3 这种编号不是词
+_ZH = re.compile("|".join(sorted(SKELETON["中文"], key=len, reverse=True)))
+_JA = re.compile("|".join(sorted(SKELETON["日文"], key=len, reverse=True)))
+_EN = set(SKELETON["英文"])
+CODEX_REQUEST = "## My request:"   # codex 附件外壳“# Files mentioned by the user: … ## My request:”之后才是用户的话
+_CODEY = re.compile(r"[=(){}<>|$;\[\]]|^\s{2,}|^\S+:\s")    # 贴进来的命令、代码、日志行（同 Synapse 联想的认法）
+
+
+def skeleton(text):
+    """各语言的骨架词个数：{语言: 个数}。中文在汉字串里、日文在平假名串里按长的优先数，英文按词（n't 单算）。"""
+    words = [w.lower() for w in _WORD.findall(text) if w != "A"]       # 大写的单个 A 多是“A 和 B”的代号，不当冠词
+    return {"中文": sum(len(_ZH.findall(r)) for r in _HAN_RUN.findall(text)),
+            "英文": sum(w in _EN for w in words) + sum(w.endswith("n't") for w in words),
+            "日文": sum(len(_JA.findall(r)) for r in _HIRA_RUN.findall(text))}
+
+
+def _json(text):
+    t = (text or "").strip()
+    if not t.startswith(("{", "[")):
+        return False
+    try:
+        json.loads(t)
+        return True
+    except ValueError:
+        return False
+
+
+def language(text, pasted=False):
+    """一段话用什么语言写（按骨架，见 SKELETON）：中文、日文、英文；骨架词太少或分不清返回 None。代码块、行内代码、链接、路径不算，
+    整段是 JSON 的不判。pasted：用户这一侧，再去掉像命令、代码、日志的行（贴进来的，不是用户自己写的话）。"""
+    if _json(text):
+        return None
+    t = _CODE.sub(" ", text or "")
+    if pasted:
+        t = "\n".join(l for l in t.splitlines() if not _CODEY.search(l))
+    t = guard.PATH.sub(" ", guard.URL.sub(" ", t))
+    (top, n), (_, second) = sorted(skeleton(t).items(), key=lambda x: -x[1])[:2]
+    return top if n >= SKELETON_MIN and n >= SKELETON_LEAD * second else None
+
+
+def language_note(user, assistant, before=None, steady=True):
+    """这一轮用的语言，一句话；都是记录语言、也没换语言的返回 None。
+    before：同一会话前面最近一轮判得出语言的“我”的回复（None = 前面没有，按记录语言算）；“我”和它用的语言不同，写“换成”。
+    steady=False：接着用同一种语言的轮不写（只写换了语言的，和用户用的不是记录语言的）。
+    用户这一侧只看整段都是用户自己写的话：宿主注入、转述的不判，有一行像贴进来的命令、日志也不判（2026-10-26：贴日志的轮被读成“用户用英文说”）。"""
+    mine = language(assistant)
+    u = user_text(user)[0]
+    u = u.split(CODEX_REQUEST, 1)[1] if CODEX_REQUEST in u else u     # codex 带附件时宿主套的英文外壳，只看用户的话
+    own = kind(user) is None and relayed(user) is None and not any(_CODEY.search(l) for l in u.splitlines())
+    theirs = language(u) if own else None
+    prev = RECORD_LANGUAGE if before is None else language(before)
+    switched = bool(mine and prev and mine != prev)
+    out = []
+    if theirs and (theirs != RECORD_LANGUAGE or (mine and mine != theirs and (steady or switched))):
+        out.append(f"{USER_NAME}用{theirs}说")
+    if switched:
+        out.append(f"我换成{mine}回复（上一轮用{prev}）")
+    elif steady and mine and mine != RECORD_LANGUAGE:
+        out.append(f"我用{mine}回复")
+    return "这一轮" + "，".join(out) + "。" if out else None

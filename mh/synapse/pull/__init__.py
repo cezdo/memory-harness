@@ -30,7 +30,7 @@ from ...engram.store import absent
 from .. import track
 from . import retrieve
 
-VERSION = "v0.16"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.23"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -38,8 +38,17 @@ VERSION = "v0.16"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.13 改名 evoke、relive、roam，按方向分：话题按顺序分页、一条陈述给前后几条（2026-10-22）
                          # v0.14 三个工具都有 limit、page（条数、翻页），evoke 加 grain（最小到 L、T、S）（2026-10-22）
                          # v0.16 旧 J 退役（2026-10-23，全量重读后由陈述代替）：evoke 不再给，relive 旧句柄标明已退役
+                         # v0.17 evoke 去掉 limit、page：一页 6–8 条按字数定，同一轮前面给过的不再列，再 evoke 就是接着往下（2026-10-27）
+                         # v0.18 陈述的来源按 form 写下的顺序给，不按编号（2026-10-27：相关的被挤出第一页，足迹记的那页也对不上）
+                         # v0.19 话题超窗先给目录（按 observe 预览的分组），陈述带 said 只给原话的位置和开头（2026-10-27：查看窗口 6–8 条）
+                         # v0.20 陈述的来源页对齐分节：两页要同一预览组，否则按组、轮分；同一轮再执行给下一节，分了节才提示（2026-10-27）
+                         # v0.21 来源分节先按 form 写下的结构：直接来源、各『引用』、各『文件』各一节（2026-10-27）
+                         # v0.22 『文件』指向和来源分开，默认不给，relive 带 files 才给（2026-10-27）
+                         # v0.23 话题头下提示“挂线待审视”（中间插入留下的标记，form 设计“挂线是粗筛”；J6，2026-10-27）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
+EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
+EVOKE_CHARS = 800        # 超过 6 条时一页最多多少字：近期 8 条满页的中位约 800 字（10-27 量的）
 LIMIT_MAX = 30           # 一页最多几条（v0.14，2026-10-22：条数和翻页都要有；默认还是 SHOW）
 GRAINS = {"L": ("line", "node"), "T": ("line", "node", "entry"), "S": ("line", "node", "entry")}   # evoke 最小给到哪一层（v0.14）
 K1, B = 1.5, 0.75
@@ -283,7 +292,10 @@ def _span(hs):
 
 def _head(L, nid):
     n = L.nodes[nid]
-    return f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+    head = f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+    if n.get("review"):          # 中间插入留下的标记（v0.23）：这条挂线形成时没看到后来补进的内容，用到时由你带着新内容再看
+        head += f"\n挂线{n['review']}；线挂得不对就用 feedback 改挂（改挂到同一条线表示看过了）"
+    return head
 
 
 def show_node(L, nid, recall=None, conn=None, start=0):
@@ -293,6 +305,10 @@ def show_node(L, nid, recall=None, conn=None, start=0):
         # 后面还有的写出接着读的句柄。上一级的线先不给。
         items = n.get("items", [])
         size, p = _WIN.get()
+        if len(items) > size and not start and p == 1 and recall is None and conn is not None:
+            secs = _sections(conn, L, items)
+            if secs:
+                return _show_sections(L, nid, secs)
         start = start or (p - 1) * size
         page = items[start:start + size]
         out = [_head(L, nid)] + [f"- {L.stmts[it['id']]['h']} {it['text']}" for it in page]
@@ -316,6 +332,111 @@ def show_node(L, nid, recall=None, conn=None, start=0):
     if n["kind"] == "line":
         ins["topic_line"].insert(0, n["row"])
     return "\n".join(out), dict(ins)
+
+
+def _sections(conn, L, items):
+    """话题超窗时的目录（v0.19，2026-10-27）：陈述按 observe 预览的分组归节，节名用预览写的“类型”，不另调模型。
+    陈述看它第一条 E 出自哪一轮，那一轮以最近一次预览的分组为准；对不上预览的（旧做法观察的）归“其余”。全都对不上给空。"""
+    turns = {}
+    for it in items:
+        row = conn.execute("SELECT refs FROM form_record WHERE id=?", (it["id"],)).fetchone()
+        refs = json.loads(row[0]).get("event", []) if row else []
+        r = refs and conn.execute("SELECT turn FROM event WHERE id=?", (refs[0],)).fetchone()
+        turns[it["id"]] = r[0] if r else None
+    group = _preview_groups(conn, turns.values())
+    secs = {}
+    for it in items:
+        k = group.get(turns[it["id"]])
+        secs.setdefault(k, []).append(it["id"])
+    if list(secs) == [None]:
+        return []
+    return [(k, ids) for k, ids in secs.items()]
+
+
+def _preview_groups(conn, turns):
+    """轮 → 它最近一次 observe 预览的分组 (预览, 从第几轮, 到第几轮, 类型)：经 observe 的接口（observe.groups）。"""
+    from ...engram import observe
+    return observe.groups(conn, turns)
+
+
+def _group_name(k):
+    return (f"第 {k[1]}–{k[2]} 轮" if k[1] != k[2] else f"第 {k[1]} 轮") + (f" {k[3]}" if k[3] else "")
+
+
+def source_sections(conn, evs, size=None, structures=None, files=False):
+    """陈述的来源怎么分节（v0.20，用户 2026-10-27：页对齐，两页要有门槛）。返回 [(节名或 None, [E 编号…])]，按 form 写下的顺序。
+    一页以内不分。form 写下了结构的（v0.21）按结构分：直接来源一节，每个『引用』『文件』各一节，节名是引用名、文件路径，
+    前面给过的不重给（refs.event 就是这几样的并集：sol 10-27 查的，超过 16 条的 106 条里 91 条是被引用、文件指向撑大的）。
+    没有结构的：两页以内、全在同一个预览组的顺着切成两页；否则按预览组分，只有一组的按轮分，只有一轮的顺着切。
+    每节再按窗口切齐，后面的标“续”。"""
+    size = size or _WIN.get()[0]
+    st_ = structures or {}
+    structured = bool(st_.get("basis") or st_.get("quotes") or st_.get("files"))
+    if structured:              # 『文件』指向和来源分开：默认不给，files 时只给它（用户 2026-10-27，v0.22）
+        own = set(st_.get("basis", [])) | {x for q in st_.get("quotes", []) for x in q.get("to", [])}
+        fil = [x for f in st_.get("files", []) for x in f.get("to", [])]
+        evs = [e for e in fil if e not in own] if files else [e for e in evs if e in own]
+    elif files:
+        evs = []
+    rows = {r[0]: r[1] for r in conn.execute(f"SELECT id, turn FROM event WHERE id IN ({','.join('?' * len(evs))})", evs)} if evs else {}
+    evs = [e for e in dict.fromkeys(evs) if e in rows]
+    if len(evs) <= size and not files:
+        return [(None, evs)]
+    if structured:
+        parts = [(f"文件：{f.get('path', '')}", [x for x in f.get("to", []) if x in evs]) for f in st_.get("files", [])] if files else \
+            [("直接来源", st_.get("basis", []))] + [(f"引用：{q.get('name', '')}", q.get("to", [])) for q in st_.get("quotes", [])]
+        out, given = [], set()
+        group = _preview_groups(conn, rows.values())
+        for nm, ids in parts:
+            ids = [e for e in dict.fromkeys(ids) if e in rows and e not in given]
+            given.update(ids)
+            subs = {}
+            for e in ids:                  # 一节超过两页的，节内再按预览组分（数字范围展开会夹进别的组：sol 10-27 查的 64872）
+                subs.setdefault(group.get(rows[e]) if len(ids) > 2 * size else None, []).append(e)
+            for k, sub in subs.items():
+                sn = nm if k is None or len(subs) == 1 else f"{nm} · {_group_name(k)}"
+                for i in range(0, len(sub), size):
+                    out.append((sn if i == 0 else f"{sn}（续）", sub[i:i + size]))
+        rest = [e for e in evs if e not in given]
+        for i in range(0, len(rest), size):
+            out.append(("其余" if i == 0 else "其余（续）", rest[i:i + size]))
+        return out
+    group = _preview_groups(conn, rows.values())
+    keys = {e: group.get(rows[e]) for e in evs}
+    if len(set(keys.values())) > 1:
+        by = {e: ("g", keys[e]) for e in evs}
+    elif len(evs) > 2 * size and len(set(rows[e] for e in evs)) > 1:
+        by = {e: ("t", rows[e]) for e in evs}
+    else:
+        by = {e: None for e in evs}
+    order = {}
+    for e in evs:
+        order.setdefault(by[e], []).append(e)
+    out = []
+    for k, ids in order.items():
+        nm = None if k is None else (_group_name(k[1]) if k[1] and k[0] == "g" else "其余" if k[0] == "g" else _turn_name(conn, k[1]))
+        for i in range(0, len(ids), size):
+            out.append((nm if i == 0 or nm is None else f"{nm}（续）", ids[i:i + size]))
+    return out
+
+
+def _turn_name(conn, t):
+    r = conn.execute("SELECT ordinal FROM turn_detail WHERE occurrence=?", (t,)).fetchone()
+    return f"第 {r[0] + 1} 轮" if r else "某一轮"
+
+
+def _show_sections(L, nid, secs):
+    """目录一行一节：第几轮、类型、这一节的陈述（连着的写成一段，读它就是 relive 这个句柄）。节多了照窗口翻页。"""
+    out = [_head(L, nid) + "（陈述多，先给目录：relive 某一节的句柄读它）"]
+    lines = []
+    for k, ids in secs:
+        hs = [L.stmts[i]["h"] for i in ids]
+        span = _span(hs)
+        hs_text = span if span != hs[0] or len(hs) == 1 else "、".join(hs)
+        name = "其余" if k is None else _group_name(k)
+        lines.append(f"- {name}：{hs_text}（{len(ids)} 条）")
+    out += _cap(lines, len(lines))
+    return "\n".join(out), {"session_entry": [L.nodes[nid]["row"]]}
 
 
 def _recent(L, ids):
@@ -348,23 +469,39 @@ def show_context(L, sid):
     return "\n".join(out), {"form_record": [it["id"] for it in near_]}
 
 
-def show_stmt(conn, L, sid, h, source=False, said=False, recall=None):
+def show_stmt(conn, L, sid, h, source=False, said=False, recall=None, section=0, files=False):
     """陈述是最小单位（2026-10-19）：只取它时给正文；带 source、said、recall 是取它的属性，只给句柄和属性，
     正文不再重复（evoke、relive 已经给过）。"""
     row = conn.execute("SELECT * FROM form_record WHERE id=?", (sid,)).fetchone()
     now = sid in L.stmts
     head = f"[{L.stmt_handle(sid, h)}]" + ("" if now else "（已不是现在的陈述）")
-    attrs = source or said or recall is not None
+    attrs = source or said or files or recall is not None
     out = [head if attrs else head + (" " if now else "") + row["text"]]
     evs = json.loads(row["refs"]).get("event", [])
-    if (source or said) and evs:
-        lines = []
-        for r in conn.execute(f"SELECT * FROM event WHERE id IN ({','.join('?' * len(evs))}) ORDER BY id", evs):
-            lines.append(f"- E{r['id']}{_speaker(r)} {r['text']}" + ("".join(f"\n    {x}" for x in _said(conn, r)) if said else ""))
-        out += ["来源："] + _cap(lines, len(lines))
+    shown, secs, name = [], [], None
+    if files and not any(f.get("to") for f in json.loads(row["structures"] or "{}").get("files", [])):
+        out.append("这条陈述没有『文件』指向。")
+    elif (source or said or files) and evs:
+        secs = source_sections(conn, evs, structures=json.loads(row["structures"] or "{}"), files=files)   # 页对齐分节（v0.20）；section 是这一轮第几次要它
+        if section >= len(secs):
+            out.append(f"来源一共 {len(secs)} 节，这一轮都给过了。")
+        else:
+            name, shown = secs[section]
+    if shown:
+        lines = []     # 按 form 写下的顺序给（10-27：原来按编号排，相关的被挤出第一页，和足迹按顺序记的那页也对不上）
+        seen = set()   # said 在陈述上只给原话的位置和开头，同一段只给一次；全文 relive 那条 E 带 said（v0.19）
+        got = {r["id"]: r for r in conn.execute(f"SELECT * FROM event WHERE id IN ({','.join('?' * len(shown))})", shown)}
+        for r in (got[e] for e in shown if e in got):
+            lines.append(f"- E{r['id']}{_speaker(r)} {r['text']}" + ("".join(f"\n    {x}" for x in _said(conn, r, brief=seen)) if said else ""))
+        if len(secs) > 1:      # 真的分了节才说（用户 2026-10-27：常态不提示）
+            out += [f"{'文件指向' if files else '来源'}（第 {section + 1} 节，共 {len(secs)} 节" + (f"：{name}" if name else "") + "）："] + lines
+            if section + 1 < len(secs):
+                out.append("（再执行一次同样的 relive，给出下一节）")
+        else:
+            out += [(f"文件指向（{name}）：" if files and name else "文件指向：" if files else "来源：")] + lines
     if recall is not None:
         out += _stmt_history(conn, L, row)
-    return "\n".join(out), {"form_record": [sid], "event": _slice(evs) if (source or said) else []}
+    return "\n".join(out), {"form_record": [sid], "event": shown, **({"_sections": len(secs)} if len(secs) > 1 else {})}
 
 
 def _stmt_history(conn, L, row):
@@ -388,7 +525,10 @@ def _speaker(r):
     return "" if absent(r["speaker"]) else f"（{r['speaker']}）"
 
 
-def _said(conn, ev):
+SAID_HEAD = 40           # 陈述带 said 时每段原话给多少字（v0.19）
+
+
+def _said(conn, ev, brief=None):
     """E 的出处一路到原话：几轮一起观察的写“轮:段落”，轮号是这一轮在整段会话里的序号（ordinal + 1，observe 的
     deep_rough_read.turn_blocks 这样编），不是观察窗口里的第几轮；旧版本逐轮的只写段落，就是 E 的 turn 那一轮。"""
     if absent(ev["turn"]):
@@ -408,8 +548,18 @@ def _said(conn, ev):
             t = r[0]
         segs = cache.setdefault(t, show.segments(conn, t, ev["born"]))
         text = segs.get(label)
+        if brief is not None:      # 目录：位置加开头；前面给过的这一段只写位置
+            key = (t, label)
+            out.append(f"[{seg}]" + ("（同上）" if key in brief else " " + (_head_of(text) if text else "（找不到）")))
+            brief.add(key)
+            continue
         out.append(f"[{seg}] " + (text[:400] + ("…" if len(text) > 400 else "") if text else "（找不到）"))
     return out or ["（没有出处）"]
+
+
+def _head_of(text):
+    one = " ".join(text.split())
+    return one[:SAID_HEAD] + ("…" if len(one) > SAID_HEAD else "")
 
 
 def show_event(conn, L, eid, source=False, said=False):
@@ -510,10 +660,10 @@ MISSING = ("没有这个句柄。话题线 L3、话题 L3:T5（T5）、陈述 L3
 
 
 def relive(conn, handles, said=False, recall=None, session="", purpose="interactive", cwd="", note="", source=False,
-           limit=None, page=None, **_):
+           limit=None, page=None, files=False, **_):
     tok = _WIN.set(paging(limit, page))
     try:
-        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source)
+        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files)
     finally:
         _WIN.reset(tok)
 
@@ -524,12 +674,14 @@ def _window_query():
     return {**({"limit": n} if n != SHOW else {}), **({"page": p} if p != 1 else {})}
 
 
-def _relive(conn, handles, said, recall, session, purpose, cwd, note, source):
+def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False):
     """按位置读（v0.13；v0.12 以前叫 get）：一条陈述给它前后几条，话题按顺序分页（接着读给范围句柄），线、骨架给下一层，E、J 给正文。
     source：来源（陈述的 E、J 的旧会话记录和同一段会话现在的话题）；said：E 走到原话；recall：历史。"""
     L = layers(conn)
     out, ins = [], defaultdict(list)
-    attrs = source or said or recall is not None
+    attrs = source or said or files or recall is not None
+    round_metas = _round_metas(conn, session, "relive") if (source or said or files) else []
+    sections = {}
     for h in handles:
         kind, v = resolve(L, h)
         if kind == "node":
@@ -545,11 +697,15 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source):
                 if sid is None:
                     parts.append(f"{hh}：没有这一条")
                     continue
-                t, g = show_stmt(conn, L, sid, hh, source, said, recall)
+                key = f"{sid}/{'s' if source else ''}{'d' if said else ''}{'f' if files else ''}"     # 内部按“陈述/第几节”记（v0.20）
+                k = sum(1 for m in round_metas if key in m.get("sections", {}))
+                t, g = show_stmt(conn, L, sid, hh, source, said, recall, section=k, files=files)
+                if g.pop("_sections", 0):
+                    sections[key] = k
                 parts.append(t)
-                for k, xs in g.items():
-                    got[k] += xs
-            text = "\n".join(parts) if not (source or said or recall is not None) else "\n\n".join(parts)
+                for k2, xs in g.items():
+                    got[k2] += xs
+            text = "\n".join(parts) if not attrs else "\n\n".join(parts)
         elif kind == "event":
             text, got = show_event(conn, L, v, source, said)
         elif kind == "j":
@@ -565,8 +721,10 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source):
             ins[k] += [x for x in xs if x not in ins[k]]
     text = "\n\n".join(out)
     text = track.deliver(conn, VERSION, "recall" if recall is not None else "relive",
-              {"relive": {"handles": list(handles), "said": said, "source": source, "recall": recall, **_window_query()}},
-              text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note, raw=said)
+              {"relive": {"handles": list(handles), "said": said, "source": source, "recall": recall, **({"files": True} if files else {}),
+                          **_window_query()}},
+              text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note, raw=said,
+              meta={"sections": sections} if sections else None)
     return text
 
 
@@ -588,10 +746,42 @@ def _alloc(rem, n):
     return take
 
 
-def evoke(conn, words, session="", purpose="interactive", cwd="", note="", limit=None, page=None, grain=None, **_):
-    """按相关度排，一页 limit 条（默认 SHOW），page 翻页：每一页在剩下的结果里按 _alloc 重新分，翻页不重不漏。
+def seen_this_round(conn, session):
+    """这一轮前面的 evoke 已经给看过的（v0.17）。一轮从这段会话最近一次联想推送算起（用户每说一句，宿主的钩子写一次）；
+    这段会话没有推送的（没挂钩子，如隔离的实验），整段会话算一轮。没有会话编号认不出轮，不去重。"""
+    seen = set()
+    for meta in _round_metas(conn, session, "evoke"):
+        seen.update(meta.get("evoked", []))
+    return seen
+
+
+def _round_metas(conn, session, mode):
+    """这一轮里前面几次拉取（mode）的 meta；一轮怎么算见 seen_this_round。没有会话编号给空。"""
+    if not session:
+        return []
+    cond, args = track.by_session(conn, session)
+    start = conn.execute(f"SELECT MAX(d.occurrence) FROM use_detail d WHERE {cond} AND d.channel='push' AND d.mode='associate'",
+                         args).fetchone()[0] or 0
+    return [json.loads(m) for (m,) in conn.execute(f"SELECT d.meta FROM use_detail d WHERE {cond} AND d.channel='pull' "
+                                                   "AND d.mode=? AND d.occurrence>? ORDER BY d.occurrence", [*args, mode, start])]
+
+
+def _fit(rem, line):
+    """一页几条（v0.17）：至少 EVOKE_PAGE[0] 条，再往上加到 EVOKE_PAGE[1]，字数超过 EVOKE_CHARS 就停。每个条数都按 _alloc 分。"""
+    best = None
+    for n in range(EVOKE_PAGE[0], EVOKE_PAGE[1] + 1):
+        take = _alloc(rem, n)
+        if best is not None and (take == best or sum(len(line(k, x)) for k in rem for x in rem[k][:take[k]]) > EVOKE_CHARS):
+            break
+        best = take
+    return best
+
+
+def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain=None, **_):
+    """按相关度排，一页 6–8 条（按字数定，_fit），按 _alloc 分给话题和线、陈述。同一轮前面 evoke 给过的不再列（seen_this_round），
+    所以同一轮再 evoke 同样的词就是接着往下看，不用翻页（v0.17，用户 2026-10-27：减少模型理解成本；v0.14 的 limit、page 去掉）。
+    略去的里面，不去重时本该出现在这一页的，页脚附上句柄。
     grain：最小给到哪一层（v0.14，2026-10-22）：L 只给线和骨架，T 给到话题，S（默认）给到陈述。"""
-    n, p = paging(limit, page)
     g = str(grain or "S").strip().upper()[:1]
     g = g if g in GRAINS else "S"
     L = layers(conn)
@@ -599,29 +789,38 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", limit
     big = [w for w in words if L.corpus.share(w, ws) >= retrieve.UBIQUITOUS]   # 几乎处处都有的词：BM25 几路不拿它查（v0.12）；
     # 索引词那一路照旧拿全部查词，大词（两成以上）由它自己处理
     text_q = " ".join(w for w in words if w not in big)
-    rem = {"node": [nid for nid, _ in retrieve.search(words, text_q, {k: v for k, v in L.nodes.items() if not v.get("retired")}, ws, L.corpus, deep=True)
-                    if L.nodes[nid]["kind"] in GRAINS[g]],
-           "stmt": [sid for sid, _ in L.stmt_index.top(text_q, None)] if g == "S" else []}
-    for _ in range(p):
-        take = _alloc(rem, n)
-        shown = {k: rem[k][:take[k]] for k in rem}
-        rem = {k: rem[k][take[k]:] for k in rem}
-    left = sum(map(len, rem.values()))
+    hits = {"node": [nid for nid, _ in retrieve.search(words, text_q, {k: v for k, v in L.nodes.items() if not v.get("retired")}, ws, L.corpus, deep=True)
+                     if L.nodes[nid]["kind"] in GRAINS[g]],
+            "stmt": [sid for sid, _ in L.stmt_index.top(text_q, None)] if g == "S" else []}
+    seen = seen_this_round(conn, session)
+    key = {"node": lambda x: f"n:{x}", "stmt": lambda x: f"s:{x}"}
+    rem = {k: [x for x in xs if key[k](x) not in seen] for k, xs in hits.items()}
+    skipped = sum(map(len, hits.values())) - sum(map(len, rem.values()))
+    line = lambda k, x: f"- {_node_line(L, x)}" if k == "node" else f"- {L.stmts[x]['h']} {L.stmts[x]['text']}"
+    take = _fit(rem, line)
+    top = _fit(hits, line) if skipped else {}           # 不去重时这一页会给的：其中前面给过的就是这次也相关的，附句柄（用户 2026-10-27）
+    again = [(L.stmts[x]["h"] if k == "stmt" else L.where(x) if L.nodes[x]["kind"] == "entry" else x) for k in top for x in hits[k][:top[k]] if key[k](x) in seen]
+    shown = {k: rem[k][:take[k]] for k in rem}
+    left = sum(len(rem[k]) - take[k] for k in rem)
     out, ins = [], defaultdict(list)
     for nid in shown["node"]:
-        out.append(f"- {_node_line(L, nid)}")
+        out.append(line("node", nid))
         nd = L.nodes[nid]
         ins[INPUT_KIND[nd["kind"]]].append(nd.get("row", nid))
     for x in shown["stmt"]:
-        out.append(f"- {L.stmts[x]['h']} {L.stmts[x]['text']}")
+        out.append(line("stmt", x))
         ins["form_record"].append(x)
-    if out and left:
-        out.append(f"（还有 {left} 条：下一页 page={p + 1}）")
+    if out and (left or skipped):
+        out.append("（" + "；".join(([f"这一轮前面给过的 {skipped} 条不再列" + (f"，其中这次也排在前面的：{'、'.join(again)}" if again else "")]
+                                     if skipped else []) +
+                                    ([f"还有 {left} 条：再 evoke 就接着往下"] if left else [])) + "）")
     text = "\n".join(out) or (f"没有命中（查词都是几乎每段会话都有的词：{'、'.join(big)}；换个更具体的说法）。" if big and len(big) == len(words)
-                               else f"第 {p} 页没有了。" if p > 1 else "没有命中。")
-    query = {"words": list(words), **({"big": big} if big else {}), **({"limit": n} if n != SHOW else {}),
-             **({"page": p} if p != 1 else {}), **({"grain": g} if g != "S" else {})}
-    text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note)
+                               else f"这一轮前面已经都给过了（{skipped} 条" + (f"，排在前面的：{'、'.join(again)}" if again else "") + "），往下没有了。" if skipped else "没有命中。")
+    query = {"words": list(words), **({"big": big} if big else {}), **({"skipped": skipped} if skipped else {}),
+             **({"grain": g} if g != "S" else {})}
+    evoked = [key[k](x) for k in shown for x in shown[k]]
+    text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note,
+                         meta={"evoked": evoked} if evoked else None)
     return text
 
 
