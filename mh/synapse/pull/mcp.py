@@ -27,9 +27,8 @@ from ...engram.store.instance import USER_NAME
 NAME, PROTOCOL = "mh", "2025-06-18"
 
 NOTE = {"note": {"type": "string", "description": "一句话意见"}}
-WINDOW = {      # relive、roam 的分页（evoke 没有：一页 6–8 条，同一轮再 evoke 就接着往下，v0.17）
-    "limit": {"type": "integer", "description": "每页几条，默认 8，最多 30"},
-    "page": {"type": "integer", "description": "第几页，从 1 起"}, **NOTE}
+WINDOW = {      # relive、roam 的翻页：一页固定 8 条，没有 limit（evoke 连 page 也没有，v0.17；relive、roam 去掉 limit，v0.24）
+    "page": {"type": "integer", "description": "第几页，从 1 起（一页 8 条）"}, **NOTE}
 
 TOOLS = [
     {"name": "evoke",
@@ -139,7 +138,7 @@ def call(conn, name, args):
 
 def _call_new(conn, name, args, kw):
     from .. import pull
-    win = {"limit": args.get("limit"), "page": args.get("page")}
+    win = {"page": args.get("page")}
     if name == "evoke":
         words = args.get("words") or []
         words = words.split() if isinstance(words, str) else [str(w) for w in words]

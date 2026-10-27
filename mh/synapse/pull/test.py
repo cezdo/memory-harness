@@ -172,7 +172,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual(self._uses()[-1]["mode"], "roam")
 
     def test_paging(self):
-        """v0.14：一页话题和线、陈述各占一半，不够的让给另一路；按页模拟不重不漏；limit 有上限；截断写出下一页（v0.16 旧 J 退役，不再分名额）。"""
+        """v0.14：一页话题和线、陈述各占一半，不够的让给另一路；按页模拟不重不漏；条数固定、只翻页；截断写出下一页（v0.16 旧 J 退役，不再分名额）。"""
         rem = {"node": list(range(10)), "stmt": list(range(100, 110))}
         self.assertEqual(pull._alloc(rem, 8), {"node": 4, "stmt": 4})
         self.assertEqual(pull._alloc({"node": [1], "stmt": list(range(20))}, 8), {"node": 1, "stmt": 7})
@@ -182,8 +182,9 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             seen += rem["node"][:take["node"]] + rem["stmt"][:take["stmt"]]
             rem = {k: rem[k][take[k]:] for k in rem}
         self.assertEqual(sorted(seen), list(range(10)) + list(range(100, 110)))
-        self.assertEqual(pull.paging(100, 0), (pull.LIMIT_MAX, 1))
-        self.assertEqual(pull.paging("x", None), (pull.SHOW, 1))
+        self.assertEqual(pull.paging(0), (pull.SHOW, 1))
+        self.assertEqual(pull.paging("x"), (pull.SHOW, 1))
+        self.assertEqual(pull.paging(3), (pull.SHOW, 3))
         tok = pull._WIN.set((2, 2))
         try:
             self.assertEqual(pull._cap(list("abcde"), 5), ["c", "d", "（还有 1 条：下一页 page=3）"])
@@ -191,13 +192,15 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             pull._WIN.reset(tok)
 
     def test_grain_and_window_in_use(self):
-        """grain=T 不给陈述，记进足迹；evoke 不认 limit（v0.17）；relive 照旧翻页。"""
+        """grain=T 不给陈述，记进足迹；evoke、relive 都不认 limit（v0.17、v0.24），relive 只翻页。"""
         text = pull.evoke(self.conn, ["X 升级"], grain="T", limit=3, **self.kw)
         self.assertNotIn(":S", text)
         q = json.loads(self._uses()[-1]["query"])
         self.assertEqual(q["grain"], "T")
         self.assertNotIn("limit", q)
         self.assertIn("第 9 页没有了", pull.relive(self.conn, ["T1"], page=9, **self.kw))
+        pull.relive(self.conn, ["T1"], limit=30, **self.kw)
+        self.assertNotIn("limit", self._uses()[-1]["query"])
 
     def test_source_order(self):
         """陈述的来源按 form 写下的顺序给，和足迹记下的那一页一致（10-27：原来按编号排）。"""
@@ -266,18 +269,21 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertNotIn("再执行一次", one)
         n = len(pull.source_sections(self.conn, evs, size=1))
         self.assertEqual(n, len(evs))
+        shrink = mock.patch.object(pull, "SHOW", 1)                           # 窗口压成 1 条，一节一条
+        shrink.start()
+        self.addCleanup(shrink.stop)
         seen = []
         for i in range(n):
-            t = body(pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
+            t = body(pull.relive(self.conn, [h], source=True, **self.kw))
             self.assertIn(f"第 {i + 1} 节，共 {n} 节", t)
             self.assertEqual("再执行一次" in t, i + 1 < n)
             seen += __import__("re").findall(r"^- E(\d+)", t, __import__("re").M)
         self.assertEqual([int(x) for x in seen], evs)                        # 按写下的顺序，不重不漏
-        self.assertIn(f"来源一共 {n} 节，这一轮都给过了", pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
-        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, limit=1, **dict(self.kw, session="t3")))
+        self.assertIn(f"来源一共 {n} 节，这一轮都给过了", pull.relive(self.conn, [h], source=True, **self.kw))
+        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, **dict(self.kw, session="t3")))
         track.use(self.conn, pull.VERSION, "associate", {"associate": {"prompt": "下一句"}}, "", {}, session="t",
                   purpose="prefetch", channel="push")
-        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
+        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, **self.kw))
 
     def test_evoke_fit(self):
         """v0.17：一页至少 6 条，字数够的话加到 8 条，超过 EVOKE_CHARS 就停；结果不够 6 条的全给。"""

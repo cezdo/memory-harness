@@ -122,9 +122,8 @@ def main():
     mp.add_argument("--session", default="")
     mp.add_argument("--purpose", default="interactive", choices=list(synapse.PURPOSES))
     mp.add_argument("--note", default="")
-    for x in (se, gt, mp):
-        x.add_argument("--limit", type=int, default=None, help="每页几条（默认 8，最多 30）")
-        x.add_argument("--page", type=int, default=None, help="第几页，从 1 起")
+    for x in (gt, mp):
+        x.add_argument("--page", type=int, default=None, help="第几页，从 1 起（一页 8 条）")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
     qa = top.add_parser("quota", help="三家订阅的额度（codex / claude / ark），只读，不发模型请求")
     qa.add_argument("names", nargs="*", help="只看这几家")
@@ -255,7 +254,7 @@ def main():
         print(json.dumps(push.hook(synapse.library(), json.load(sys.stdin)), ensure_ascii=False))
     elif args.cmd in ("evoke", "relive", "roam"):
         from .synapse import pull
-        kw = dict(session=args.session, purpose=args.purpose, cwd=os.getcwd(), note=args.note, limit=args.limit, page=args.page)
+        kw = dict(session=args.session, purpose=args.purpose, cwd=os.getcwd(), note=args.note)
         conn = synapse.library()
         if args.cmd == "evoke":
             print(pull.evoke(conn, args.words, grain=args.grain, **kw))
@@ -263,9 +262,9 @@ def main():
             hs, recall = list(args.ks), args.recall
             if recall is not None and recall != "all" and not recall.isdigit():
                 hs, recall = [recall] + hs, "all"          # --recall 后面紧跟的是句柄，不是窗口
-            print(pull.relive(conn, hs, said=args.said, source=args.source, recall=recall, **kw))
+            print(pull.relive(conn, hs, said=args.said, source=args.source, recall=recall, page=args.page, **kw))
         else:
-            print(pull.roam(conn, args.node, **kw))
+            print(pull.roam(conn, args.node, page=args.page, **kw))
     elif args.cmd in ("boot", "standing"):
         from .synapse import push
         print(push.render(args.cwd, args.host))
