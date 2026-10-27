@@ -8,12 +8,12 @@ design 根目录只放本索引；全局设计、词典与安装配置在 `globa
 
 | 阅读目的 | 文档 | 实现 |
 |---|---|---|
-| 目标、不变量、分工、回放与评估 | [总体设计](global/设计.md) | [`mh/`](../mh) |
+| 目标、不变量、分工、回放、写入时不追求正确理解、借上一层的视野与评估 | [总体设计](global/设计.md) | [`mh/`](../mh) |
 | 术语与句柄 | [词典](global/词典.md) | 各模块共用 |
 | 三原语、存储与来源 | [Engram](engram/设计.md) | [`mh/engram/`](../mh/engram) |
 | 原话如何进入系统 | [采集](engram/observe/采集.md) | [`observe/sources/`](../mh/engram/observe/sources)、[`collect.py`](../mh/engram/observe/collect.py) |
 | 原话如何变成事件 | [observe](engram/observe/设计.md) | [`mh/engram/observe/`](../mh/engram/observe) |
-| 会话记录、话题、挂线与骨架 | [form](engram/form/设计.md) | [`mh/engram/form/`](../mh/engram/form) |
+| 会话记录、话题、挂线、分层（作用域是会话）与骨架 | [form](engram/form/设计.md) | [`mh/engram/form/`](../mh/engram/form) |
 | 跨会话的认知与版本引用 | [cognize](engram/cognize/设计.md) | [`mh/engram/cognize/`](../mh/engram/cognize) |
 | 申请、纠正与反馈 | [修正机制](engram/申请.md) | Engram 各过程 |
 | 推送、拉取、足迹与宿主 | [Synapse](synapse/设计.md) | [`mh/synapse/`](../mh/synapse) |
