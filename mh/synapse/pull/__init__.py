@@ -30,7 +30,7 @@ from ...engram.store import absent
 from .. import track
 from . import retrieve
 
-VERSION = "v0.23"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.24"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -45,11 +45,11 @@ VERSION = "v0.23"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.21 来源分节先按 form 写下的结构：直接来源、各『引用』、各『文件』各一节（2026-10-27）
                          # v0.22 『文件』指向和来源分开，默认不给，relive 带 files 才给（2026-10-27）
                          # v0.23 话题头下提示“挂线待审视”（中间插入留下的标记，form 设计“挂线是粗筛”；J6，2026-10-27）
+                         # v0.24 relive、roam 也去掉 limit，一页固定 SHOW 条，只能翻页（2026-10-27：查看窗口 6–8 条，不让调大绕过去）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
 EVOKE_CHARS = 800        # 超过 6 条时一页最多多少字：近期 8 条满页的中位约 800 字（10-27 量的）
-LIMIT_MAX = 30           # 一页最多几条（v0.14，2026-10-22：条数和翻页都要有；默认还是 SHOW）
 GRAINS = {"L": ("line", "node"), "T": ("line", "node", "entry"), "S": ("line", "node", "entry")}   # evoke 最小给到哪一层（v0.14）
 K1, B = 1.5, 0.75
 OLD_NODE = re.compile(r"(D\d+G\d+|D\d+|O:.+|M\d{4}-\d{2}(-\d{2})?)")   # 旧地图的节点编号（旧的主题 T47 和新的话题同形，按话题认）
@@ -253,14 +253,12 @@ def _size(L, nid):
 _WIN = contextvars.ContextVar("pull_window", default=(SHOW, 1))     # 这次调用每页几条、第几页
 
 
-def paging(limit=None, page=None):
-    """每页几条、第几页（v0.14，2026-10-22）：limit 默认 SHOW、最多 LIMIT_MAX；page 从 1 起。给错了按默认。"""
-    def num(v, d):
-        try:
-            return int(v) if v not in (None, "") else d
-        except (TypeError, ValueError):
-            return d
-    return max(1, min(num(limit, SHOW), LIMIT_MAX)), max(1, num(page, 1))
+def paging(page=None):
+    """每页几条、第几页：每页固定 SHOW 条（v0.24 去掉 limit，用户 2026-10-27）；page 从 1 起，给错了按第 1 页。"""
+    try:
+        return SHOW, max(1, int(page)) if page not in (None, "") else 1
+    except (TypeError, ValueError):
+        return SHOW, 1
 
 
 def _slice(seq):
@@ -660,8 +658,8 @@ MISSING = ("没有这个句柄。话题线 L3、话题 L3:T5（T5）、陈述 L3
 
 
 def relive(conn, handles, said=False, recall=None, session="", purpose="interactive", cwd="", note="", source=False,
-           limit=None, page=None, files=False, **_):
-    tok = _WIN.set(paging(limit, page))
+           page=None, files=False, **_):
+    tok = _WIN.set(paging(page))
     try:
         return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files)
     finally:
@@ -669,9 +667,9 @@ def relive(conn, handles, said=False, recall=None, session="", purpose="interact
 
 
 def _window_query():
-    """不是默认的条数、页数才记进足迹。"""
-    n, p = _WIN.get()
-    return {**({"limit": n} if n != SHOW else {}), **({"page": p} if p != 1 else {})}
+    """不是第 1 页才记进足迹。"""
+    p = _WIN.get()[1]
+    return {"page": p} if p != 1 else {}
 
 
 def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False):
@@ -824,8 +822,8 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
     return text
 
 
-def roam(conn, node=None, session="", purpose="interactive", cwd="", note="", limit=None, page=None, **_):
-    tok = _WIN.set(paging(limit, page))
+def roam(conn, node=None, session="", purpose="interactive", cwd="", note="", page=None, **_):
+    tok = _WIN.set(paging(page))
     try:
         return _roam(conn, node, session, purpose, cwd, note)
     finally:
