@@ -155,6 +155,8 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(outcome(None)[0], "ok")
         self.assertEqual(outcome("TimeoutExpired(['x'], 9)")[0], "timeout")
         self.assertEqual(outcome("HTTP 429 Too Many Requests")[0], "env_error")
+        self.assertEqual(outcome("RuntimeError('codex exec 失败（1）：Selected model is at capacity. "
+                                 "Please try a different model.')")[0], "env_error")
         self.assertEqual(outcome("RuntimeError('codex exec 失败（1）：ERROR codex_models_manager::manager: failed to refresh "
                                  "available models: request timed out\\nYou’ve hit your usage limit.')")[0], "env_error")
         # 2026-10-17 ark 周额度用完（阶段 B 的实验里遇到）：不计失败，休眠后再试

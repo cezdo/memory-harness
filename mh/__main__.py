@@ -78,6 +78,7 @@ def main():
     eg.add_argument("--until", help="reobserve：会话开始时间的上界（不含）")
     eg.add_argument("--dry-run", action="store_true", help="reobserve：只列出会挑中哪些会话，不写申请")
     eg.add_argument("--reread", action="store_true", help="reobserve：补读，不重新预览（2026-10-20）")
+    eg.add_argument("--level", help="request（给 form）：问题在哪一级。statement（默认）：陈述的问题，从 pack 起重做、沿用入口和挂线；entry：入口（名字、停在、索引词）的问题，只重新起名、陈述留着、挂线沿用；attach：挂线的问题，只重新挂线；unit：单位的问题（会话被切成两份这类），起名、挂线从头来")
     eg.add_argument("--reason", help="request：理由")
     eg.add_argument("--model", help="request：当时主会话的模型（记进主会话的 Operator）")
     eg.add_argument("--limit", type=int, default=10, help="observe：这一批最多预览几个窗口")
@@ -167,6 +168,10 @@ def main():
                     raise SystemExit(f"认不出：{t}")
             if not args.model:
                 raise SystemExit("--model：当时主会话的模型")
+            if to == "form":                           # 问题在哪一级（J2）：点名陈述、E 的默认陈述级，会话切错这类才写 --level unit
+                if args.level not in (None, "statement", "entry", "attach", "unit"):
+                    raise SystemExit("--level：statement、entry、attach 或 unit")
+                inputs["level"] = [args.level or "statement"]
             rid = estore.request(conn, estore.MAIN, to, inputs, args.reason or "", estore.main_operator(conn, args.model), cause="manual")
             conn.commit()
             print(f"申请 {rid}：{estore.MAIN} → {to}，" + "，".join(f"{k} {len(v)} 条" for k, v in inputs.items()))

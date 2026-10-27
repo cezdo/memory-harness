@@ -24,6 +24,9 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self._pushes = (pushes.DIR, pushes.LATEST)
         pushes.DIR, pushes.LATEST = self.dir / "events", self.dir / "events" / "synapse-latest.md"
         self.addCleanup(lambda: setattr(pushes, "DIR", self._pushes[0]) or setattr(pushes, "LATEST", self._pushes[1]))
+        from ..hosts import claude                   # 钩子按宿主进程记的当前会话也写进临时目录（不能改到正在用的 claude）
+        self._run_dir, claude.RUN = claude.RUN, self.dir / "run" / "claude"
+        self.addCleanup(lambda: setattr(claude, "RUN", self._run_dir))
         self.e = self._session("s1", "2026-10-17T08:00:00Z")
         self._run(self._fakes([ft.PACK.format(a=self.e[0], b=self.e[1])], [ft.LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
         self.kw = dict(session="t", purpose="dev", cwd="/w")
@@ -188,12 +191,115 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             pull._WIN.reset(tok)
 
     def test_grain_and_window_in_use(self):
-        """grain=T 不给陈述；不是默认的 limit、page、grain 记进足迹。"""
+        """grain=T 不给陈述，记进足迹；evoke 不认 limit（v0.17）；relive 照旧翻页。"""
         text = pull.evoke(self.conn, ["X 升级"], grain="T", limit=3, **self.kw)
         self.assertNotIn(":S", text)
         q = json.loads(self._uses()[-1]["query"])
-        self.assertEqual((q["grain"], q["limit"]), ("T", 3))
+        self.assertEqual(q["grain"], "T")
+        self.assertNotIn("limit", q)
         self.assertIn("第 9 页没有了", pull.relive(self.conn, ["T1"], page=9, **self.kw))
+
+    def test_source_order(self):
+        """陈述的来源按 form 写下的顺序给，和足迹记下的那一页一致（10-27：原来按编号排）。"""
+        sid = next(iter(pull.layers(self.conn).stmts))
+        evs = json.loads(self.conn.execute("SELECT refs FROM form_record WHERE id=?", (sid,)).fetchone()[0])["event"]
+        rows = self.conn.execute("SELECT id FROM event WHERE id IN (%s)" % ",".join("?" * len(evs)), evs).fetchall()
+        self.assertTrue(rows)
+        text, got = pull.show_stmt(self.conn, pull.layers(self.conn), sid, "S1", source=True)
+        shown = [int(x) for x in __import__("re").findall(r"^- E(\d+)", text, __import__("re").M)]
+        self.assertEqual(shown, [e for e in evs if e in {r[0] for r in rows}][:len(shown)])
+        self.assertEqual(shown, got["event"])
+
+    def test_topic_sections(self):
+        """v0.19：话题超窗时先给目录，按 observe 预览的分组归节、节名用“类型”，同一轮以最近一次预览为准；接着读照旧；said 在陈述上只给位置和开头。"""
+        L = pull.layers(self.conn)
+        nid = next(k for k, v in L.nodes.items() if v["kind"] == "entry")
+        items = L.nodes[nid]["items"]
+        tok = pull._WIN.set((1, 1))                                   # 窗口压成 1 条，让测试话题超窗
+        try:
+            self.assertIn("第 1–2 轮 讨论：", pull.show_node(L, nid, None, self.conn)[0])   # 测试数据自带一次预览
+            self.assertNotIn("先给目录", pull.show_node(L, nid, None, self.conn, start=1)[0])   # 接着读照旧按顺序
+            turn = self.conn.execute("SELECT turn FROM event WHERE id=?", (json.loads(self.conn.execute(
+                "SELECT refs FROM form_record WHERE id=?", (items[0]["id"],)).fetchone()[0])["event"][0],)).fetchone()[0]
+            op = st.operator(self.conn, "test/preview", "observe", "previewer")
+            occ = st.occurrence(self.conn, "act", op, started="2026-10-17T09:00:00Z", scale="session", outcome="ok")
+            meta = {"reads": [{"from": 1, "to": 2, "type": "升级方案确认。", "turns": [turn]}]}
+            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (occ, "observe", "preview", "{}", "", "", json.dumps(meta)))
+            self.conn.commit()
+            text = pull.show_node(L, nid, None, self.conn)[0]
+            self.assertIn("先给目录", text)
+            self.assertIn("第 1–2 轮 升级方案确认：", text)
+        finally:
+            pull._WIN.reset(tok)
+        t, _ = pull.show_stmt(self.conn, L, items[0]["id"], "S1", said=True)
+        self.assertNotIn("…" * 2, t)
+        for line in t.splitlines():
+            if line.strip().startswith("[") and "]" in line and not line.startswith("[L"):
+                self.assertLessEqual(len(line.split("] ", 1)[-1]), pull.SAID_HEAD + 1)
+
+    def test_source_sections(self):
+        """v0.20：来源一页以内不分节、不提示；超出时同一轮再执行给下一节，分了节才提示，给完说一共几节；新的一轮从头。"""
+        L = pull.layers(self.conn)
+        from unittest import mock
+        evs = [r[0] for r in self.conn.execute("SELECT id FROM event ORDER BY id DESC")]      # 倒着挂：顺序要照写下的
+        self.assertGreater(len(evs), 1)
+        base = self.conn.execute("SELECT born FROM form_record WHERE id=?", (next(iter(L.stmts)),)).fetchone()[0]
+        sid = self.conn.execute("INSERT INTO form_record(born, idx, kind, text, refs, labels, structures, unresolved) "
+                                "VALUES(?,?,?,?,?,?,?,?)", (base, 99, "session", "挂了几条 E 的陈述", json.dumps({"event": evs}),
+                                                            "[]", "{}", "[]")).lastrowid
+        self.conn.commit()
+        h = "L1:T1:S99"
+        L.stmts[sid] = {"text": "挂了几条 E 的陈述", "entry": "T1", "h": h, "id": sid}
+        patch = mock.patch.object(pull, "resolve", lambda L_, hh: ("stmts", [(hh, sid)]))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.assertEqual(pull.source_sections(self.conn, evs), [(None, evs)])
+        st_ = {"basis": [evs[0]], "quotes": [], "files": [{"path": "a.md", "to": evs}]}         # v0.21：按 form 写下的结构分
+        secs = pull.source_sections(self.conn, evs, size=1, structures=st_)
+        self.assertEqual(secs, [(None, [evs[0]])])                                          # 『文件』指向默认不给（v0.22），剩一页不分节
+        st2 = {"basis": evs[:1], "quotes": [{"name": "q", "to": evs[1:]}], "files": []}
+        self.assertEqual([n for n, _ in pull.source_sections(self.conn, evs, size=1, structures=st2)][:2], ["直接来源", "引用：q"])
+        fs = pull.source_sections(self.conn, evs, size=1, structures=st_, files=True)
+        self.assertTrue(all(n.startswith("文件：a.md") for n, _ in fs))
+        self.assertEqual([e for _, ids in fs for e in ids], evs[1:])                        # 只给文件那几条，和来源分开
+        one = body(pull.relive(self.conn, [h], source=True, **self.kw))
+        self.assertNotIn("再执行一次", one)
+        n = len(pull.source_sections(self.conn, evs, size=1))
+        self.assertEqual(n, len(evs))
+        seen = []
+        for i in range(n):
+            t = body(pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
+            self.assertIn(f"第 {i + 1} 节，共 {n} 节", t)
+            self.assertEqual("再执行一次" in t, i + 1 < n)
+            seen += __import__("re").findall(r"^- E(\d+)", t, __import__("re").M)
+        self.assertEqual([int(x) for x in seen], evs)                        # 按写下的顺序，不重不漏
+        self.assertIn(f"来源一共 {n} 节，这一轮都给过了", pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
+        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, limit=1, **dict(self.kw, session="t3")))
+        track.use(self.conn, pull.VERSION, "associate", {"associate": {"prompt": "下一句"}}, "", {}, session="t",
+                  purpose="prefetch", channel="push")
+        self.assertIn("第 1 节", pull.relive(self.conn, [h], source=True, limit=1, **self.kw))
+
+    def test_evoke_fit(self):
+        """v0.17：一页至少 6 条，字数够的话加到 8 条，超过 EVOKE_CHARS 就停；结果不够 6 条的全给。"""
+        rem = {"node": list(range(10)), "stmt": list(range(100, 110))}
+        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 10).values()), 8)
+        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 300).values()), 6)
+        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 110).values()), 7)
+        self.assertEqual(pull._fit({"node": [1], "stmt": [2, 3]}, lambda k, x: "x"), {"node": 1, "stmt": 2})
+
+    def test_evoke_round(self):
+        """v0.17：同一轮前面 evoke 给过的不再列，再查同样的词就是接着往下；联想推送（新的一轮）以后重新给；别的会话不受影响。"""
+        first = body(pull.evoke(self.conn, ["X 升级"], **self.kw))
+        self.assertIn("X 升级", first)
+        again = body(pull.evoke(self.conn, ["X 升级"], **self.kw))
+        self.assertTrue(again.startswith("这一轮前面已经都给过了"), again)
+        self.assertIn("排在前面的：L1", again)                               # 这次也相关的附句柄
+        self.assertEqual(json.loads(self._uses()[-1]["query"])["skipped"], first.count("\n- ") + 1)
+        self.assertIn("X 升级", pull.evoke(self.conn, ["X 升级"], **dict(self.kw, session="t2")))
+        track.use(self.conn, pull.VERSION, "associate", {"associate": {"prompt": "下一句"}}, "", {}, session="t",
+                  purpose="prefetch", channel="push")
+        self.assertEqual(body(pull.evoke(self.conn, ["X 升级"], **self.kw)), first)
+        self.assertEqual(pull.seen_this_round(self.conn, ""), set())
 
     def test_map_skips_skeleton_root(self):
         """有骨架的工作区，roam 工作区直接给骨架的根下面那层，根不占一层（2026-10-22）。"""
@@ -221,6 +327,34 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("## 环境\n", text)
         u = self._uses()[-1]
         self.assertEqual((u["channel"], u["mode"]), ("push", "assist"))
+        real = push.render                                           # 近况里写出的话题（10-27）：线和话题都记成送达，工具节的示例不算
+        push.render = lambda cwd, *a, **k: push.entry(None, cwd) + "\n- 甲服务（L1:T1）；还没整理（L?:T7）"
+        try:
+            push.hook(self.conn, {"session_id": "t", "cwd": "/w", "host": "dsh"})
+        finally:
+            push.render = real
+        self.assertEqual(json.loads(self._uses()[-1]["meta"])["handles"], {"topic_line": [1], "session_entry": [1, 7]})
+
+    def test_session_after_clear(self):
+        """/clear 以后宿主换了会话、MCP 不重启（2026-10-27）：钩子按 claude 进程记下当前会话，MCP 按父进程读。"""
+        import os
+        from unittest import mock
+        from ..hosts import claude
+        from . import mcp
+        me = os.getpid()
+        with mock.patch.object(claude, "host_pid", lambda start=None: me):
+            push.hook(self.conn, {"session_id": "new", "cwd": "/w"})              # SessionStart（clear）带着新会话
+            push.hook(self.conn, {"session_id": "dsh-1", "cwd": "/w", "host": "dsh"})   # 别的宿主不记
+        self.assertEqual(claude.current(me), "new")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "old"}), mock.patch.object(os, "getppid", lambda: me):
+            self.assertEqual(mcp._session({}), "new")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "old"}), mock.patch.object(os, "getppid", lambda: 999999999):
+            self.assertEqual(mcp._session({}), "old")                           # 没记过：照旧用环境变量
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertEqual(mcp._session({"session": "s"}), "s")              # 不是 Claude Code：经参数给
+        claude.bind("x", pid=999999999)                                         # 进程已经不在的记录，下次写时删掉
+        claude.bind("new", pid=me)
+        self.assertFalse((claude.RUN / "999999999").exists())
 
     def test_check_clean(self):
         from ...engram import check
@@ -250,6 +384,18 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("L1:T1:S1", q["candidates"])
         self.assertIn("X 升级", u["shown"])                              # 分组的主题名是话题线的名字
 
+    def test_head_marks_review(self):
+        """话题的挂线还标着待审视（中间插入留下的，J6）：话题头下面提示；没有标记的头不变。"""
+        class L:
+            nodes = {"T1": {"name": "N", "date": "", "topic": "t", "items": [], "review": ""},
+                     "T2": {"name": "N", "date": "", "topic": "t", "items": [], "review": "待审视：晚到的 E 插进了已整理的范围（E9）"}}
+            where = staticmethod(lambda nid: nid)
+        self.assertNotIn("待审视", pull._head(L, "T1"))
+        head = pull._head(L, "T2")
+        self.assertEqual(head.count("\n"), 1)
+        self.assertIn("挂线待审视：晚到的 E", head)
+        self.assertIn("feedback", head)
+
     def test_status(self):
         """项目现状：手写的部分（仓库、检查命令、目录说明）加上从 git 读的（活跃、不进 git、最近的提交、没提交的改动）和检查的结果；
         不推操作文档；手记推送只读编好的，按宿主去掉它自己给了的节，没有就不给这一节。"""
@@ -268,7 +414,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         (repo / "design" / "new.md").write_text("x")
         (src / "w.md").write_text(f"# 项目现状：w\n\n- 仓库：{repo}\n- 检查：printf '检查了 3 份\\n\\n- 没有发现事件'\n\n## 目录\n\n"
                                   "- design/：设计文档\n- tmp/：实验\n")
-        with mock.patch.object(status, "SOURCES", src):
+        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=[]):   # 不读正式库
             text = status.compile("w")
             self.assertIn("- 近 3 天有提交：design/（1）；不进 git：tmp/", text)    # 2026-10-24 目录压成一行，说明不推
             self.assertNotIn("设计文档", text)
@@ -286,6 +432,14 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         cc = status.read("w", home=self.dir / "status", host="claude")       # Claude Code 自带 git 状态和最近的提交
         self.assertNotIn("### 最近的提交", cc)
         self.assertNotIn("### 没提交的改动", cc)
+        from ..push.recent import TOUCHED
+        touched = [f"  - design/new.md：Claude Code「别的会话」（L1:T1）10-27 12:00 最后{TOUCHED}"]       # 宿主给不了的“是谁碰的”留下
+        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=touched):
+            status.write("w", home=self.dir / "status2")
+        kept = status.read("w", home=self.dir / "status2", host="claude")
+        self.assertIn("### 没提交的改动", kept)
+        self.assertIn(f"最后{TOUCHED}", kept)
+        self.assertNotIn("### 最近的提交", kept)
         self.assertIn("### 目录", cc)
         self.assertIn("### 检查", cc)
         self.assertEqual(status.read("没编过的", home=self.dir / "status"), "")

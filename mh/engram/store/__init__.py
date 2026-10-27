@@ -24,7 +24,7 @@ DEFAULT_DB = HOME / "engram.db"
 # 照常记录，但不计入“失败几次就不再重试”的上限（执行状态不等于认识状态）。超时不在此列：长轮次可能每次都超时；
 # 两种都沾的（超时的字样加上额度、限流）按环境错误算。
 ENVIRONMENTAL = re.compile(r"quota|insufficient|balance|rate.?limit|usage limit|too many requests|\b40[23]\b|\b429\b|\b50[23]\b"
-                           r"|overloaded|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
+                           r"|overloaded|\bmodel is at capacity\b|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
                            r"|waiting for service|did not activate|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
 # 内容过滤：服务商按内容拦下（如 ark 的 finish_reason: content_filter）。重试不会变，这一份就不要了（2026-10-17）
 FILTERED = re.compile(r"content_filter|content.?(policy|moderation)|内容过滤|内容安全|敏感内容", re.I)

@@ -116,6 +116,55 @@ class RecentTest(unittest.TestCase):
         self.assertIn('第一句（2 轮，L44:T1）', got)
         self.assertIn('最后提交：提交说明；你最后说：' + '长' * recent.SAID + '……', got)
 
+    def test_foreign_sessions_that_crossed(self):
+        """别处开的会话：只收比本区第 n+1 条还近、碰过本区的；那一行标出在哪开的（2026-10-26）。"""
+        from unittest import mock
+        from . import recent
+        own = [self.item(f'o{i}', f'o{i}', f'2026-10-24T0{5 - i}:00:00+00:00') for i in range(5)]
+        far = [self.item('new', 'n', '2026-10-24T04:30:00+00:00'), self.item('idle', 'i', '2026-10-24T04:40:00+00:00'),
+               self.item('old', 'x', '2026-10-24T01:30:00+00:00')]
+        seen = []
+        with mock.patch.object(recent, 'sessions', lambda c, ws, foreign=False: far if foreign else own), \
+             mock.patch.object(recent, 'crossed', lambda x, ws: seen.append(x['session']) or x['session'] != 'idle'):
+            got = [x['session'] for x in recent.candidates(None, 'mh', n=3)]
+        self.assertEqual(got, ['o0', 'new', 'o1', 'o2', 'o3', 'o4'])
+        self.assertNotIn('old', seen)                                            # 比第 n+1 条还旧的不读原始记录
+        x = dict(self.item('new', 'n', '2026-10-24T04:30:00+00:00'), cwd='/nowhere/other', ws='mh')
+        with mock.patch.object(recent, 'workspace', lambda p: 'other'):
+            self.assertIn('Claude Code（在 other 开的） · ', recent.line(x, 'L7:T1'))
+
+    def test_dirty_sources(self):
+        """没提交的改动归给改动时刻之前最后碰过它的会话；碰过文件本身的优先于只碰过目录的；都没碰过的另列（2026-10-26）。"""
+        import os, tempfile
+        from pathlib import Path
+        from unittest import mock
+        from . import recent
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / "a.md").write_text("x"); (repo / "b.md").write_text("x"); (repo / "c.md").write_text("x")
+            t = 1793000000
+            for f in ("a.md", "b.md", "c.md"):
+                os.utime(repo / f, (t, t))
+            iso = lambda dt: __import__("mh.engram.observe.written_files", fromlist=["_t"])._t(dt * 1000)
+            ses = [{"source": "claude", "session": "s-here", "file": "f1", "cwd": d, "title": "这里"},
+                   {"source": "claude", "session": "s-other", "file": "f2", "cwd": "/x/other", "title": "那边"}]
+            touch = {"f1": {d: iso(t - 10), str(repo / "b.md"): iso(t + 3600)},             # 只碰过目录；碰 b 在改动之后
+                     "f2": {str(repo / "a.md"): iso(t - 100), str(repo / "b.md"): iso(t - 50)}}
+            with mock.patch.object(recent, "active", lambda c, since: ses), mock.patch.object(recent, "handle", lambda c, x: "L1:T1"), \
+                 mock.patch.object(recent, "workspace", lambda p: "mh" if p == d else "other"), \
+                 mock.patch("mh.engram.observe.written_files.touches", lambda s, f, c=None: touch[f]):
+                got = recent.dirty_sources(None, repo, ["a.md", "b.md", "c.md"], "mh")
+        self.assertEqual(len(got), 2)
+        self.assertTrue(got[0].startswith("- a.md、b.md：Claude Code（在 other 开的）「那边」（L1:T1）"))
+        self.assertEqual(got[1], f"- c.md：近 {recent.DAYS} 天的会话都没{recent.TOUCHED}")   # 目录是仓库根本身：不算
+
+    def test_host_given_section_keeps_sources(self):
+        from . import status
+        part = "### 没提交的改动\n- 2 个文件：a、b\n  - a：Claude Code「x」（L1:T1）10-26 15:18 最后碰过"
+        self.assertEqual(status._given(part, ("没提交的改动",)), "### 没提交的改动\n- a：Claude Code「x」（L1:T1）10-26 15:18 最后碰过")
+        self.assertIsNone(status._given("### 没提交的改动\n- 没有", ("没提交的改动",)))
+        self.assertEqual(status._given("### 服务\n- 在跑", ("没提交的改动",)), "### 服务\n- 在跑")
+
     def test_drop_self_and_cut(self):
         from . import recent
         body = '\n'.join(f'- 10-24 0{i}:00 · Claude Code · 事{i}（1 轮，claude:s{i}，还没整理）\n  - 你最后说：好 <!-- claude:s{i} -->'

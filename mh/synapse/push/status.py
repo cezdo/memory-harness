@@ -142,9 +142,9 @@ def compile(ws, home=None):
     log = _run(["git", "log", f"-{COMMITS}", "--format=%h %cd %s", "--date=format:%m-%d %H:%M"], repo).splitlines()
     if log:
         parts += ["", "### 最近的提交", *[f"- {_cut(x)}" for x in log]]
-    dirty = [x[3:] for x in _run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], repo).splitlines() if x.strip()]
+    dirty = [x.split(None, 1)[1].split(" -> ")[-1] for x in _run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], repo).splitlines() if x.strip()]
     parts += ["", "### 没提交的改动"] + ([f"- {len(dirty)} 个文件（可能是别的会话做到一半）：" + "、".join(dirty[:DIRTY])
-                                         + ("……" if len(dirty) > DIRTY else "")] if dirty else ["- 没有"])
+                                         + ("……" if len(dirty) > DIRTY else "")] + _dirty_sources(repo, dirty[:DIRTY * 3], ws) if dirty else ["- 没有"])
     svc = _services(cfg["services"])
     if svc:
         parts += ["", "### 服务", *svc]
@@ -157,6 +157,20 @@ def compile(ws, home=None):
     if near:
         parts += ["", near]
     return "\n".join(parts)
+
+
+def _dirty_sources(repo, files, ws):
+    """没提交的改动是哪段会话碰的（recent.dirty_sources）；读库出任何错都不给。"""
+    try:
+        from .. import library
+        from . import recent
+        conn = library()
+        try:
+            return ["  " + x for x in recent.dirty_sources(conn, repo, files, ws)]
+        finally:
+            conn.close()
+    except Exception:
+        return []
 
 
 def _recent(ws):
@@ -235,6 +249,15 @@ def write(ws, home=None):
     return True
 
 
+def _given(part, drop):
+    """宿主自己给了的节去掉；宿主给不了的行（没提交的改动是谁碰的）留下，没有就整节去掉。"""
+    if not any(part.startswith(f"### {h}") for h in drop):
+        return part
+    from .recent import TOUCHED
+    keep = [l for l in part.splitlines()[1:] if TOUCHED in l and l.startswith("  - ")]
+    return "\n".join([part.splitlines()[0], *(l[2:] for l in keep)]) if keep else None
+
+
 def read(ws, home=None, host=None):
     """手记推送用：编好的项目现状，带编好的时刻，去掉这个宿主自己给了的节（HOST_GIVES）；没有就返回 ""。"""
     got = _read_stamped((home or _out()) / f"{ws}.md")
@@ -243,8 +266,7 @@ def read(ws, home=None, host=None):
     at, body = got
     drop = HOST_GIVES.get(host, ())
     if drop:
-        body = "\n\n".join(p for p in re.split(r"\n\n(?=### )", body)
-                           if not any(p.startswith(f"### {h}") for h in drop)).strip()
+        body = "\n\n".join(filter(None, (_given(p, drop) for p in re.split(r"\n\n(?=### )", body)))).strip()
     return f"## 近况（{ws}，{at:%m-%d %H:%M} 编）\n\n{body}" if at else f"## 近况（{ws}）\n\n{body}"
 
 

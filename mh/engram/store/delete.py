@@ -20,7 +20,11 @@ def footprint(conn, sessions):
         occ |= {r[0] for r in conn.execute("SELECT occurrence FROM session_detail WHERE source=? AND session=?", (src, ses))}
         occ |= {r[0] for r in conn.execute("SELECT occurrence FROM turn_detail WHERE source=? AND session=?", (src, ses))}
     names = {ses for _, ses in sessions}
-    own_use = {r[0] for r in conn.execute("SELECT occurrence, session FROM use_detail") if r[1] in names}
+    moved = {}                       # 更正过会话的 use（track / rebind）按更正算
+    for inputs, ses in conn.execute("SELECT o.inputs, d.session FROM occurrence o JOIN use_detail d ON d.occurrence=o.id "
+                                    "WHERE d.channel='track' AND d.mode='rebind' ORDER BY o.id"):
+        moved.update({u: ses for u in json.loads(inputs).get("use", [])})
+    own_use = {r[0] for r in conn.execute("SELECT occurrence, session FROM use_detail") if moved.get(r[0], r[1]) in names}
     claims = {t: set() for t in CLAIMS}
     rows = conn.execute("SELECT id, role, inputs, parent FROM occurrence").fetchall()
     changed = True

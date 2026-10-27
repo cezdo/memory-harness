@@ -26,19 +26,19 @@ from ...engram.store.instance import USER_NAME
 
 NAME, PROTOCOL = "mh", "2025-06-18"
 
-WINDOW = {      # 三个拉取工具共用的参数
+NOTE = {"note": {"type": "string", "description": "一句话意见"}}
+WINDOW = {      # relive、roam 的分页（evoke 没有：一页 6–8 条，同一轮再 evoke 就接着往下，v0.17）
     "limit": {"type": "integer", "description": "每页几条，默认 8，最多 30"},
-    "page": {"type": "integer", "description": "第几页，从 1 起"},
-    "note": {"type": "string", "description": "一句话意见"}}
+    "page": {"type": "integer", "description": "第几页，从 1 起"}, **NOTE}
 
 TOOLS = [
     {"name": "evoke",
-     "description": "按词找记忆，按相关度排，命中给全文：线 L、话题 L:T、骨架 k- 在前，陈述 L:T:S 在后，旧的 J 放在最后的“联想”里。"
-                    "几个词一起给，不必同时出现，带上换个说法的词。",
+     "description": "按词找记忆，按相关度排，命中给全文：线 L、话题 L:T、骨架 k- 在前，陈述 L:T:S 在后。"
+                    "几个词一起给，不必同时出现，带上换个说法的词。一次给 6–8 条；同一轮里给过的不再给，再查就是接着往下。",
      "inputSchema": {"type": "object", "properties": {
          "words": {"type": "array", "items": {"type": "string"}, "description": "要查的词"},
          "grain": {"type": "string", "enum": ["L", "T", "S"], "description": "最小给到哪一层：L 线和骨架，T 话题，S 陈述（默认）"},
-         **WINDOW},
+         **NOTE},
          "required": ["words"]}},
     {"name": "relive",
      "description": "按句柄读记忆库（不是文件），不按相关度：陈述给它前后各 3 条（▶ 是要的那条），话题从头按顺序读，线、骨架给下一层，E、J 给正文。"
@@ -47,6 +47,7 @@ TOOLS = [
          "handles": {"type": "array", "items": {"type": "string"}, "description": "句柄，一个或几个"},
          "source": {"type": "boolean", "description": "来源：陈述依据的 E；J 的旧会话"},
          "said": {"type": "boolean", "description": "走到原话"},
+         "files": {"type": "boolean", "description": "陈述里『文件：』指向的 E（默认不给，和来源分开）"},
          "recall": {"type": "string", "description": "历史：all 或 N（陈述何时写出、还在不在；话题的旧版；J 的关系链）"},
          **WINDOW},
          "required": ["handles"]}},
@@ -76,7 +77,11 @@ def tools():
 
 
 def _session(args):
-    return os.environ.get("CLAUDE_CODE_SESSION_ID") or args.get("session") or ""
+    """Claude Code：钩子按宿主进程记下的当前会话（/clear 以后环境变量是旧的），没有再用环境变量；别的宿主经参数给。"""
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        from ..hosts import claude
+        return claude.current() or os.environ["CLAUDE_CODE_SESSION_ID"]
+    return args.get("session") or ""
 
 
 HIDDEN = ("session", "cwd")       # 宿主、测试传的，不在 schema 里
@@ -138,13 +143,14 @@ def _call_new(conn, name, args, kw):
     if name == "evoke":
         words = args.get("words") or []
         words = words.split() if isinstance(words, str) else [str(w) for w in words]
-        return pull.evoke(conn, words, grain=args.get("grain"), **win, **kw)
+        return pull.evoke(conn, words, grain=args.get("grain"), **kw)
     if name == "relive":
         hs = args.get("handles") or []
         hs = hs.split() if isinstance(hs, str) else [str(h) for h in hs]
         recall = args.get("recall")
         recall = None if recall in (None, "", False) else str(recall)
-        return pull.relive(conn, hs, said=bool(args.get("said")), source=bool(args.get("source")), recall=recall, **win, **kw)
+        return pull.relive(conn, hs, said=bool(args.get("said")), source=bool(args.get("source")), recall=recall,
+                           files=bool(args.get("files")), **win, **kw)
     return pull.roam(conn, args.get("node") or None, **win, **kw)
 
 

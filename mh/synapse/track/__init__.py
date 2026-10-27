@@ -131,6 +131,41 @@ def internal(conn, act, step, handles, session, purpose="form"):
     return oid
 
 
+def rebind(conn, version, uses, session, why, evidence=None):
+    """更正 use 记在哪段会话（2026-10-27）：use 不可变，写一条 track / rebind，inputs 带 use = 那几条，session 是实际的会话。
+    起因是 Claude Code /clear 以后 MCP 仍用启动时的会话编号（hosts/claude.py）。读者经 rebound / by_session 认。返回编号。"""
+    olds = sorted({r[0] for u in uses for r in conn.execute("SELECT session FROM use_detail WHERE occurrence=?", (u,))})
+    parent, host = _session(conn, session)
+    oid = st.occurrence(conn, "use", operator(conn, version), started=st.now(), ended=st.now(), scale="session",
+                        inputs={"use": sorted(uses)}, cause="manual", parent=parent, outcome="ok")
+    conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (oid, "track", "rebind", "interactive", host, session, NA, NA, dumps({"rebind": {"from": olds, "why": why}}),
+                  NA, NA, dumps({"evidence": evidence} if evidence else {})))
+    conn.commit()
+    return oid
+
+
+def rebound(conn):
+    """更正过会话的 use → 实际的会话（后写的为准）。"""
+    out = {}
+    for inputs, session in conn.execute("SELECT o.inputs, d.session FROM occurrence o JOIN use_detail d ON d.occurrence=o.id "
+                                        "WHERE d.channel='track' AND d.mode='rebind' ORDER BY o.id"):
+        for u in json.loads(inputs).get("use", []):
+            out[u] = session
+    return out
+
+
+def by_session(conn, session, col="d"):
+    """按会话筛 use 的 SQL 条件和参数：记在这段会话、没被更正走的，加上更正进来的。col 是 use_detail 的别名。"""
+    moved = rebound(conn)
+    into = [u for u, s in moved.items() if s == session]
+    away = [u for u, s in moved.items() if s != session]
+    sql = f"({col}.session=?" + (f" AND {col}.occurrence NOT IN ({','.join('?' * len(away))})" if away else "") + ")"
+    if into:
+        sql = f"({sql} OR {col}.occurrence IN ({','.join('?' * len(into))}))"
+    return sql, [session, *away, *into]
+
+
 def backfill_internal(conn):
     """2026-10-20 以前 form 内部的拉取没记 use：从 label、attach 的 act 的 meta（near、picks）补。按 parent 去重，可以重复跑；
     meta 里没有这一项的 act 不补。返回补了几条。"""

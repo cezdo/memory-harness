@@ -71,6 +71,19 @@ def waiting(conn):
     return [p for p in observe.progress(conn) if p["state"] in observe.TO_OBSERVE]
 
 
+def assert_live(test, conn):
+    """活性（J3，2026-10-27）：每个待观测的轮（会话都当作已告一段落）都有办法前进——在 ready 排出的预览窗口里，
+    或在 to_read 排出的某一组里。没有的就是永远待观测，form 的门槛会一直被它钉住（10-27 的漏分组）。"""
+    far = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    pending = {p["turn"] for p in observe.progress(conn, now=far) if p["state"] in observe.TO_OBSERVE}
+    cover = set()
+    for rows, _ in observe.ready(conn, list(observe.pool_ops(conn).values()), now=far):
+        cover |= {r["occurrence"] for r in rows}
+    for _, group, _ in observe.to_read(conn):
+        cover |= set(group["turns"])
+    test.assertEqual(pending - cover, set(), "待观测却没有办法前进的轮")
+
+
 class FakeSource:
     def __init__(self, path, session, turns):
         self.path, self.session, self.turns = path, session, turns
@@ -194,6 +207,26 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(drr.file_names({"read": ["tmp/x/", "mh/engram/observe/"], "wrote": ["写了 a/b.md", "提交 1a2b「runbook：改 c.py」：d/e.py、f/g.md"]}),
                          {"observe", "b.md", "e.py", "g.md"})                      # 太短的目录名（x）不认；提交说明里的不算
         self.assertEqual(written_files.bash_reads("cd tmp/x; sed -n 1,40p a.py && cat $f-v0.1.md | head"), ["tmp/x", "a.py"])
+        with tempfile.TemporaryDirectory() as d:                                   # 碰过：heredoc、变量赋值、文件参数里的绝对路径都算（2026-10-26）
+            log = Path(d) / "s.jsonl"
+            uses = [{"type": "tool_use", "id": "1", "name": "Bash", "input": {"command": "D=~/mh/tmp/x; cat > ~/mh/a.md <<'EOF'\nhi\nEOF\ncd /srv/w && ls"}},
+                    {"type": "tool_use", "id": "2", "name": "Read", "input": {"file_path": "/etc/hosts"}}]
+            log.write_text(json.dumps({"timestamp": "2026-10-26T01:00:00Z", "message": {"content": uses}}) + "\n")
+            self.assertEqual(written_files.touched("claude", str(log)),
+                             {written_files.HOME_DIR + "/mh/tmp/x", written_files.HOME_DIR + "/mh/a.md", "/srv/w", "/etc/hosts"})
+            log.write_text(json.dumps({"timestamp": "2026-10-26T01:00:00Z", "message": {"content": [   # 相对路径：按命令里前面的 cd，没有就按 cwd
+                {"type": "tool_use", "id": "3", "name": "Bash", "input": {"command": "sed -n 1p design/a.md; cd /srv/w && python3 x/b.py"}}]}}) + "\n")
+            self.assertEqual(written_files.touched("claude", str(log), "/home/u/p"), {"/home/u/p/design/a.md", "/srv/w", "/srv/w/x/b.py"})
+            js = ('text(await tools.exec_command({cmd:"sed -n 1p design/a.md",workdir:"/srv/w","max_output_tokens":4000}));\n'
+                  'text(await tools.apply_patch("*** Begin Patch\\n*** Update File: mh/b.py\\n@@\\n-x\\n+y\\n*** Add File: /srv/c.md\\n+z\\n*** End Patch"));\n'
+                  'text(await tools.exec_command({cmd: c}));')                     # codex：exec 里的 JS（2026-10-26）；变量拼的命令认不出
+            rows = [{"timestamp": "2026-10-26T01:00:00Z", "type": "turn_context", "payload": {"cwd": "/home/u/p"}},
+                    {"timestamp": "2026-10-26T01:00:01Z", "type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": js}}]
+            log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            uses, _ = written_files._codex(str(log))
+            self.assertEqual(sorted((v[1], v[2].get("file_path") or v[2].get("command")) for v in uses.values()),
+                             [("Bash", "cd /srv/w && sed -n 1p design/a.md"), ("Write", "/home/u/p/mh/b.py"), ("Write", "/srv/c.md")])
+            self.assertEqual(written_files.touched("codex", str(log), "/home/u/p"), {"/srv/w", "/srv/w/design/a.md", "/home/u/p/mh/b.py", "/srv/c.md"})
         self.assertEqual(drr.file_note({"read": ["a.py", "tmp/x/"], "wrote": []}), ["这一轮“我”读过：a.py、tmp/x/"])
         events = [{"text": f"{U}说明脚本的四步。", "segments": ["8:A1"]}, {"text": f"{U}决定先做 A。", "segments": ["8:U1"]},
                   {"text": "我说明了做法，细节见当轮设计材料。", "segments": ["8:A2"]}, {"text": "我在讨论中提出先做 B。", "segments": ["8:A2"]}]
@@ -237,6 +270,33 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(relayed(pasted), "看看这个：")
         self.assertIsNone(relayed("短的一句"))
         self.assertIsNone(relayed("没有结构的长文本" * 300))
+
+    def test_language(self):
+        from .label import USER_NAME, language, language_note
+        en = "Observation is effectively finished. The only thing left is one session that kept timing out on the first try, so I will check it again later."
+        zh = "我刚才看了一下，那边的额度快用完了还没跑完，不过基本马上观察完了，你检查一下结果吧。"
+        self.assertEqual(language(en), "英文")
+        self.assertEqual(language(zh), "中文")
+        self.assertEqual(language("せーのっ！でもそんなんじゃだめ、もうそんなんじゃほら、心は進化するよもっともっと"), "日文")
+        self.assertIsNone(language("ok"))                                   # 太短
+        # 按骨架认，不按字数：英文名词再多，谓语和虚词是中文的就是中文；反过来也一样
+        self.assertEqual(language("我把 pattern-based formatted Formation replay pipeline 停了，因为 observation service 还在跑，所以先等一下再看"), "中文")
+        self.assertEqual(language("I stopped the 格式化形成回放流程 because the 观察服务和整理服务 is still running, so we can wait for it"), "英文")
+        self.assertEqual(language("A1、A3 已经完成并提交了，接着做 A6，把旧的段撤掉"), "中文")      # A1 不是冠词
+        self.assertEqual(language("[执行清单](a.md) 已经改好了，之前的判断错了，我把原因也写上了"), "中文")   # 链接开头不是 JSON
+        self.assertIsNone(language('{"risk_level": "low", "outcome": "allow", "rationale": "' + en + '"}'))   # JSON
+        self.assertEqual(language(zh + "\n```\n" + en * 5 + "\n```"), "中文")      # 代码块不算
+        log = "\n".join(f"drwxr-xr-x 2 me me 4096 Oct 26 path=/home/me/x{i}" for i in range(30))
+        self.assertIsNone(language(log, pasted=True))                       # 贴进来的日志行
+        self.assertEqual(language_note(zh, en), f"这一轮{USER_NAME}用中文说，我换成英文回复（上一轮用中文）。")
+        self.assertEqual(language_note(zh, en, before=en), f"这一轮{USER_NAME}用中文说，我用英文回复。")
+        self.assertEqual(language_note(zh, zh, before=en), "这一轮我换成中文回复（上一轮用英文）。")
+        self.assertEqual(language_note("<task-notification>done</task-notification>", en, before=en), "这一轮我用英文回复。")
+        self.assertEqual(language_note(log + "\n" + en, zh), None)          # 贴了日志的不判用户这一侧
+        self.assertIsNone(language_note(zh, zh))
+        self.assertIsNone(language_note(zh, zh, before="ok"))               # 上一轮判不出：不说换
+        self.assertIsNone(language_note(zh, en, before=en, steady=False))   # 接着用英文：form 那边不写
+        self.assertEqual(language_note(zh, en, steady=False), f"这一轮{USER_NAME}用中文说，我换成英文回复（上一轮用中文）。")
 
     def test_collect(self):
         turns = [Turn("你好", "回答", closed=True), Turn("<task-notification>完成</task-notification>", "收到", closed=True),
@@ -312,6 +372,19 @@ class ObserveTest(unittest.TestCase):
         self._collect(rows, sid="long")                                    # 轮数不设上限：80 轮整段一次
         self.assertEqual([len(w) for w, _ in observe.ready(self.conn, op, session="long", now=later)], [80])
 
+    def test_preview_missing(self):
+        """预览漏分组的轮次（2026-10-27，668f6657 的第 12–14 轮）：不算处理过，下一次照常预览；不然它永远待观测，挡住 form 的门槛。"""
+        self._collect([Turn(f"第{i}", "答" * 50, closed=True) for i in range(4)])
+        assert_live(self, self.conn)
+        fakes = self._fakes(["### 第 1–2 轮\n类型：闲聊\n读法：不读\n\n### 第 4 轮\n类型：闲聊\n读法：不读\n",
+                             "### 第 3 轮\n类型：闲聊\n读法：不读\n"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        acts = self._acts()                                                  # 同一批里接着把漏掉的那一轮单独预览
+        self.assertEqual([(a["step"], json.loads(a["meta"])["missing"]) for a in acts], [("preview", [3]), ("preview", [])])
+        self.assertEqual(json.loads(acts[1]["window"])["turns"], [self.conn.execute("SELECT occurrence FROM turn_detail WHERE ordinal=2").fetchone()[0]])
+        self.assertEqual({p["state"] for p in observe.progress(self.conn)}, {"not_read"})
+        self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
+
     def test_fast(self):
         """快道（runbook I7，2026-10-25）：没告一段落的会话按写窗口封窗粗读，尾巴等；之后照常预览：判粗读的不再读、快道 E 是终稿，
         判精读的读完后快道 E 退场，判不读的收回。"""
@@ -331,6 +404,7 @@ class ObserveTest(unittest.TestCase):
         self.assertNotEqual(fast[0]["operator"], observe.operator(self.conn, "rough")[0])                  # 快道是另一个 Operator
         self.assertEqual(len(observe.frame(self.conn)["events"]), 3)
         self.assertEqual(set(states(self.conn).values()), {"not_previewed"})                               # form 照样等预览
+        assert_live(self, self.conn)
         observe.run(self.conn, workers=1, models=self._fakes([], [], []), log=io.StringIO(), now=t0 + timedelta(minutes=30))
         self.assertEqual(len([a for a in self._acts() if json.loads(a["window"]).get("fast")]), 2)          # 读过的不再排
         # 告一段落：照常预览。第 1 轮精读、第 2 轮粗读（快道读过，不再读）、第 3 轮不读、第 4 轮粗读
@@ -345,6 +419,7 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT count(*) FROM event").fetchone()[0], 5)                   # 退场的不删
         self.assertEqual(states(self.conn), dict(zip(turns, ["read", "read", "not_read", "read"])))
         self.assertEqual(waiting(self.conn), [])
+        assert_live(self, self.conn)
 
     def test_seal(self):
         rows = lambda sizes: [{"occurrence": i, "assistant": "x" * n, "commentary": "[]"} for i, n in enumerate(sizes)]
@@ -435,7 +510,7 @@ class ObserveTest(unittest.TestCase):
         """重读旧粗读组（2026-10-25）：同样的几轮按现在的做法再读，读过的轮次更早的 E 整轮被取代，form 只看到新 E。"""
         self._collect([Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在报告里", closed=True)])
         fakes = self._fakes(["### 第 1–2 轮\n类型：讨论\n读法：粗读\n"],
-                            [f"### 事件1\n{U}提出先做一版。\n来源：1:U1\n\n### 事件2\n我说明结果在报告里。\n来源：2:A1\n"])
+                            rough=[f"### 事件1\n{U}提出先做一版。\n来源：1:U1\n\n### 事件2\n我说明结果在报告里。\n来源：2:A1\n"])
         observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
         old = [a for a in self._acts() if a["step"] == "rough"][0]
         old_e = [r[0] for r in self.conn.execute("SELECT id FROM event WHERE born=? ORDER BY id", (old["id"],))]
@@ -457,6 +532,28 @@ class ObserveTest(unittest.TestCase):
                          [f"{U}提出先做一版看看，理由是还没有现成的。", "我说明结果在报告里，并给出两个数字。"])
         self.assertEqual(observe.reread_reads(self.conn)[self.conn.execute(
             "SELECT text FROM turn_detail WHERE ordinal=0").fetchone()[0]], new["id"])
+
+    def test_prune(self):
+        """程序收回（2026-10-26）：Jev 判过没有必要的 E 不删，只是不再交给 form；用户段落不收；放回后照常交出。"""
+        self._collect([Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在报告里", closed=True)])
+        fakes = self._fakes(["### 第 1–2 轮\n类型：讨论\n读法：粗读\n"],
+                            rough=[f"### 事件1\n{U}提出先做一版。\n来源：1:U1\n\n### 事件2\n我说明结果在报告里。\n来源：2:A1\n"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        e1, e2 = [r[0] for r in self.conn.execute("SELECT id FROM event ORDER BY id")]
+        self.assertIsNone(observe.prune(self.conn, [], "空的"))                    # 没有可收回的就不写 act
+        self.assertIsNone(observe.prune(self.conn, [e1], "Jev 判：确认继续"))       # 出处是用户段落（1:U1），不收
+        act = observe.prune(self.conn, [e1, e2], "Jev 判：只是执行记录，没有判断")
+        self.assertEqual(observe.pruned(self.conn), {e2})
+        self.assertEqual([e["id"] for e in observe.frame(self.conn, "dsh", "s1")["events"]], [e1])   # 只交出没收回的
+        self.assertEqual(self.conn.execute("SELECT a.step FROM act_detail a WHERE a.occurrence=?", (act,)).fetchone()[0], "prune")
+        self.assertIsNone(observe.unprune(self.conn, [e1], "没收着的"))             # 只放回现在收着的
+        back = observe.unprune(self.conn, [e2], "看过以后放回")
+        self.assertEqual(observe.pruned(self.conn), set())                          # 收回、放回按先后，后一次说了算
+        self.assertEqual([e["id"] for e in observe.frame(self.conn, "dsh", "s1")["events"]], [e1, e2])
+        self.assertEqual(self.conn.execute("SELECT a.step FROM act_detail a WHERE a.occurrence=?", (back,)).fetchone()[0], "unprune")
+        observe.prune(self.conn, [e2], "再收")
+        self.assertEqual(observe.pruned(self.conn), {e2})
+        self.assertNotIn(("turns", ()), observe.history(self.conn).finished)       # 收回、放回的记录不当成一次读
 
     def test_previous(self):
         """会话续上：之前预览定下的分组给新的预览接着划分，前面的原话不再给，前面的轮次不重看。"""

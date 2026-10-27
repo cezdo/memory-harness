@@ -89,6 +89,7 @@ def check(conn, db_path, brief=False):
             ev.hit("来源：event 指向的轮次不存在", eid)
 
     roles = {"turn", "session", "act", "use", "request", "deletion"}
+    alias = {"reread": "act"}                              # 重读的输入指向旧的读 act（2026-10-26）
     gone = delete.deleted(conn)[1]                        # 按要求删掉的（store.delete）：留下的发生、记录指向它们不算事件，按条数列
     def is_gone(kind, t):
         return t in gone.get("occurrence" if kind in roles else kind, ())
@@ -123,6 +124,7 @@ def check(conn, db_path, brief=False):
 
     for r in conn.execute("SELECT id, role, inputs, parent, predecessor FROM occurrence"):
         for kind, ids in json.loads(r["inputs"]).items():
+            kind = alias.get(kind, kind)
             for t in ids:
                 if absent(t):
                     ev.hit(f"来源：发生的输入里有 {t}", r["id"])
@@ -323,4 +325,14 @@ def coverage(conn):
         ev.n["observe：按申请被取代的 E（不再交出，留在那一轮上；条数，不是事件）"] += len(gone)
     if handed["withdrawn"]:
         ev.n["form：被 form 读过、又因开关撤下的 E（条数，不是事件）"] += len(handed["withdrawn"])
+    from .form import history                                    # 只算现在用着的那次 pack 写的（重做取代的旧陈述还留在库里）
+    current = {a for (step, _), a in history(conn).ok.items() if step == "pack"}
+    for act, meta in conn.execute("SELECT occurrence, meta FROM act_detail WHERE process='form' AND step='pack' AND meta LIKE '%\"violations\"%'"):
+        if act not in current:
+            continue                                             # 已经被重做取代的，问题不在了（2026-10-27）
+        for n, why in json.loads(meta).get("violations", []):    # pack-v0.4 起：重写一次后还不合规的（2026-10-27）
+            ev.hit("form：陈述的来源重写后仍不合 pack 的检查", f"act {act} {f'陈述{n}' if n else '整份'}：{why[:40]}")
+    big = sum(1 for born, r in conn.execute("SELECT born, refs FROM form_record") if born in current and len(json.loads(r).get("event", [])) > 16)
+    if big:
+        ev.n["form：现行陈述的来源超过两页（16 条；条数，不是事件，pack-v0.4 以前写的多）"] += big
     return ev.lines()

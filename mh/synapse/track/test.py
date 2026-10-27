@@ -101,6 +101,62 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         rec = json.loads(self.conn.execute("SELECT query FROM use_detail WHERE mode='cite'").fetchone()[0])["cite"][0]
         self.assertEqual(rec["linked"], [])                               # 选了“都不是”：不连
 
+    def test_cite_handles(self):
+        """〖〗里直接写的句柄（2026-10-27）：程序解析后直接连，不看曝光、不问 Jev；剩下的正文够长再认；v0.1 没认句柄的轮次重做一次。"""
+        from . import cite
+        calls = []
+
+        def judge(state, *_):
+            calls.append(state)
+            return {"probabilities": {"A": 0.9, "无": 0.1}}
+        s2 = pull.layers(self.conn).by_h["L1:T1:S2"]
+        self.assertEqual(cite.HANDLE.findall("L7:T461、dsh-integration；T123（10-19）；pack-v0.3、E5"), ["L7:T461", "T123"])
+        self._reply("s5", "〖L1:T1:S2〗；〖L1:T1 那次甲服务的步骤〗")
+        old = st.operator(self.conn, "synapse/cite-v0.1", "synapse", "program", model="jev", prompt=st.NA, prompt_hash=st.NA,
+                          isolation=st.NA, window="turn", params={})
+        tid = self.conn.execute("SELECT d.occurrence FROM turn_detail d WHERE d.session='s5'").fetchone()[0]
+        oid = st.occurrence(self.conn, "use", old, started=st.now(), scale="turn", inputs={"turn": [tid]}, outcome="ok")
+        self.conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (oid, "track", "cite", "interactive", st.UNKNOWN, "s5",
+                          st.NA, st.NA, json.dumps({"cite": [{"quote": "L1:T1:S2", "cands": [], "linked": []}]}), st.NA, st.NA, "{}"))
+        self.conn.commit()
+        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))   # v0.1 的记录片段里有句柄：重做
+        q, inputs, meta = self.conn.execute("SELECT u.query, o.inputs, u.meta FROM use_detail u JOIN occurrence o ON o.id=u.occurrence "
+                                            "WHERE u.mode='cite' ORDER BY o.id DESC").fetchone()
+        recs, inputs = json.loads(q)["cite"], json.loads(inputs)
+        self.assertEqual(recs[0]["linked"], [["form_record", s2]])
+        self.assertEqual((recs[1]["handles"], recs[1]["linked"], recs[1].get("skip")), (["L1:T1"], [["session_entry", 1]], "字面没有候选"))
+        self.assertEqual((inputs["form_record"], inputs["use"]), ([s2], [oid]))
+        self.assertEqual(json.loads(meta)["handles"], {"session_entry": [1]})
+        self.assertEqual(calls, [])                                       # s5 什么都没看过：剩下的正文没有候选，不调 Jev
+        self.assertEqual(cite.backfill(self.conn, judge=judge), (0, 0))
+
+    def test_rebind(self):
+        """/clear 后记错会话的拉取（2026-10-27）：写一条 rebind 更正，cite 的曝光、联想去重、访问树都按更正认。"""
+        from . import cite, rebind, rebound, trees as tr
+        from ..push import associate
+        pull.relive(self.conn, ["T1"], session="s1", purpose="interactive", cwd="/w")    # 实际是 s6 发的，记成了 s1
+        uid = self.conn.execute("SELECT max(occurrence) FROM use_detail WHERE mode='relive'").fetchone()[0]
+        self._reply("s6", "〖甲服务的步骤〗")
+        texts = cite.texts_of(self.conn)
+        self.assertEqual(cite.exposed(self.conn, "s6", "2100-01-01", texts), [])
+        judge = lambda *a: {"probabilities": {"A": 0.9, "无": 0.1}}                  # noqa: E731
+        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))           # 当时没有候选
+        rid = rebind(self.conn, pull.VERSION, [uid], "s6", "测试", evidence=["toolu_x"])
+        self.assertEqual(rebound(self.conn), {uid: "s6"})
+        self.assertEqual(len(cite.exposed(self.conn, "s6", "2100-01-01", texts)), 2)
+        self.assertEqual(cite.exposed(self.conn, "s1", "2100-01-01", texts), [])
+        self.assertTrue(associate._seen(self.conn, "s6"))
+        self.assertIn(uid, [x["id"] for x in tr.steps(self.conn, pull.layers(self.conn), "dsh", "s6")])
+        self.assertIn(("dsh", "s6"), tr.sessions(self.conn))
+        q = json.loads(self.conn.execute("SELECT query FROM use_detail WHERE occurrence=?", (rid,)).fetchone()[0])
+        self.assertEqual(q["rebind"]["from"], ["s1"])
+        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))           # 更正以后候选变了：重做，取代旧的那条
+        rec, inputs = self.conn.execute("SELECT u.query, o.inputs FROM use_detail u JOIN occurrence o ON o.id=u.occurrence "
+                                        "WHERE u.mode='cite' ORDER BY o.id DESC").fetchone()
+        self.assertTrue(json.loads(rec)["cite"][0]["linked"])
+        self.assertEqual(len(json.loads(inputs)["use"]), 1)
+        self.assertEqual(cite.backfill(self.conn, judge=judge), (0, 0))
+
 
 for _name in [n for n in dir(pt.PullTest) if n.startswith("test_")]:
     setattr(TreesTest, _name, None)       # pull、form 自己的测试不在这里重跑

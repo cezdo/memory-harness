@@ -6,15 +6,17 @@
 
 写进（written）：
 
-来源：会话的原始记录（Claude Code 的 jsonl、dsh 的 session.v4.jsonl.zstd），加上工作区的 git 提交。
+来源：会话的原始记录（Claude Code 的 jsonl、dsh 的 session.v4.jsonl.zstd、codex 的 rollout jsonl），加上工作区的 git 提交。
 - Edit、Write、NotebookEdit、MultiEdit（dsh：write、edit）的 file_path；
 - git 提交：时间窗里全部分支的提交，按提交时间落到轮次；只留哈希在本会话工具输出里出现过的，或那一轮跑过 git commit 的
   （并行的会话同一轮里也提交时可能混进来）。再用 git show 取这次提交的文件。工作区不是 git 仓库时只认写文件。
-Bash 里用 sed、heredoc、python 写文件的认不出来；没提交的这类写入会漏掉。codex 的记录还没接（没有写文件的工具调用记录）。
+Bash 里用 sed、heredoc、python 写文件的认不出来；没提交的这类写入会漏掉。codex：exec 里的 apply_patch 当写文件、exec_command 当 Bash（2026-10-26）。
 按工具调用的时间落到轮次上（轮次 i 从它的开始到下一轮的开始）。
 路径按工作区换成相对路径（worktree 的前缀 .claude/worktrees/<名>/ 也去掉），家目录写 ~，和 E 里的写法对上。
 打码不在这里做：调用方把这些行和 E 拼进同一份输入后整体处理，同一个文件在两边一样。
 实验：tmp/logical-session/files.py（pack-v0.4 起）。以后可以改成采集时把路径存下来，接口不变。
+
+碰过（touched）：工具调用里出现过的全部绝对路径，不分读写、不落轮次；Synapse 认跨工作区的会话用。
 """
 import bisect
 import json
@@ -94,7 +96,63 @@ def _dsh(path):
     return uses, {"all": "\n".join(raw)}
 
 
-READERS = {"claude": _claude, "dsh": _dsh}
+_CALL = re.compile(r"tools\.(exec_command|apply_patch)\(")
+_STR = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`(?:[^`\\]|\\.)*`')
+_PATCHED = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$", re.M)
+
+
+def _js_str(src, at):
+    """src[at:] 起的第一个 JS 字符串字面量 → 内容；不是字面量（变量）返回 None。"""
+    m = _STR.match(src, at)
+    if not m:
+        return None
+    raw = m.group(0)
+    if raw[0] == '"':
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    return raw[1:-1].encode("utf-8", "backslashescape").decode("unicode_escape", "replace") if "\\" in raw else raw[1:-1]
+
+
+def _codex(path):
+    """codex 的工具调用都包在 exec（一段 JS）里：tools.exec_command({cmd:"…", workdir:"…"}) 当 Bash，
+    tools.apply_patch("*** Update File: …") 里的文件当 Write（相对路径按那一轮 turn_context 的 cwd）。结果按 call_id。"""
+    uses, results, cwd = {}, {}, None
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+            if d.get("type") == "turn_context":
+                cwd = p.get("cwd") or cwd
+            elif p.get("type") == "custom_tool_call_output":
+                out = p.get("output")
+                results[p.get("call_id")] = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+            elif p.get("type") == "custom_tool_call" and p.get("name") == "exec" and d.get("timestamp"):
+                js, ts = p.get("input") or "", _t(d["timestamp"])
+                for n, m in enumerate(_CALL.finditer(js)):
+                    key = f"{p.get('call_id')}#{n}"
+                    if m.group(1) == "apply_patch":
+                        patch = _js_str(js, m.end()) or ""
+                        for i, (a, b) in enumerate(_PATCHED.findall(patch)):
+                            f_ = a or b
+                            uses[f"{key}.{i}"] = (ts, "Write", {"file_path": f_ if f_.startswith("/") or not cwd else str(Path(cwd) / f_)})
+                        continue
+                    args = js[m.end():m.end() + 20000]
+                    c = re.match(r"\s*\{\s*cmd\s*:\s*", args)
+                    cmd = _js_str(args, c.end()) if c else None
+                    if cmd is None:
+                        continue
+                    w = re.search(r"\bworkdir\s*:\s*", args[:len(cmd) + 400])
+                    wd = _js_str(args, w.end()) if w else None
+                    uses[key] = (ts, "Bash", {"command": f"cd {wd} && {cmd}" if wd else cmd})
+    return uses, results
+
+
+READERS = {"claude": _claude, "dsh": _dsh, "codex": _codex}
 LOOK = {"sed", "cat", "head", "tail", "less", "grep", "rg", "wc", "ls", "jq", "diff", "cd", "find"}
 PATHY = re.compile(r"^[~\w.\-/]*(/|\.(py|md|json|jsonl|yml|yaml|toml|sh|txt|html|js|ts|csv))[\w.\-/]*$")
 
@@ -133,6 +191,48 @@ def read(source, path, cwd, starts):
             if len(f.strip("/.~")) > 1 and f not in out[turn]:
                 out[turn].append(f)
     return dict(out)
+
+
+ABS = re.compile(r"(?<![\w.$~/-])(~?/[\w.\-/~@+]+)")
+REL = re.compile(r"(?<![\w.$~/:-])((?:[\w.\-]+/)+[\w.\-]+)")      # 相对路径（mh/a.py）：按命令里前面最近的 cd，没有就按会话的 cwd
+CD = re.compile(r"\bcd\s+[\"']?(~?/[^\s;&|\"']*)")
+
+
+def _rel(cmd, cwd):
+    """一条命令里的相对路径 → 绝对路径；只跟这条命令里的 cd（绝对路径），不跨命令。"""
+    cds = [(m.start(), m.group(1).replace("~", HOME_DIR, 1)) for m in CD.finditer(cmd)]
+    out = []
+    for m in REL.finditer(cmd):
+        if m.group(1).startswith(("http", "www.")):
+            continue
+        base = ([d for at, d in cds if at < m.start()] or [cwd])[-1]
+        if base:
+            out.append(str(Path(base) / m.group(1)))
+    return out
+
+
+def touches(source, path, cwd=None):
+    """一段会话的工具调用里出现过的绝对路径（~ 展开）→ 最后一次出现的时刻（UTC ISO），不分读写：文件参数，加 Bash 命令里
+    路径样的词（重定向、heredoc、变量赋值里的也算）。给 Synapse 认“在别的工作区开、动过这个工作区”的会话、没提交的改动是谁
+    碰的（2026-10-26，别的项目的会话改本仓，Bash heredoc 写文件 written() 认不出）。认不出的来源、找不到的原始记录返回空。"""
+    reader = READERS.get(source)
+    if not reader or not path or not Path(path).exists():
+        return {}
+    uses, _ = reader(path)
+    out = {}
+    for ts, name, inp in uses.values():
+        for v in (inp.get("file_path"), inp.get("path"), inp.get("command") if name == "Bash" else None):
+            if isinstance(v, str):
+                got = [m.replace("~", HOME_DIR, 1) if m.startswith("~") else m for m in ABS.findall(v)]
+                got += _rel(v, cwd)
+                for m in got:
+                    out[m] = max(out.get(m, ts), ts)
+    return out
+
+
+def touched(source, path, cwd=None):
+    """touches() 的路径集合。"""
+    return set(touches(source, path, cwd))
 
 
 def commit_files(repo, h):
