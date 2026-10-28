@@ -24,7 +24,6 @@ K1, B = 1.5, 0.75
 
 
 PHRASE_DF, COMMON_MSGS, SHOW_MAX, HEAD = 20, 10, 5, 40
-GROUPS = 5                 # 线索式联想最多列几天（另加最早的一天）
 DELIVER = set()                        # 送达的档（2026-10-15 定为 {"专名","强回想","组合"}；2026-10-16 清空：推送暂停，改走纯 get/search）
 SHADOW_TIERS = {"专名", "强回想", "组合"}  # 影子里仍按这套档位算「本来会推什么」，与 10-15/10-16 已送达的那批同一口径
 # 2026-10-09 起一直只记录、不推送（SHADOW）；10-15 起按档送达，送达和只记录的写在同一条足迹里，标档位，两边一直能对照；
@@ -212,14 +211,12 @@ def in_context(ctx_grams, text):
 
 
 def _around(text, words, before=12, width=HEAD):
-    """词段第一次出现的位置附近的一段（正文里没有就取开头）：比开头更能看出这条为什么被带上来。"""
+    """词段第一次出现的位置附近的一段（正文里没有就取开头）：比开头更能看出这条为什么被带上来。截断处写“……”，省略号前不留标点。"""
     low = text.lower()
     at = min((low.find(w.lower()) for w in words if w.lower() in low), default=-1)
-    if at < 0:
-        return text[:width] + ("……" if len(text) > width else "")
-    a = max(0, at - before)
-    return ("……" if a else "") + text[a:a + width] + ("……" if a + width < len(text) else "")
-
+    a = max(0, at - before) if at >= 0 else 0
+    chunk = text[a:a + width]
+    return ("……" if a else "") + (chunk.rstrip("，。；、：！？,.;:!? \n") + "……" if a + width < len(text) else chunk)
 
 
 def terms(text):
@@ -234,7 +231,7 @@ def terms(text):
 
 # ---- 新库上的联想（E1a）----
 
-CACHE_V = 4                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收）
+CACHE_V = 7                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名）
 NAMES_FILE = HOME / "names.json"   # 名单变体：旧记忆系统迁来的节点名（用户整理过），换库时从旧库冻结下来；是用户的数据，放数据目录（重构 H）
 
 
@@ -247,7 +244,8 @@ class Docs:
         for sid, s in L.stmts.items():
             e = L.nodes[s["entry"]]
             self.k[("s", sid)] = {"text": s["text"], "anchor": e["date"], "holder": "", "workspace": e["ws"],
-                                  "topic": L.nodes[e["parent"]]["name"] if e["parent"] else e["name"], "h": s["h"]}
+                                  "topic": L.nodes[e["parent"]]["name"] if e["parent"] else e["name"], "h": s["h"],
+                                  "entry": s["entry"], "line": e["parent"], "name": e["name"]}
         self.post, self.len = defaultdict(dict), {}
         for key, d in self.k.items():
             tf = terms(d["text"])
@@ -267,6 +265,50 @@ class Docs:
             for key, tf in self.post.get(t, {}).items():
                 scores[key] += w * tf * (K1 + 1) / (tf + K1 * (1 - B + B * self.len[key] / self.avg))
         return dict(scores)
+
+
+HOP_SEEDS, HOP_SHOW = 5, 5        # 往外一跳（2026-10-28，影子）：拿字面命中的前几条当起点，最多记几条邻居
+
+
+def hop_edges(conn, idx):
+    """往外一跳用的边，现有的两种：同源（陈述共享来源 E，最强）、同线异题（同一条线下别的话题）。
+    一起被需要的边等回填的数据攒起来再加（现在〖〗回填只有几十条）。→ {"src": {来源: [键]}, "line": {线: {话题: [键]}}}"""
+    src, line = defaultdict(list), defaultdict(lambda: defaultdict(list))
+    for sid, refs in conn.execute("SELECT id, refs FROM form_record WHERE kind='session'"):
+        key = ("s", sid)
+        if key not in idx.k:
+            continue
+        for r in (json.loads(refs or "{}").get("event") or []):
+            src[r].append(key)
+    for key, d in idx.k.items():
+        if d.get("line"):
+            line[d["line"]][d["entry"]].append(key)
+    return {"src": {r: ks for r, ks in src.items() if len(ks) > 1},
+            "line": {l: dict(e) for l, e in line.items() if len(e) > 1}}
+
+
+def hop(data, hits, rank, skip):
+    """字面命中的前几条（hits，已按相关度排好）→ 往外一跳的邻居 [{h, edge, from}]：同源在前，同线异题在后；
+    字面命中的和 skip（已出现过的）不要，因为这些“我”自己查得到。同线异题只取起点话题所在线下别的话题里和这句话最贴的一条。"""
+    idx, edges = data["idx"], data["hop"]
+    seeds = hits[:HOP_SEEDS]
+    out, taken = [], set(hits) | set(skip)
+
+    def add(k, edge, frm):
+        if k not in taken and len(out) < HOP_SHOW:
+            taken.add(k)
+            out.append({"h": idx.k[k]["h"], "edge": edge, "from": idx.k[frm]["h"]})
+    keys = {k: i for i, k in enumerate(seeds)}
+    for ks in edges["src"].values():
+        mine = [k for k in ks if k in keys]
+        for k in ks if mine else ():
+            add(k, "同源", mine[0])
+    for frm in seeds:
+        d = idx.k[frm]
+        for entry, ks in (edges["line"].get(d["line"]) or {}).items():
+            if entry != d["entry"]:
+                add(max(ks, key=lambda k: rank.get(k, 0)), "同线异题", frm)
+    return out
 
 
 def cached(conn):
@@ -295,7 +337,8 @@ def cached(conn):
     nodes = "\x00".join(_norm(" ".join([n.get("name", ""), n.get("topic", "")] + [a for g in n["words"]["lists"] for a in g]))
                         for n in L.nodes.values())                         # 话题、线、骨架的名字、主题、索引词：search 碰得到的节点
     common = {w for w, f in lexicon().items() if f >= RARE_FREQ}            # 常用词：查不到也不列（2026-10-20：按词典过滤）
-    data = {"idx": idx, "msgs": msgs, "body": body, "lex": lex, "names": names, "stmts": stmts, "nodes": nodes, "common": common}
+    data = {"idx": idx, "msgs": msgs, "body": body, "lex": lex, "names": names, "stmts": stmts, "nodes": nodes, "common": common,
+            "hop": hop_edges(conn, idx)}
     folder.mkdir(parents=True, exist_ok=True)
     for old in folder.glob("*.pkl"):
         old.unlink()
@@ -364,12 +407,17 @@ def _cut_spans(text, i, j):
     return [(a, b) for a, b in out if 2 <= b - a <= 6 and _CJK.fullmatch(text[a:b])]
 
 
+_JUNK = re.compile(r"[^A-Za-z0-9_.\-㐀-鿿]")     # 英文词、汉字段以外的字符（标点、空格、中点）
+
+
 def missing(data, toks, text, lookup=known):
     """查不到的词（2026-10-20）：这句话里的名词（只看 LTP 标成名词的词，仓库名这类英文专名也在里面），在现在的陈述正文里、
     话题 / 线 / 骨架的名字、主题、索引词里都逐字找不到的，也就是 search 碰不到、get 取不到 S 的。只在 E 或旧 J 里出现过的算查不到。
     英文和汉字粘在一起的词（“ds问”）拆开分别看，一个汉字的不算；词典里的常用词不列；贴进来的代码、日志行不看。
     日语不交给 LTP（2026-10-22）：假名比汉字多的行整行不看，带假名的词不列。
     通用词汇不列（2026-10-22）：普通名词在通用词库里有的不列，切坏的（_cut）不列，实例配置的手动名单 QUIET 不列。
+    词典（design/global/词典.md）词头里的叫法不列（2026-10-28）：项目自己定下的名字，刚起的还没进记忆，但词典里查得到。
+    词里夹着标点、空格的（分词把“Souhatsu] · Yorimichi”切成一个词，2026-10-28）按英文词和汉字段拆开分别看。
     lookup：词 → 词频 的查表（默认 known，测试换成字典）。→ [词……]，按在句子里出现的先后。"""
     mine = "\n".join(l for l in text.splitlines()
                      if not _CODEY.search(l) and len(_KANA.findall(l)) <= sum(map(len, _CJK.findall(l))))
@@ -377,7 +425,8 @@ def missing(data, toks, text, lookup=known):
     for w, p, _, _ in toks:
         if p not in NOUN or w not in mine or _KANA.search(w) or any(n in w for n in NAMES):
             continue
-        parts = re.findall(r"[A-Za-z][A-Za-z0-9_.\-]*|[㐀-鿿]+", w) if re.search(r"[A-Za-z]", w) and _CJK.search(w) else [w]
+        split = (re.search(r"[A-Za-z]", w) and _CJK.search(w)) or _JUNK.search(w)
+        parts = re.findall(r"[A-Za-z][A-Za-z0-9_.\-]*|[㐀-鿿]+", w) if split else [w]
         words += [x for x in parts if len(_norm(x)) >= 2]
         if p in ("n", "nl"):
             plain.add(w)
@@ -387,6 +436,10 @@ def missing(data, toks, text, lookup=known):
         k = _norm(w)
         if k and w not in common and k not in QUIET and k not in data["stmts"] and k not in data["nodes"] and k not in [_norm(x) for x in out]:
             out.append(w)
+    if out:
+        from ...engram.form import glossary          # 用到才导入（form 包导入要几十毫秒）
+        named = {_norm(n) for e in glossary.entries() for n in e["names"]}
+        out = [w for w in out if _norm(w) not in named]
     if not out:
         return out
     cjk = [w for w in out if _CJK.fullmatch(w)]
@@ -394,27 +447,41 @@ def missing(data, toks, text, lookup=known):
     return [w for w in out if not (w in plain and w in lex) and not (w in cjk and _cut(mine, w, lex))]
 
 
-def clues(idx, cand, words, groups=GROUPS):
-    """线索式的联想（2026-10-10）：按日期分组、最近的在前，每组带话题线的名字、句柄和一条的开头；最早的一组单独列出。"""
-    from ..pull import VERSION
-    by = {}
+def by_topic(idx, cand):
+    """候选按话题归并 → {话题句柄: [键]}，按相关度（候选的顺序）排，只取前 SHOW_MAX 个；给用户看的和给模型的是同一份。
+    句柄去重，同名的话题各算各的。"""
+    out = {}
     for k in cand:
-        by.setdefault((idx.k[k]["anchor"] or "")[:10], []).append(k)
-    days = sorted(by, reverse=True)
-    pick = days[:groups] + ([days[-1]] if len(days) > groups else [])
-    lines = [f"souhatsu（联想，Synapse {VERSION}，程序按{USER_NAME}这句话里的「{'」「'.join(words[:5])}」找出，只是线索，不一定相关）："
-             f"{len(cand)} 条，{len(days)} 天，最近的在前："]
-    for d in pick:
-        ks = by[d]
-        tops = list(dict.fromkeys(idx.k[k]["topic"] for k in ks if idx.k[k]["topic"]))
-        head = _around(idx.k[ks[0]]["text"], words)
-        lines.append(f"- {'最早 ' if d == days[-1] and len(days) > groups else ''}{d[5:]}"
-                     f"{' · ' + '、'.join(tops[:2]) if tops else ''} · {' '.join(idx.k[k]['h'] for k in ks[:3])}"
-                     f"{f' 等 {len(ks)} 条' if len(ks) > 3 else ''}：{head}")
-    if len(days) > len(pick):
-        lines.append(f"（中间还有 {len(days) - len(pick)} 天没列出）")
-    lines.append("不相关就不用管；要看前后文：`mcp__mh__relive <句柄> [句柄……]`，或 `mcp__mh__evoke <词>`。")
-    return "\n".join(lines)
+        out.setdefault(idx.k[k]["h"].rsplit(":", 1)[0], []).append(k)
+    return dict(list(out.items())[:SHOW_MAX])
+
+
+def topic_rows(idx, cand, words):
+    """给用户看的和给模型的共用的数据（2026-10-28：算法、内容一致，只有排版不同）：每个话题一行，按相关度排，
+    句柄（话题级，relive 读得到）、日期、话题名、命中几条、一条命中的开头。"""
+    rows = []
+    for h, ks in by_topic(idx, cand).items():
+        d = idx.k[ks[0]]
+        rows.append({"h": h, "date": (d["anchor"] or "")[5:10], "name": d["name"], "n": len(ks), "head": _around(d["text"], words)})
+    return rows
+
+
+def shown_keys(idx, cand):
+    """显示出来的陈述：每个话题列出开头的那一条（topic_rows 的 head）。足迹和流水记的“显示了什么”按它，和看到的一致。"""
+    return [ks[0] for ks in by_topic(idx, cand).values()]
+
+
+def clues(rows):
+    """给模型的排版（线索式的联想，2026-10-10；2026-10-28 改成按话题）：和其他注入一样包在 <memory-harness> 里，
+    第一行 [Souhatsu] 说明这是联想，不写用法提示。"""
+    body = [f"- {r['h']} · {r['date']} · {r['name']} · {r['n']}：{r['head']}" for r in rows]
+    return "\n".join([f"<{TAG}>", "[Souhatsu]"] + body + [f"</{TAG}>"])
+
+
+def shown_text(rows, delivered, yorimichi=""):
+    """给用户看的排版：同样的内容，一个话题两行，片段缩进在下一行。标题后面带上当前的 yorimichi（允许拐几次），一眼看出判得对不对。"""
+    return "\n".join(["[Souhatsu]" + ("" if delivered else " 只记录，未推送") + (f" · {yorimichi}" if yorimichi else "")]
+                     + [f"{i}> {r['name']} · {r['h']} · {r['date']} · {r['n']}\n   {r['head']}" for i, r in enumerate(rows, 1)])
 
 
 def _seen(conn, session):
@@ -456,7 +523,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     from .. import hosts, track
     from ..hosts import claude, codex, dsh_log
     from ..track import pushes
-    from . import pos
+    from . import pos, switch, yorimichi
     from ..pull import VERSION
     from ...engram.store import workspace
     rec = {"prompt": (prompt or "")[:PROMPT_KEEP], "shadow": True, "skip": None, "harness": host,
@@ -474,7 +541,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
                 delivered = (not rec.get("shadow")) and bool(shown)
                 gone = (rec.get("n_in_context") or 0) + (rec.get("seen") or 0)
                 pushes.note("associate", host, session, cwd, delivered,
-                            summary=(f"souhatsu：{'、'.join(hs)}（{'、'.join(tier)}）" if shown
+                            summary=(f"souhatsu：{'、'.join(rec.get('topics') or hs)}（{'、'.join(tier)}）" if shown
                                      else f"souhatsu：{gone} 条候选都已在上下文里或这段对话里出现过"),
                             version=VERSION, tier=tier, used=rec.get("used"),
                             terms=[{k: t.get(k) for k in ("t", "df", "tier")} for t in rec.get("terms") or []],
@@ -519,6 +586,10 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     rec["missing"] = lost
     rec["missing_sent"] = fresh
     rec["sent_words"] = list(fresh)
+    if switch.state(session) == "off":        # 用户关了这个会话的联想（push/switch）：只剩“查不到的词”
+        return done("已关闭")
+    width = yorimichi.state(session).get("width") or 0     # 这段对话允许拐几次（push/yorimichi）：0 深挖不给
+    rec["yorimichi"] = width
     found_terms, hits, cues, docs = spans(data, toks[0], text)
     rec.update(terms=found_terms, cue=cues)
     variants = {}
@@ -548,9 +619,6 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
             (there if grams and in_context(grams, idx.k[k]["text"]) else cand).append(k)
         return cand, there, len(allk & seen)
 
-    def count(cand):
-        return min(SHOW_MAX, max(3, math.ceil(len(cand) / 3)))
-
     def hs(ks):
         return [idx.k[k]["h"] for k in ks]
 
@@ -558,7 +626,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
         rec["variants"] = {}
         for name, (hit, info) in variants.items():
             cand, there, nseen = pick(hit)
-            rec["variants"][name] = {**info, "shown": hs(cand[:count(cand)]), "candidates": hs(cand[:20]),
+            rec["variants"][name] = {**info, "shown": hs(shown_keys(idx, cand)), "candidates": hs(cand[:20]),
                                      "in_context": hs(there[:20]), "seen": nseen, "same_workspace": same(cand)}
     send = {t["t"]: hits[t["t"]] for t in found_terms if t["ok"] and t.get("tier") in SHADOW_TIERS}
     if send:
@@ -572,7 +640,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     else:
         return done("没有词段")
     tier = list(dict.fromkeys(tier))
-    delivered = any(x in DELIVER for x in tier)
+    delivered = any(x in DELIVER for x in tier) and width > 0
     if delivered:
         words = [w for w in words if _norm(w) not in sent]
         if not words:
@@ -582,30 +650,38 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     cand, there, nseen = pick(use)
     rec.update(candidates=hs(cand[:20]), in_context=hs(there[:20]), seen=nseen, workspace=here, same_workspace=same(cand),
                n_candidates=len(cand), n_in_context=len(there), used=words)
+    try:      # 往外一跳只记录，不显示不送达；出了错不影响这一轮
+        rec["hop"] = hop(data, sorted(set().union(*use.values()), key=lambda k: -score.get(k, 0)), score, seen | set(there))
+    except Exception as e:
+        rec["hop"] = {"error": repr(e)}
     if not cand:
         return done("都已出现过")
-    n = count(cand)
-    shown, rest = cand[:n], len(cand) - n
-    first = idx.k[shown[0]]
-    listing = [f"souhatsu（联想，程序按{USER_NAME}这句话里的「{'」「'.join(words[:5])}」找出，只是线索）：",
-               f"- [{first['h']}]（{first['anchor'][:10]}{'，' + first['holder'] if first['holder'] else ''}）{first['text']}"]
-    listing += [f"- [{idx.k[k]['h']}]（{idx.k[k]['anchor'][:10]}）{idx.k[k]['text'][:HEAD]}……" for k in shown[1:]]
-    out = clues(idx, cand, words)
+    keep = width if delivered else None                   # 送达时按 yorimichi 截；只记录的照旧列出来对照
+    rows = topic_rows(idx, cand, words)[:keep]
+    shown = shown_keys(idx, cand)[:keep]
+    rest = len(cand) - sum(r["n"] for r in rows)          # 没列出来的：不在这几个话题里的候选
+    out = clues(rows)
     if delivered:
         rec["sent_words"] += words
-    done(None, shown, text=out, text_list="\n".join(listing), omitted=max(rest, 0))
-    msg = f"souhatsu：{'、'.join(hs(shown))}（{'、'.join(words[:3])}；{'、'.join(tier)}）"
+    rec["topics"] = [r["h"] for r in rows]
+    done(None, shown, text=out, omitted=max(rest, 0))
+    msg = shown_text(rows, delivered, yorimichi.label(width))
     ctx = "\n\n".join(x for x in (note, out if delivered else None) if x) or None
-    return ctx, (msg if delivered else msg + "（只记录，未推送）") + (f"；{shown_line}" if shown_line else "")
+    return ctx, msg + (f"\n{shown_line}" if shown_line else "")
 
 
 def hook(stdin=sys.stdin, stdout=sys.stdout):
-    """UserPromptSubmit：读宿主 JSON，命中就输出附加上下文和一行显示；没命中或出错都什么也不输出（出错记进足迹）。"""
+    """UserPromptSubmit：读宿主 JSON，命中就输出附加上下文和一行显示；没命中或出错都什么也不输出（出错记进足迹）。
+    整句是联想开关命令（`push/switch`）时记下、拦下，返回退出码（codex 拦输入是 2）。"""
     from .. import library
+    from . import switch
     d = {}
     conn = None
     try:
         d = json.load(stdin)
+        code = switch.handle(d, d.get("host") or "claude", stdout, sys.stderr)       # 开关命令：记下、拦下，不联想
+        if code is not None:
+            return code
         conn = library()
         got = associate(conn, d.get("prompt", ""), d.get("session_id", ""), d.get("cwd", ""),
                         d.get("transcript_path"), d.get("host") or "claude", d.get("host_kind"))
@@ -629,4 +705,4 @@ def hook(stdin=sys.stdin, stdout=sys.stdout):
 
 if __name__ == "__main__":
     from mh.synapse.push import associate      # 按包路径调：缓存里 pickle 的类要记成包里的，不能记成 __main__
-    associate.hook()
+    sys.exit(associate.hook() or 0)

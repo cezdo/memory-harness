@@ -51,6 +51,34 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         return self.conn.execute("SELECT o.inputs, d.* FROM use_detail d JOIN occurrence o ON o.id=d.occurrence "
                                  "WHERE d.session='t' ORDER BY o.id").fetchall()
 
+    def test_switched_off_like_missing(self):
+        """/no-observe 以后，已经形成的也读不到，和没有一样（审查 05，2026-10-28）：直接给话题、陈述（会话里的、线里的）、E 的句柄，
+        得到的和不存在的句柄一样；/do-observe 以后回来。"""
+        import io
+        from ...engram.observe import collect
+        from ...engram.observe.sources.turn import Session, Turn
+        from ...engram.observe.test import FakeSource
+        hs = ["T1:S1", "L1:S1", f"E{self.e[0]}"]
+        rl = lambda h: pull.relive(self.conn, [h], **self.kw)
+        self.assertIn("X", rl("T1:S1"))
+        self.assertNotIn("没有这一条", rl(f"E{self.e[0]}"))
+
+        def say(*commands):
+            f = self.dir / "s1.jsonl"
+            sess = Session("dsh", "s1", str(f), started="2026-10-17T08:00:00Z", cwd="/w")
+            turns = [Turn("把 X 升级一下（s1）", "好", closed=True, started="2026-10-17T08:00:00Z"),
+                     Turn("写下来（s1）", "写进 docs/x.md 了", closed=True, started="2026-10-17T08:00:00Z")]
+            turns += [Turn(c, "", closed=True, started=f"2026-10-17T{9 + i:02d}:00:00Z") for i, c in enumerate(commands)]
+            collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(), modules={"dsh": FakeSource(f, sess, turns)})
+            self.conn.commit()
+        say("/no-observe")
+        self.assertEqual(body(rl("T1:S1")), body(rl("T99:S1")).replace("T99", "T1"))
+        self.assertEqual(body(rl("L1:S1")), body(rl("L1:S99")).replace("S99", "S1"))
+        self.assertEqual(body(rl(f"E{self.e[0]}")), body(rl("E99999")).replace("E99999", f"E{self.e[0]}"))
+        say("/no-observe", "/do-observe")
+        self.assertIn("X", rl("T1:S1"))
+        self.assertNotIn("没有这一条", rl(f"E{self.e[0]}"))
+
     def test_search_big_words(self):
         """v0.12：几乎处处都有的词（这个工作区里 UBIQUITOUS 以上的会话都出现过）不拿去 BM25 查；全是这种词又没碰上，就说没有命中。"""
         text = pull.evoke(self.conn, [f"{U}"], **self.kw)               # 测试库只有一段会话，“用户”在它的 E 里：大词
@@ -381,7 +409,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             got = associate.associate(self.conn, "甲服务当时怎么升级来着", session="t", cwd="/w")
         finally:
             pos.tag = real
-        self.assertIn("L1:T1:S1", got[1])                                 # 只记录：给用户看的一行里有，没有附加上下文
+        self.assertTrue(got[1].startswith("[Souhatsu] 只记录，未推送 · Yorimichi 0\n1> "))      # 只记录：给用户看的是带序号的话题，没有附加上下文
+        self.assertNotIn("L1:T1:S1", got[1])
         self.assertIsNone(got[0])
         u = self._uses()[-1]
         self.assertEqual((u["channel"], u["mode"], u["purpose"]), ("push", "associate", "prefetch"))
@@ -389,6 +418,26 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertTrue(q["shadow"])
         self.assertIn("L1:T1:S1", q["candidates"])
         self.assertIn("X 升级", u["shown"])                              # 分组的主题名是话题线的名字
+
+    def test_associate_follows_yorimichi(self):
+        """yorimichi：0 不送达；1–3 送达，按条数截。"""
+        from unittest.mock import patch
+        from ..push import associate, pos, yorimichi
+        tag = lambda texts, timeout=5: [[("甲服务", "nz", 2, "SBV"), ("当时", "nt", 3, "ADV"), ("怎么", "r", 3, "ADV"),
+                                         ("升级", "v", 0, "HED"), ("来着", "u", 4, "RAD")]]
+        got = {}
+        with patch.object(pos, "tag", tag), patch.object(associate, "DELIVER", {"专名", "强回想", "组合"}):
+            for width, session in ((0, "p1"), (1, "p2")):
+                with patch.object(yorimichi, "state", return_value={"width": width}):
+                    got[width] = associate.associate(self.conn, "甲服务当时怎么升级来着", session=session, cwd="/w")
+        self.assertIsNone(got[0][0])
+        self.assertTrue(got[0][1].startswith("[Souhatsu] 只记录，未推送 · Yorimichi 0"))
+        self.assertTrue(got[1][0].startswith("<memory-harness>\n[Souhatsu]\n- "))
+        self.assertEqual(got[1][0].count("\n- "), 1)
+        self.assertTrue(got[1][1].startswith("[Souhatsu] · Yorimichi 1\n1> "))
+        self.assertNotIn("\n2> ", got[1][1])
+        q = self.conn.execute("SELECT query FROM use_detail WHERE session='p2' ORDER BY occurrence DESC").fetchone()[0]
+        self.assertEqual(json.loads(q)["associate"]["yorimichi"], 1)
 
     def test_head_marks_review(self):
         """话题的挂线还标着待审视（中间插入留下的，J6）：话题头下面提示；没有标记的头不变。"""
@@ -480,7 +529,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_mcp(self):
         names = [t["name"] for t in mcp.handle(self.conn, {"id": 1, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["evoke", "relive", "roam", "feedback"])
+        self.assertEqual(names, ["evoke", "relive", "roam", "feedback", "yorimichi"])
         r = mcp.handle(self.conn, {"id": 2, "method": "tools/call",
                                    "params": {"name": "relive", "arguments": {"handles": ["s-1"], "session": "t"}}})["result"]
         self.assertFalse(r["isError"])

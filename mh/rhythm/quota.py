@@ -13,18 +13,26 @@
 每家统一成 {"name", "plan", "windows": [{"name": "5h" | "week" | "month", "used": 0–100, "resets": unix 秒}], "ok": 能不能用}；
 读不到时 {"name", "error"}；退回旧结果时多一个 "stale"（多久以前、为什么）。
 """
-import hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.parse, urllib.request
+import hashlib, hmac, json, os, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..engram.store import HOME
+from ..engram.invoke import NO_UPDATE, OFFLINE_FEATURES, catalog   # 启动 app-server 也要关掉插件、apps 和在线模型目录
 
 from ..engram.store.instance import CODEX              # codex CLI 的路径：实例配置（这台机器上绕过 ~/.local/bin/codex 的包装）
 CODEX_HOME = HOME / "codex-quota-home"
 CLAUDE_CRED = Path.home() / ".claude/.credentials.json"
 VOLC = Path.home() / ".config/memory-harness/volc.json"
 CLAUDE_CACHE = HOME / "quota-claude.json"
+CODEX_TIMEOUT = 60      # 读 codex 额度最多等多久（秒）：app-server 不出声也不退出时，到点杀掉，记“读不到”，不卡住节律（审查 09，2026-10-28）
 CLAUDE_TTL = 600        # Claude 额度读一次管多久（秒）：接口限流，不必高频查
+
+
+def _app_server_args(cat=None):
+    """启动 app-server 的参数。默认开着的插件、apps 和在线模型目录会让每次启动拉几十 MB（2026-10-28 实测 20MB），
+    这里只读额度、不用这些；有本地模型目录（invoke.catalog）就指过去。"""
+    return [CODEX, "app-server", *OFFLINE_FEATURES, *NO_UPDATE] + (["-c", f"model_catalog_json={cat}"] if cat else [])
 
 
 def codex():
@@ -34,8 +42,11 @@ def codex():
     msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "mh-quota", "version": "0.1"}}},
             {"jsonrpc": "2.0", "method": "initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}]
-    p = subprocess.Popen([CODEX, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    p = subprocess.Popen(_app_server_args(catalog()), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          env=dict(os.environ, CODEX_HOME=str(CODEX_HOME)), text=True)
+    late = threading.Event()
+    timer = threading.Timer(CODEX_TIMEOUT, lambda: (late.set(), p.kill()))
+    timer.start()
     try:
         p.stdin.write("".join(json.dumps(m) + "\n" for m in msgs))
         p.stdin.flush()
@@ -47,9 +58,11 @@ def codex():
                 r = m["result"]
                 break
         else:
-            raise RuntimeError("app-server 没有返回额度")
+            raise RuntimeError(f"app-server {CODEX_TIMEOUT} 秒没返回额度" if late.is_set() else "app-server 没有返回额度")
     finally:
+        timer.cancel()
         p.kill()
+        p.wait()
     rl = r["rateLimits"]
     ws = [{"name": {300: "5h", 10080: "week"}.get(w["windowDurationMins"], f"{w['windowDurationMins']}m"),
            "used": w["usedPercent"], "resets": w["resetsAt"]} for w in (rl.get("primary"), rl.get("secondary")) if w]

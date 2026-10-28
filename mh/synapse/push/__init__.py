@@ -97,13 +97,15 @@ TOOL = "mcp__mh__"       # 宿主给 MCP 工具起的名字：mcp__<服务名>__
 
 
 def entry(L, cwd):
-    """工具怎么用（2026-10-24：常用入口并进“最近停下的几件事”，每条带句柄；这里只留 roam 的提示）。L、cwd 留着给调用方。"""
+    """工具怎么用（2026-10-24：常用入口并进“最近停下的几件事”，每条带句柄；2026-10-28 改成介绍的口吻，和内核“记忆与认知”一致，加上 yorimichi）。L、cwd 留着给调用方。"""
     from ...engram.store import workspace as ws_of
     here = ws_of(cwd)
     return "\n".join(["### 工具",
-                      f"- `{TOOL}evoke` 按词找（几个词一起给，带上换个说法的词），`{TOOL}relive` 按句柄读（必要时走到原话），"
-                      f"`{TOOL}roam` 走地图（不知道用什么词时；这个工作区全部的线：roam {here}）；参数见工具说明。",
-                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。"])
+                      f"- `{TOOL}evoke`：按词回忆，几个词一起给，带上换个说法的词；",
+                      f"- `{TOOL}relive`：按句柄读下去，需要时一直走到原话；",
+                      f"- `{TOOL}roam`：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
+                      f"- `{TOOL}yorimichi`：告诉记忆现在给联想留几条；",
+                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。参数见各工具的说明。"])
 
 
 def render(cwd, host="claude", session="", start="", model=""):

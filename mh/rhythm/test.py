@@ -5,6 +5,7 @@ python3 -m unittest mh.rhythm.test
 """
 import io
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -196,6 +197,44 @@ class QuotaCacheTest(unittest.TestCase):
         import urllib.error
         with self.assertRaisesRegex(RuntimeError, "限流"):
             self.quota.claude(fetch=cut, now=0)
+
+
+class QuotaArgsTest(unittest.TestCase):
+    """额度检查只读：启动 app-server 要关掉插件、apps、更新检查和在线模型目录（2026-10-28，默认一次启动拉 20MB）。"""
+
+    def test_app_server_args(self):
+        from . import quota
+        plain = quota._app_server_args()
+        self.assertEqual(plain[1], "app-server")
+        self.assertIn("features.plugins=false", plain)
+        self.assertIn("features.apps=false", plain)
+        self.assertIn("features.remote_plugin=false", plain)
+        self.assertIn("check_for_update_on_startup=false", plain)
+        self.assertNotIn("model_catalog_json=/x.json", plain)
+        self.assertIn("model_catalog_json=/x.json", quota._app_server_args(Path("/x.json")))
+
+
+class QuotaTimeoutTest(unittest.TestCase):
+    """app-server 不出声也不退出：到 CODEX_TIMEOUT 杀掉，记成读不到，不一直等（审查 09，2026-10-28）。"""
+
+    def test_codex_timeout(self):
+        from . import quota
+        d = Path(tempfile.mkdtemp())
+        fake = d / "codex"
+        fake.write_text("#!/bin/sh\nexec sleep 30\n")
+        fake.chmod(0o755)
+        (d / "home").mkdir()
+        (d / "home" / "auth.json").write_text("{}")
+        saved = quota.CODEX, quota.CODEX_HOME, quota.CODEX_TIMEOUT
+        quota.CODEX, quota.CODEX_HOME, quota.CODEX_TIMEOUT = str(fake), d / "home", 1
+        try:
+            t = time.time()
+            (q,) = quota.read(["codex"])
+        finally:
+            quota.CODEX, quota.CODEX_HOME, quota.CODEX_TIMEOUT = saved
+        self.assertLess(time.time() - t, 10)
+        self.assertIn("1 秒没返回额度", q["error"])
+        self.assertIsNone(quota.wait_until(q))                 # 读不到，不是用完了
 
 
 if __name__ == "__main__":

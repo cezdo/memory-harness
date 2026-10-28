@@ -496,6 +496,8 @@ def store_read(conn, op_id, pid, group, step, tables, mask, text, output, meta, 
     commit=False：由调用方把一段会话的几次读写一起提交（form 不会看到半段）。"""
     restored, seconds = mask.restore(output), meta.get("seconds")
     events, nothing = parse.parse_turns(restored, {n: t for n, (_, t) in tables.items()}) if error is None else ([], False)
+    if error is None and not events and not nothing:      # 既没有事件也没写“无”：格式不对，留着重试（审查 03，2026-10-28）
+        error = "content_error: 没有解析出事件，也没写“无”"
     meta.update(masked=dict(mask.back), read=group["how"], empty=nothing, **({"part": group["part"]} if group.get("part") else {}))
     if reread:
         meta["reread"] = reread

@@ -106,10 +106,14 @@ function mcpClient(cfg, logger) {
     });
     proc.stderr.on("data", (d) => logger.warn(`mh-synapse(mcp): ${String(d).trim().slice(0, 500)}`));
     const dead = proc;
-    proc.on("exit", () => {
+    const down = (why) => {
       if (proc === dead) proc = null;
-      for (const [id, w] of pending) { pending.delete(id); w({ error: { message: "拉取服务退出了" } }); }
-    });
+      for (const [id, w] of pending) { pending.delete(id); w({ error: { message: why } }); }
+    };
+    proc.on("exit", () => down("拉取服务退出了"));
+    // 启动失败（python 路径不对……）只发 error、不发 exit；没人接会成未处理的事件，把宿主带倒（审查 15，2026-10-28）
+    proc.on("error", (e) => { logger.warn(`mh-synapse(mcp): 拉取服务启动失败：${e.message}`); down(`拉取服务启动失败：${e.message}`); });
+    proc.stdin.on("error", (e) => down(`拉取服务写不进去：${e.message}`));
   }
   function request(method, params, timeoutMs, signal) {
     if (!proc) start();

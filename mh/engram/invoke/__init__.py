@@ -39,8 +39,97 @@ def whole(model):
 
 # 默认开着的插件与 apps 每次调用都会同步 apps 工具表（实测约 6MB），插件目录过期后再拉 26MB；
 # 观察者只读、从不用这些工具，关掉后单次约 0.8MB（2026-10-08）。视为不影响观察，isolation 仍是 v1（用户裁决）
+# 2026-10-28 复测：插件目录长到 48MB JSON，默认特性下一次调用 42MB（插件包 26.7MB + apps 工具表 13.2MB）；
+# 关掉后 0.7MB，剩下的几乎全是每个进程启动都拉的在线模型目录（见 catalog）。
 # --strict-config：写错的键直接报错；之前手写的 plugins_enabled 就是被静默忽略的无效键
 OFFLINE_FEATURES = [a for f in ("plugins", "apps", "remote_plugin") for a in ("-c", f"features.{f}=false")]
+# 隔离的 home 没有宿主那份配置，更新检查得单独关（宿主 ~/.codex/config.toml 里是 check_for_update_on_startup=false）
+NO_UPDATE = ["-c", "check_for_update_on_startup=false"]
+
+# 模型目录：codex 每次进程启动都会在线拉一份（实测约 0.66MB，2026-10-28）。观察、形成每次调用都是一个新进程，
+# 一天上千次就是几百 MB。把目录落盘，调用时用 model_catalog_json 指过去：过期（CATALOG_DAYS）或里面没有要用的
+# 模型时刷新一次（codex debug models，一次约 0.66MB），之后只剩真正要发的那一请求。
+CATALOG = HOME / "codex-models.json"
+CATALOG_DAYS = 7
+_catalog_lock = threading.Lock()
+_catalog_seen = {"key": None, "models": set()}
+
+
+def _models_of(path):
+    """目录里的模型名（按 mtime、大小缓存，不每次解析 600KB JSON）。"""
+    st = path.stat()
+    key = (str(path), st.st_mtime, st.st_size)
+    if _catalog_seen["key"] != key:
+        data = json.loads(path.read_text())
+        _catalog_seen["key"] = key
+        _catalog_seen["models"] = {m.get("slug") for m in data.get("models", []) if isinstance(m, dict)}
+    return _catalog_seen["models"]
+
+
+def _ensure_home(home):
+    """隔离的 codex home：目录、认证（只放一个指向宿主 auth.json 的符号链接）。不存在时 codex 直接拒绝启动。"""
+    home.mkdir(parents=True, exist_ok=True)
+    if not (home / "auth.json").exists():
+        (home / "auth.json").symlink_to(Path.home() / ".codex/auth.json")
+    return home
+
+
+def _debug_models():
+    """codex debug models 的产出，就是落盘的模型目录。用隔离的 home，不读宿主的缓存和配置。"""
+    p = subprocess.run(["codex", "debug", "models", *OFFLINE_FEATURES, *NO_UPDATE],
+                       capture_output=True, text=True, timeout=120,
+                       env=dict(os.environ, CODEX_HOME=str(_ensure_home(Codex.home))))
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr[-300:] or f"codex debug models 退出 {p.returncode}")
+    return p.stdout
+
+
+def _off_path(path):
+    """标记文件：这个 codex 版本不认 model_catalog_json 时记一笔，免得每次调用都白试一次（白试会多起一个进程、多拉一次在线目录）。"""
+    return Path(path).with_name(Path(path).name + ".off")
+
+
+def _marked_off(path, days):
+    try:
+        return time.time() - _off_path(path).stat().st_mtime < days * 86400
+    except OSError:
+        return False
+
+
+def catalog(model=None, path=None, days=CATALOG_DAYS, run=None):
+    """本地的模型目录：够新、里面有这个模型（model 不给就不看）就直接用；否则刷新一次。
+    刷新不了、或这个版本不认它，返回 None，调用方退回在线目录（在线时每个进程启动拉一次）。"""
+    path = Path(path or CATALOG)
+    if _marked_off(path, days):
+        return None
+
+    def usable():
+        try:
+            return time.time() - path.stat().st_mtime < days * 86400 and (model is None or model in _models_of(path))
+        except (OSError, ValueError):
+            return False
+
+    if usable():
+        return path
+    with _catalog_lock:
+        if usable():                    # 并发的调用里可能已经有人刷过了
+            return path
+        try:
+            text = (run or _debug_models)()
+            models = {m.get("slug") for m in json.loads(text).get("models", []) if isinstance(m, dict)}
+        except Exception:
+            return None
+        if not models:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(text)
+            tmp.replace(path)           # 原子落盘：别的进程不会读到半个文件
+        except OSError:
+            return None
+        _catalog_seen["key"] = None
+        return path
 
 
 class Codex:
@@ -63,16 +152,30 @@ class Codex:
             self.isolation += "-notools"
 
     def __call__(self, prompt):
-        self.home.mkdir(parents=True, exist_ok=True)
-        if not (self.home / "auth.json").exists():
-            (self.home / "auth.json").symlink_to(Path.home() / ".codex/auth.json")
-        env = dict(os.environ, CODEX_HOME=str(self.home))
+        env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
+        cat = catalog(self.model)
         with tempfile.TemporaryDirectory(prefix="mh-codex-") as tmp:
             out = Path(tmp) / "last.txt"
-            p = subprocess.run(
-                ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, "--strict-config", "--ephemeral", "--skip-git-repo-check",
-                 "-s", "read-only", "-C", tmp, "-o", str(out), "--json", "-"],
-                input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env)
+
+            def run(cat):
+                # 有本地模型目录就指过去，省掉这次进程启动的在线目录；没有（刷新失败）就照原样在线拉
+                extra = ["-c", f"model_catalog_json={cat}"] if cat else []
+                return subprocess.run(
+                    ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, *NO_UPDATE, *extra,
+                     "--strict-config", "--ephemeral", "--skip-git-repo-check",
+                     "-s", "read-only", "-C", tmp, "-o", str(out), "--json", "-"],
+                    input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env)
+
+            p = run(cat)
+            if cat and p.returncode != 0 and "model_catalog_json" in p.stderr + p.stdout:
+                # 版本换了、目录格式对不上：去掉它重来一次；坏文件删掉、记一笔，CATALOG_DAYS 内不再带
+                # （不带就不认它的话，每次带都是白起一个进程、多拉一次在线目录）
+                Path(cat).unlink(missing_ok=True)
+                try:
+                    _off_path(cat).write_text(f"{time.time()}\n")
+                except OSError:
+                    pass
+                p = run(None)
             events = [json.loads(l) for l in p.stdout.splitlines() if l.startswith("{")]
             if p.returncode != 0 or not out.exists():
                 # 接口报错（如订阅到期时的“模型不支持”）在 stdout 的 error 事件里，stderr 是空的（2026-10-10）

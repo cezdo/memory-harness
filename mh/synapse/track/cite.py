@@ -1,18 +1,21 @@
 """〖〗回填（design/synapse/设计.md 足迹一节，runbook F2，2026-10-22）：“我”用到了记忆里的内容，就在正文里用〖〗标出那半句
 （可以转述）。程序认出转述的是哪一条：
 1. 取出回复里〖〗中的内容（至少 MIN_CHARS 个字）；
-2. 候选是这段会话在这一轮之前给看到过的陈述（旧 J 2026-10-23 退役；evoke / search、relive / get、roam / map 和送达的联想；form 内部的检索、
+2. 候选是这段会话到这一轮结束为止给看到过的陈述（旧 J 2026-10-23 退役；evoke / search、relive / get、roam / map 和送达的联想；form 内部的检索、
    只记录的联想不算）。设计上是“在场”（最后一次压缩之后），现在先按曝光算；
 3. 字面（BM25）留前 TOP 条，放进同一个问题交给 Jev 选“转述说的是哪一条”，另有“都不是”；
 4. 最高的一项不是“都不是”、概率不低于 THRESHOLD 才连；原文一字不差的几条当作同一条，都连上。
 片段里直接写了句柄（L3:T5:S1、L3:T5、T5、L3，2026-10-27 起）的，程序解析后直接连上，不看曝光、不问 Jev；去掉句柄剩下的
 正文够长，照上面再认一遍。只认 L、T 开头的写法：E、J 的写法和 runbook 的条目编号（E5）撞，真实案例里也没有。
+轮次的结束时间来源都不记，到这一轮结束为止按下一轮开始算（v0.3，审查 08，2026-10-28；v0.2 截在这一轮开始，同一轮里先拉取
+再引用的都漏了）；还没有下一轮的，等会话告一段落（observe 的 IDLE）再回填，截到当下。v0.2 的记录整轮重做一次。
 v0.1 的记录没认句柄：片段里有句柄的轮次按新版本整轮重做一次，新记录的 inputs 带 use = [旧记录]，表示取代；
 回填以后这段会话又有拉取更正进来（track / rebind，/clear 后记错会话的）的，同样重做。
 每一轮写一条 use（channel = track，mode = cite，parent 是那段会话，inputs 带那一轮和连上的陈述、J），可以重复跑：
 inputs 里已经有这一轮的就跳过。整理循环每天跑一次。"""
 import json
 import re
+from datetime import datetime, timezone
 
 from ...engram import store as st
 from ...engram.store import NA, UNKNOWN, dumps
@@ -22,7 +25,7 @@ HANDLE = re.compile(r"(?<![A-Za-z0-9_:])(?:L(?:\d+|\?)(?::T\d+)?|T\d+)(?::S\d+(?
 MIN_CHARS, TOP, THRESHOLD = 4, 5, 0.5
 SEEN_MODES = ("search", "get", "map", "recall", "evoke", "relive", "roam")
 QUESTION = "转述说的是哪一条候选记忆里的那件事？"
-VERSION = "cite-v0.2"
+VERSION = "cite-v0.3"
 
 
 def operator(conn):
@@ -119,7 +122,7 @@ def _todo(conn):
     for oid, inp, q, name, ses in conn.execute("SELECT o.id, o.inputs, u.query, p.name, u.session FROM occurrence o JOIN use_detail u "
                                                "ON u.occurrence=o.id JOIN operator p ON p.id=o.operator WHERE u.channel='track' AND u.mode='cite'"):
         old = (name == "synapse/cite-v0.1" and any(HANDLE.search(r.get("quote", "")) for r in json.loads(q).get("cite", []))) \
-            or rebound_at.get(ses, 0) > oid
+            or name == "synapse/cite-v0.2" or rebound_at.get(ses, 0) > oid
         for i in json.loads(inp).get("turn", []):
             if old:
                 redo.setdefault(i, oid)
@@ -128,24 +131,36 @@ def _todo(conn):
     return done, {i: oid for i, oid in redo.items() if i not in done}
 
 
-def backfill(conn, judge=None, limit=200):
-    """回复里有〖〗、还没回填过的轮次，逐轮认出引用了哪些记忆，写成 use。Jev 出错的那一轮这次不写，下次再试。返回 (写了几轮, 出错几轮)。"""
+def until(conn, source, session, ordinal, started, now):
+    """这一轮到什么时候为止（拉取的曝光截到这里）：下一轮开始；还没有下一轮的，会话告一段落了截到当下，没有就是 None（先不回填）。"""
+    from ...engram import observe
+    nxt = conn.execute("SELECT o.started FROM turn_detail d JOIN occurrence o ON o.id=d.occurrence "
+                       "WHERE d.source=? AND d.session=? AND d.ordinal=?", (source, session, ordinal + 1)).fetchone()
+    if nxt and not st.absent(nxt[0]):
+        return nxt[0]
+    return st.iso(now) if nxt or observe.idle(started, source, now) else None
+
+
+def backfill(conn, judge=None, limit=200, now=None):
+    """回复里有〖〗、还没回填过的轮次，逐轮认出引用了哪些记忆，写成 use。Jev 出错的那一轮这次不写，下次再试。返回 (写了几轮, 出错几轮)。
+    now：测试替换。"""
     from .. import pull
     from . import _split
     if judge is None:
         from .judge import choose as judge
     done, redo = _todo(conn)
-    rows = conn.execute("SELECT d.occurrence, d.session, o.started, o.ended, x.assistant FROM turn_detail d "
+    now = now or datetime.now(timezone.utc)
+    rows = conn.execute("SELECT d.occurrence, d.session, o.started, d.source, d.ordinal, x.assistant FROM turn_detail d "
                         "JOIN turn_text x ON x.id=d.text JOIN occurrence o ON o.id=d.occurrence "
                         "WHERE instr(x.assistant, '〖')>0 ORDER BY o.id").fetchall()
-    rows = [r for r in rows if r[0] not in done and spans(r[4])][:limit]
+    rows = [(r[0], r[1], r[2], cut, r[5]) for r in rows if r[0] not in done and spans(r[5])
+            for cut in [until(conn, r[3], r[1], r[4], r[2], now)] if cut][:limit]
     if not rows:
         return 0, 0
     texts, op, L = texts_of(conn), operator(conn), pull.layers(conn)
     wrote = failed = 0
-    for tid, session, started, ended, reply in rows:
-        when = ended if not st.absent(ended) else started
-        cands = exposed(conn, session, when, texts)
+    for tid, session, when, cut, reply in rows:
+        cands = exposed(conn, session, cut, texts)
         try:
             recs = [cite(q, cands, texts, judge, L) for q in spans(reply)]
         except Exception as e:

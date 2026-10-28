@@ -121,6 +121,21 @@ class ObserveTest(unittest.TestCase):
         src = FakeSource(self.file, sess, turns)
         return collect.run(self.conn, sources=("dsh",), force=True, log=io.StringIO(), modules={"dsh": src})
 
+    def test_collect_grows_while_parsing(self):
+        """解析期间文件又写进一轮（审查 02，2026-10-28）：记下的是解析前的文件状态，下次不当成没变，新的一轮照样采到。"""
+        sess = Session("dsh", "s1", str(self.file), started="2026-01-01T00:00:00Z", cwd="/w")
+        a, b = Turn("甲", "答甲", closed=True), Turn("乙", "答乙", closed=True)
+
+        class Growing(FakeSource):
+            def parse(self, path):
+                path.write_text(path.read_text() + "y")
+                return self.session, [a]
+        collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules={"dsh": Growing(self.file, sess, None)})
+        got = collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules={"dsh": FakeSource(self.file, sess, [a, b])})
+        self.assertEqual((got["dsh"]["skipped"], got["dsh"]["turns"]), (0, 1))
+        got = collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules={"dsh": FakeSource(self.file, sess, [a, b])})
+        self.assertEqual(got["dsh"]["skipped"], 1)                        # 没再变就跳过
+
     def test_parse(self):
         table = {"U1": "x", "A1": "y", "A2": "z"}
         events, nothing = parse.parse(OUTPUT, table)
@@ -473,7 +488,7 @@ class ObserveTest(unittest.TestCase):
         note = "<task-notification>\n<summary>Background command \"跑\" completed</summary>\n</task-notification>"
         self._collect([Turn(note, "跑着呢", closed=True)], sid="only")
         self._collect([Turn("跑实验", "好", closed=True), Turn(note, "还在跑", closed=True), Turn("看看", "结果" * 100, closed=True)])
-        fakes = self._fakes(["### 第 1–3 轮\n类型：实验\n读法：粗读\n"], rough=["- 记下了结果\n  来源：A1\n"])
+        fakes = self._fakes(["### 第 1–3 轮\n类型：实验\n读法：粗读\n"], rough=["### 事件1\n我记下了结果。\n来源：1:A1\n"])
         observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
         acts = [x for x in self._acts() if x["step"] in ("preview", "rough")]
         self.assertEqual([(x["step"], x["outcome"]) for x in acts], [("preview", "ok"), ("preview", "ok"), ("rough", "ok")])
@@ -488,7 +503,7 @@ class ObserveTest(unittest.TestCase):
         note = "<task-notification>\n<summary>Background command \"跑\" completed</summary>\n</task-notification>"
         self._collect([Turn("跑实验", "好", closed=True), Turn(note, "结果" * 600, closed=True), Turn(note, "还在跑", closed=True)])
         fakes = self._fakes(["### 第 1 轮\n类型：实验\n读法：粗读\n\n### 第 2–3 轮\n类型：通知\n读法：不读\n"],
-                            rough=["- 记下了结果\n  来源：A1\n"])
+                            rough=["### 事件1\n我记下了结果。\n来源：1:A1\n"])
         saved = preview.FOLD, preview.HOST_FLOOR
         preview.FOLD, preview.HOST_FLOOR = (), 10 ** 9           # 当时的规则：不并轮，没有下限
         try:
@@ -505,6 +520,17 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(observe.previews_of(self.conn, "dsh", "s1"), [pid])        # 补读不算模型的预览
         todo = observe.to_read(self.conn)
         self.assertEqual([(p, s["from"], s["to"], step) for p, s, step in todo], [(got[1], 2, 2, "rough")])
+
+    def test_read_no_event(self):
+        """既没有事件也没写“无”的输出是格式错误（审查 03，2026-10-28）：记 content_error，这组留着重试；写“无”的照常算读过。"""
+        self._collect([Turn("先做一版看看", "好的", closed=True)])
+        fakes = self._fakes(["### 第 1 轮\n类型：讨论\n读法：粗读\n"], rough=["处理完成，请查看结果。", "无"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        self.assertEqual([(a["step"], a["outcome"]) for a in self._acts()], [("preview", "ok"), ("rough", "content_error")])
+        self.assertEqual([step for _, _, step in observe.to_read(self.conn)], ["rough"])
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        self.assertEqual(self._acts()[-1]["outcome"], "ok")
+        self.assertEqual(observe.to_read(self.conn), [])
 
     def test_reread_old(self):
         """重读旧粗读组（2026-10-25）：同样的几轮按现在的做法再读，读过的轮次更早的 E 整轮被取代，form 只看到新 E。"""
