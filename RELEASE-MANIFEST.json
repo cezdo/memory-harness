@@ -155,7 +155,7 @@
     "mh/synapse/track/pushes.py": "9e64aba02571b3582ca862c30acce1735b4f289f096ea26981f63b77dba92c41",
     "mh/synapse/track/test.py": "f99160df5de299e60d2aa020606710907c5f5a6f11eae40e5b6d23a17eb1b1f0",
     "mh/synapse/track/trees.py": "d5c377ebd0e59f6870a72c2467fa25cb7f0b89ace4a718ae26a17a0c8e641b88",
-    "pyproject.toml": "3678f374129c14d0e69131b9ecd6b661db219d6fc4cc19af1c4d92734e9844d4",
+    "pyproject.toml": "fc902874f96b59774593eb78610db850ec45e69299e144dd2e3267262f79c71b",
     "tools/test.py": "e5e36d5945d6fbd8671927ef99394ee6ba322a8fdc696cba6508215e3976aa2c"
   }
 }
