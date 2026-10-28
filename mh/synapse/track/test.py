@@ -2,11 +2,14 @@
 python3 -m unittest mh.synapse.track.test
 """
 import json
+from datetime import datetime, timezone
 
 from ...engram import store as st
 from ..pull import test as pt
 from .. import pull
 from . import trees
+
+FAR = datetime(2100, 1, 1, tzinfo=timezone.utc)      # 回填时会话早已告一段落
 
 
 class TreesTest(pt.PullTest):             # 借 pull 测试造的数据（会话 s1 → 话题 T1、线 L1、陈述 L1:T1:S1/S2）
@@ -70,7 +73,7 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         pull.relive(self.conn, ["T1"], session="s2", purpose="interactive", cwd="/w")   # s2 里给看到 S1、S2
         self._reply("s2", "照你之前说的，〖甲服务的步骤写进了 docs/x.md〗，我接着补回退。〖短〗不算。")
         self.assertEqual(cite.spans("〖甲服务的步骤〗和〖短〗"), ["甲服务的步骤"])
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (1, 0))
         q, inputs = self.conn.execute("SELECT u.query, o.inputs FROM use_detail u JOIN occurrence o ON o.id=u.occurrence "
                                       "WHERE u.mode='cite'").fetchone()
         rec = json.loads(q)["cite"][0]
@@ -78,16 +81,39 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         self.assertEqual(rec["pick"], ["form_record", s2])               # 字面第一的是写进 docs/x.md 的那条
         self.assertEqual(json.loads(inputs)["form_record"], [s2])
         self.assertIn("『文件：docs/x.md』", calls[0])                    # 候选的正文是读回的写法
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (0, 0))  # 已经回填过的轮次不再做
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (0, 0))  # 已经回填过的轮次不再做
 
         def broken(*_):
             raise RuntimeError("网络")
         self._reply("s3", "〖甲服务升到新版本〗")                           # s3 里什么都没给看过：没有候选，不调 Jev
         self._reply("s4", "〖甲服务升到新版本〗")
         pull.relive(self.conn, ["T1"], session="s4", purpose="dev", cwd="/w")   # dev 的拉取不算看到
-        self.assertEqual(cite.backfill(self.conn, judge=broken), (2, 0))
+        self.assertEqual(cite.backfill(self.conn, judge=broken, now=FAR), (2, 0))
         recs = [json.loads(q)["cite"][0] for (q,) in self.conn.execute("SELECT query FROM use_detail WHERE mode='cite' ORDER BY occurrence")]
         self.assertEqual([r.get("skip") for r in recs[1:]], ["字面没有候选", "字面没有候选"])
+
+    def test_cite_same_turn(self):
+        """同一轮里先拉取、再在回复里引用（审查 08，2026-10-28）：曝光截到下一轮开始，这次拉取算候选；还没有下一轮、会话也没告一段落的先不回填。"""
+        import io
+        from . import cite
+        from ...engram.observe import collect
+        from ...engram.observe.sources.turn import Session, Turn
+        from ...engram.observe.test import FakeSource
+        judge = lambda *a: {"probabilities": {"A": 0.9, "无": 0.1}}                  # noqa: E731
+        f = self.dir / "s7.jsonl"
+        f.write_text("x")
+
+        def turns(*ts):
+            collect.run(self.conn, sources=("dsh",), force=True, fresh=0, log=io.StringIO(),
+                        modules={"dsh": FakeSource(f, Session("dsh", "s7", str(f), started="2000-01-01T00:00:00Z", cwd="/w"), list(ts))})
+        first = Turn("接着做吧", "〖甲服务的步骤写进了 docs/x.md〗", closed=True, started="2000-01-01T00:00:00Z")   # 拉取在这一轮开始之后
+        turns(first)
+        pull.relive(self.conn, ["T1"], session="s7", purpose="interactive", cwd="/w")
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=datetime(2000, 1, 1, 0, 30, tzinfo=timezone.utc)), (0, 0))
+        turns(first, Turn("好", "嗯", closed=True, started="2099-01-01T00:00:00Z"))
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=datetime(2099, 1, 1, tzinfo=timezone.utc)), (1, 0))
+        rec = json.loads(self.conn.execute("SELECT query FROM use_detail WHERE mode='cite'").fetchone()[0])["cite"][0]
+        self.assertTrue(rec["linked"])
 
     def test_cite_retry(self):
         from . import cite
@@ -96,8 +122,8 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
             raise RuntimeError("网络")
         pull.relive(self.conn, ["T1"], session="s2", purpose="interactive", cwd="/w")
         self._reply("s2", "〖甲服务升到新版本〗")
-        self.assertEqual(cite.backfill(self.conn, judge=broken), (0, 1))   # Jev 出错：这次不写，下次再试
-        self.assertEqual(cite.backfill(self.conn, judge=lambda *a: {"probabilities": {"无": 0.8, "A": 0.2}}), (1, 0))
+        self.assertEqual(cite.backfill(self.conn, judge=broken, now=FAR), (0, 1))   # Jev 出错：这次不写，下次再试
+        self.assertEqual(cite.backfill(self.conn, judge=lambda *a: {"probabilities": {"无": 0.8, "A": 0.2}}, now=FAR), (1, 0))
         rec = json.loads(self.conn.execute("SELECT query FROM use_detail WHERE mode='cite'").fetchone()[0])["cite"][0]
         self.assertEqual(rec["linked"], [])                               # 选了“都不是”：不连
 
@@ -119,7 +145,7 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         self.conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (oid, "track", "cite", "interactive", st.UNKNOWN, "s5",
                           st.NA, st.NA, json.dumps({"cite": [{"quote": "L1:T1:S2", "cands": [], "linked": []}]}), st.NA, st.NA, "{}"))
         self.conn.commit()
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))   # v0.1 的记录片段里有句柄：重做
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (1, 0))   # v0.1 的记录片段里有句柄：重做
         q, inputs, meta = self.conn.execute("SELECT u.query, o.inputs, u.meta FROM use_detail u JOIN occurrence o ON o.id=u.occurrence "
                                             "WHERE u.mode='cite' ORDER BY o.id DESC").fetchone()
         recs, inputs = json.loads(q)["cite"], json.loads(inputs)
@@ -128,7 +154,7 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         self.assertEqual((inputs["form_record"], inputs["use"]), ([s2], [oid]))
         self.assertEqual(json.loads(meta)["handles"], {"session_entry": [1]})
         self.assertEqual(calls, [])                                       # s5 什么都没看过：剩下的正文没有候选，不调 Jev
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (0, 0))
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (0, 0))
 
     def test_rebind(self):
         """/clear 后记错会话的拉取（2026-10-27）：写一条 rebind 更正，cite 的曝光、联想去重、访问树都按更正认。"""
@@ -140,7 +166,7 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         texts = cite.texts_of(self.conn)
         self.assertEqual(cite.exposed(self.conn, "s6", "2100-01-01", texts), [])
         judge = lambda *a: {"probabilities": {"A": 0.9, "无": 0.1}}                  # noqa: E731
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))           # 当时没有候选
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (1, 0))           # 当时没有候选
         rid = rebind(self.conn, pull.VERSION, [uid], "s6", "测试", evidence=["toolu_x"])
         self.assertEqual(rebound(self.conn), {uid: "s6"})
         self.assertEqual(len(cite.exposed(self.conn, "s6", "2100-01-01", texts)), 2)
@@ -150,12 +176,12 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         self.assertIn(("dsh", "s6"), tr.sessions(self.conn))
         q = json.loads(self.conn.execute("SELECT query FROM use_detail WHERE occurrence=?", (rid,)).fetchone()[0])
         self.assertEqual(q["rebind"]["from"], ["s1"])
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (1, 0))           # 更正以后候选变了：重做，取代旧的那条
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (1, 0))           # 更正以后候选变了：重做，取代旧的那条
         rec, inputs = self.conn.execute("SELECT u.query, o.inputs FROM use_detail u JOIN occurrence o ON o.id=u.occurrence "
                                         "WHERE u.mode='cite' ORDER BY o.id DESC").fetchone()
         self.assertTrue(json.loads(rec)["cite"][0]["linked"])
         self.assertEqual(len(json.loads(inputs)["use"]), 1)
-        self.assertEqual(cite.backfill(self.conn, judge=judge), (0, 0))
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (0, 0))
 
 
 for _name in [n for n in dir(pt.PullTest) if n.startswith("test_")]:

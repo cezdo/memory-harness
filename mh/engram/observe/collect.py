@@ -46,8 +46,9 @@ def unchanged(conn, path):
     return row is not None and (row[0], row[1]) == (s.st_size, s.st_mtime)
 
 
-def mark(conn, path):
-    s = path.stat()
+def mark(conn, path, s=None):
+    """s：解析之前取的文件状态。解析期间文件又长了，记的是读到的那一份，下次照样再读（审查 02，2026-10-28）。"""
+    s = s or path.stat()
     conn.execute("INSERT OR REPLACE INTO collect_file VALUES(?,?,?)", (str(path), s.st_size, s.st_mtime))
 
 
@@ -112,6 +113,7 @@ def run(conn, sources=tuple(SOURCES), force=False, fresh=FRESH, log=sys.stderr, 
             if not force and unchanged(conn, path):
                 n["skipped"] += 1
                 continue
+            before = path.stat()
             try:
                 many = hasattr(mod, "parse_all")             # 一个文件里有几个会话（开关记录）：有意的命令，不等 FRESH
                 found = mod.parse_all(path) if many else [mod.parse(path)]
@@ -127,7 +129,7 @@ def run(conn, sources=tuple(SOURCES), force=False, fresh=FRESH, log=sys.stderr, 
                 n["turns"] += t
                 n["texts"] += x
                 n["fixed"] += f
-            mark(conn, path)
+            mark(conn, path, before)
             n["files"] += 1
         conn.commit()
         totals[name] = n

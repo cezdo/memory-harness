@@ -1056,7 +1056,8 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
     返回 (处理了几张, 环境错误几次)。"""
     if REVISE != "statements":
         return 0, 0
-    todo = revisions(conn)[:limit]
+    fails = lambda r: sum(1 for _, x in r["acts"] if x in ("timeout", "content_error"))
+    todo = [r for r in revisions(conn) if fails(r) < MAX_FAILURES][:limit]     # 先去掉满次数的再取，不让它们占住批次（审查 10）
     if not todo:
         return 0, 0
     mod = (models or {}).get("restate") or MODELS[CURRENT["restate"][0]]()
@@ -1064,9 +1065,6 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
     conn.commit()
     done = env = 0
     for r in todo:
-        fails = sum(1 for _, x in r["acts"] if x in ("timeout", "content_error"))
-        if fails >= MAX_FAILURES:
-            continue
         job = restate_job(conn, r)
         sess = None
         if job:
@@ -1087,6 +1085,8 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
         if error is None and not got:
             error = "content_error: 没有解析出陈述"
         wanted = {n for n, _ in stmts}
+        if error is None and wanted - set(got):          # 漏了几条就整张重来，不改一半就关单（审查 04，2026-10-28）
+            error = "content_error: 漏了第 " + "、".join(map(str, sorted(wanted - set(got)))) + " 条"
         withdrawn = {str(row["id"]): got[n]["withdraw"] for n, row in stmts if n in got and "withdraw" in got[n]}
         meta.update(withdrawn=withdrawn, missing=sorted(wanted - set(got)), extra=sorted(set(got) - wanted))
         h = types.SimpleNamespace(last={}, fails=collections.defaultdict(collections.Counter))

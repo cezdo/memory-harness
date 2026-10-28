@@ -44,7 +44,9 @@ def main():
                 json.dump(out, sys.stdout, ensure_ascii=False)
             else:
                 from ...push.associate import hook
-                hook(io.StringIO(json.dumps(d)), sys.stdout)
+                code = hook(io.StringIO(json.dumps(d)), sys.stdout)
+                if code:                                  # 联想开关的命令：codex 以退出码 2 拦下
+                    sys.exit(code)
         else:
             raise ValueError(f"未知操作 {action}")
     except Exception as e:

@@ -25,12 +25,12 @@ import math
 import re
 from collections import Counter, defaultdict
 
-from ...engram import form, show
+from ...engram import form, observe, show
 from ...engram.store import absent
 from .. import track
 from . import retrieve
 
-VERSION = "v0.24"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.25"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -46,6 +46,7 @@ VERSION = "v0.24"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.22 『文件』指向和来源分开，默认不给，relive 带 files 才给（2026-10-27）
                          # v0.23 话题头下提示“挂线待审视”（中间插入留下的标记，form 设计“挂线是粗筛”；J6，2026-10-27）
                          # v0.24 relive、roam 也去掉 limit，一页固定 SHOW 条，只能翻页（2026-10-27：查看窗口 6–8 条，不让调大绕过去）
+                         # v0.25 MCP 加 yorimichi：“我”在对话阶段变了时记一次允许联想拐几次（0 深挖，1–3 发散），联想按它给不给、给几条（2026-10-28）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
@@ -98,6 +99,7 @@ class Layers:
         self.number(conn)
         self.number_sessions(conn)
         self.t_session = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT id, source, session FROM session_entry")}
+        self.hide(conn)
         self.stmts = {}                                        # 陈述编号 → {"text", "entry", "h"}：现在的陈述
         for nid, n in self.nodes.items():
             if n["kind"] != "entry":
@@ -137,6 +139,20 @@ class Layers:
     def number_sessions(self, conn):
         """陈述在会话里的序号（v0.11）：form 给（form.statement_seq）。sseq {陈述: 序号}；sat {(会话, 序号): 陈述}；ssess {陈述: 会话}。"""
         self.sseq, self.sat, self.ssess = form.statement_seq(conn)
+
+    def hide(self, conn):
+        """关着观察（最后一次开关是 /no-observe）的会话，和没有一样（审查 05，2026-10-28）：入口 form.entries 已经不给；这里把它的
+        话题号、陈述序号（会话里的、线里的，连同已换掉的旧版本）和 E 从句柄能解析到的映射里去掉，直接给句柄也只得到“没有”。
+        /do-observe 以后库变了，读视图重建，自然回来。"""
+        off = {k for k, v in observe.switch.states(conn).items() if v == "off"}
+        gone = {rid for rid, k in self.ssess.items() if k in off}
+        self.events_hidden = observe.withheld(conn)
+        self.t_session = {t: k for t, k in self.t_session.items() if k not in off}
+        self.sat = {k: rid for k, rid in self.sat.items() if k[0] not in off}
+        self.sseq = {rid: n for rid, n in self.sseq.items() if rid not in gone}
+        self.ssess = {rid: k for rid, k in self.ssess.items() if rid not in gone}
+        self.seq = {k: n for k, n in self.seq.items() if k[1] not in gone}
+        self.at = {k: rid for k, rid in self.at.items() if rid not in gone}
 
     def where(self, nid):
         """话题带上所在的线：L3:T5；还没挂上线写 L?:T5。"""
@@ -562,7 +578,7 @@ def _head_of(text):
 
 def show_event(conn, L, eid, source=False, said=False):
     r = conn.execute("SELECT * FROM event WHERE id=?", (eid,)).fetchone()
-    if r is None:
+    if r is None or eid in L.events_hidden:                  # 关着观察的会话里的 E 和没有一样（审查 05）
         return f"E{eid}：没有这一条", {}
     t = conn.execute("SELECT started FROM occurrence WHERE id=?", (r["turn"],)).fetchone() if not absent(r["turn"]) else None
     out = [f"[E{eid}]（{_day(t[0] if t else '')}）{_speaker(r)}{r['text']}"]

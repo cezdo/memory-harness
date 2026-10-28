@@ -250,6 +250,12 @@ class FormTest(unittest.TestCase):
         self.conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                           (u, "pull", "get", "interactive", "claude", "x", "/w", st.NA, "{}", "", st.NA, "{}"))
         self.conn.commit()
+        log = io.StringIO()                                                     # 漏了陈述2：整张记失败，申请不关（审查 04）
+        partial = FakeModel([f"### 陈述1\n我想把「甲服务」升到新版本。\n来源：E{new}\n"])
+        self.assertEqual(form.restate(self.conn, models={"restate": partial}, log=log), (1, 0))
+        self.assertIn("content_error: 漏了第 2 条", log.getvalue())
+        self.assertEqual([r["id"] for r in st.requests(self.conn, "form", "handled")], [])
+        self.assertEqual(len(self.conn.execute("SELECT id FROM form_record").fetchall()), 2)
         log = io.StringIO()
         self.assertEqual(form.restate(self.conn, models={"restate": model}, log=log), (1, 0))
         self.assertIn("改写 1 条、撤下 1 条", log.getvalue())
@@ -266,6 +272,20 @@ class FormTest(unittest.TestCase):
         self.assertEqual(st.requests(self.conn, "form", "handled")[0]["id"], rev)
         self.assertEqual(form.units(self.conn, self.now), [])
         self.assertNotIn("取代：", check.check(self.conn, self.dir / "engram.db"))
+
+    def test_restate_skips_exhausted(self):
+        """满 MAX_FAILURES 的修订提示不占批次（审查 10，2026-10-28）：先去掉再取 limit，后面能做的照样轮到。"""
+        dead = {"id": 1, "inputs": {"event": []}, "acts": [(0, "content_error")] * form.MAX_FAILURES}
+        live = {"id": 2, "inputs": {"event": []}, "acts": []}
+        saved = form.revisions
+        form.revisions = lambda conn: [dead, live]
+        try:
+            self.assertEqual(form.restate(self.conn, models={"restate": FakeModel([])}, log=io.StringIO(), limit=1), (1, 0))
+        finally:
+            form.revisions = saved
+        (inputs,) = [json.loads(r[0]) for r in self.conn.execute(
+            "SELECT o.inputs FROM occurrence o JOIN act_detail a ON a.occurrence=o.id WHERE a.step='restate'")]
+        self.assertEqual(inputs["request"], [2])
 
     def test_feedback_entry(self):
         """会话入口的反馈（2026-10-19）：主会话给出改好的名字，写一个新入口取代原来的，挂线沿用，form 不重判；重名、对已被取代的

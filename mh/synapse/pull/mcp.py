@@ -7,6 +7,7 @@
 - 库：新库 engram.db，经 mh/synapse/pull 取（2026-10-19 换库，E1a；旧库 E4 归档）。环境变量 MH_DB 可以换（测试用拷贝，不在正式库上留足迹）。
 - 进程常驻于一段会话：pull 的读视图按库的变化缓存，get、map 不用每次重建。
 - 出错不让会话断：返回 isError 和错误文字，进程继续。
+- yorimichi（2026-10-28）：“我”在对话阶段变了时记一次允许联想拐几次（0 深挖，1–3 发散），联想的钩子读它；实现在 push/yorimichi。
 - feedback（2026-10-19）：和拉取工具并列的反馈入口，写进新库 engram.db（Engram 的 form.feedback，Synapse 只是转交）；
   主会话的模型由调用方填。现在只接话题（会话入口，T5）。
 注册（用户级，所有工作区都能用；观察者的 claude -p 带 --strict-mcp-config 和独立配置目录，不会加载它）：
@@ -68,6 +69,12 @@ TOOLS = [
          "holder": {"type": "string", "description": f"谁说的：我（默认）或{USER_NAME}"},
          "model": {"type": "string", "description": "你的模型名"}},
          "required": ["reason"]}},
+    {"name": "yorimichi",
+     "description": "寄り道：这段对话允许联想拐几次。阶段变了时调一次（没变不调）：在一个点上深挖给 0，在发散、轻松地聊给 1–3。",
+     "inputSchema": {"type": "object", "properties": {
+         "width": {"type": "integer", "description": "0 深挖不给联想，1–3 给几条"},
+         "why": {"type": "string", "description": "一句话：为什么这么判"}},
+         "required": ["width"]}},
 ]
 
 
@@ -110,6 +117,10 @@ def call(conn, name, args):
     kw = dict(session=_session(args), purpose="interactive", cwd=args.get("cwd") or os.getcwd(), note=args.get("note") or "")
     if name in ("evoke", "relive", "roam"):
         return _call_new(conn, name, args, kw)
+    if name == "yorimichi":     # 允许联想拐几次（push/yorimichi，2026-10-28）：联想的钩子按它给不给、给几条
+        from ..push import yorimichi
+        return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "",
+                           host="claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
     if name == "feedback":
         scope = args.get("scope", "record")
         if scope == "presentation":
