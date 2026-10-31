@@ -25,7 +25,7 @@ def configuration():
 
     # 宿主事件的影子（event）2026-10-19 关了，不装（design/synapse/设计.md“hosts”）
     return {"hooks": {"SessionStart": [group("start")], "UserPromptSubmit": [group("associate")],
-                      "PreToolUse": [group("bind", matcher="^mcp__mh__(evoke|relive|roam)$")]}}
+                      "PreToolUse": [group("bind", matcher="^mcp__mh__")]}}      # 所有 mh 工具都要会话号（10-30：yorimichi 漏了）
 
 
 def install(home):

@@ -43,7 +43,7 @@ from .label import USER_NAME
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数（2026-10-17）
 CURRENT = {"preview": ("sol", "preview-v0.6"),   # 2026-10-20 试用 Sol low；对照 tmp/preview-sonnet/
-           "deep": ("deepseek-ark-web-deep", "deep-rough-read-v0.2"),
+           "deep": ("deepseek-oc-web-deep", "deep-rough-read-v0.2"),   # 2026-10-31 改名并换 provider：ark 订阅用完，换 OpenCode Go（之前 deepseek-ark-web-deep）
            "rough": ("luna-codex-rough", "rough-read-v0.2")}     # 2026-10-19 起（之前 deepseek-ark-web-rough + deep-rough-read-v0.1）；v0.2（10-26）：原话不是中文的，提法照原文写进「」
 MODELS = {**preview.MODELS, **deep_rough_read.MODELS}
 # 预览可以用的模型，按额度轮着用（2026-10-20：有程序兜底，Sol、Sonnet 效果差不多）。先后由节律按额度给（rhythm.pick），
@@ -311,6 +311,54 @@ def seal(rows, cap=deep_rough_read.ROUGH_CAP, hi=deep_rough_read.ROUGH_MAX):
     return sealed, tail
 
 
+def seal_at(rows, cuts):
+    """快道的封窗，加上“现在读掉”（observe 设计“叫醒”）：用户的 /do-observe、“我”的 observe-now 申请，各在那一刻把之前的
+    轮次连尾巴一起封上。cuts：[(时刻, 申请编号或 None)]，只给已经能切的（fast_ready 判）。切点在过去、位置不变，前缀照样稳定。
+    → [(几轮, 因为哪张申请封上的或 None)]。"""
+    out = []
+    for t, rid in sorted(cuts, key=lambda c: c[0]):
+        before = [r for r in rows if switch.when(r["started"]) < t]
+        if before:
+            sealed, tail = seal(before)
+            out += [(w, rid) for w in sealed + [tail] * bool(tail)]
+            rows = [r for r in rows if switch.when(r["started"]) >= t]
+    return out + [(w, None) for w in seal(rows)[0]]
+
+
+def now_requests(conn):
+    """{(来源, 会话): [(时刻, 申请编号, 当时库里最后一轮的序号)]}：“我”的“现在读掉”（observe-now）。主会话写给 observe 的范围申请里
+    只带 turn 的就是它；带 session 的是再观察（reobserve_requests）。"""
+    out = collections.defaultdict(list)
+    for rid, started, inputs in conn.execute(
+            "SELECT o.id, o.started, o.inputs FROM occurrence o JOIN request_detail d ON d.occurrence=o.id "
+            "WHERE d.from_process=? AND d.to_process='observe'", (st.MAIN,)):
+        ins = json.loads(inputs)
+        if ins.get("session") or not ins.get("turn") or st.scope(ins) != "range":
+            continue
+        k = conn.execute("SELECT source, session, ordinal FROM turn_detail WHERE occurrence=?", (ins["turn"][0],)).fetchone()
+        if k:
+            out[(k[0], k[1])].append((switch.when(started), rid, k[2]))
+    return out
+
+
+def request_now(conn, session, reason, operator_id):
+    """“我”的“现在读掉”（用户 2026-10-30：区分用户行为和模型行为，权限分开）：只读尾巴，不开观察。用户关了观察的会话拒绝
+    （库里的开关，加上钩子刚记下、还没采集进库的那一条）；开着就写一张申请（主会话 → observe，inputs 的 turn 是现在库里最后一轮），
+    快道把那一刻之前的尾巴封上去读，读的 act 认领它。“我”申请时所在的那一轮还没结束、不在库里（采集不收没结束的末轮），所以等库里
+    出现比 turn 新、又开始在申请之前的轮次（就是那一轮，结束时 Stop 叫醒循环）再切，让它一起读进去。session：宿主的会话编号。→ 申请编号。
+    还没采集进库：LookupError；关着：PermissionError。"""
+    row = conn.execute("SELECT source, session FROM session_detail WHERE session=? ORDER BY occurrence DESC", (session,)).fetchone()
+    last = row and conn.execute("SELECT occurrence FROM turn_detail WHERE source=? AND session=? ORDER BY ordinal DESC LIMIT 1",
+                                (row[0], row[1])).fetchone()
+    if not last:
+        raise LookupError(f"这段会话（{session}）还没采集进库")
+    if switch.states(conn).get((row[0], row[1])) == "off" or switch.logged(session) == "off":
+        raise PermissionError(f"{USER_NAME}关了这段对话的观察（/no-observe），只有{USER_NAME}能开")
+    rid = st.request(conn, st.MAIN, "observe", {"turn": [last[0]]}, reason, operator_id, cause="conversation")
+    conn.commit()
+    return rid
+
+
 def _fast_acts(conn):
     """快道的读：[(act, 结果, 轮次)]。"""
     return [(oid, result, json.loads(window)["turns"]) for oid, _, result, step, window, _ in conn.execute(ACTS)
@@ -324,12 +372,15 @@ def fast_texts(conn, ok_only=True):
             if not ok_only or result in ("ok", "filtered") for t in turns} - {None}
 
 
-def fast_ready(conn, session=None, now=None):
-    """快道该读的窗口：[几轮]。只看人直接参与、开着观察、还没告一段落的会话；轮次是还没处理（没预览、没被旧版本观察、
-    快道没排过）、已经结束、写出了文字的，开关那一轮和不显示的轮（宿主消息后回复不到 100 字）不算；同一份原文只排一次。"""
+def fast_ready(conn, session=None, now=None, requests=False):
+    """快道该读的窗口：[几轮]（requests：[(几轮, 因为哪张 observe-now 申请封上的或 None)]，读的 act 认领它）。只看人直接参与、开着观察、还没告一段落的会话；轮次是还没处理（没预览、没被旧版本观察、
+    快道没排过）、已经结束、写出了文字的，开关那一轮和不显示的轮（宿主消息后回复不到 100 字）不算；同一份原文只排一次。
+    不够一窗的尾巴等着，/do-observe、observe-now 之前的尾巴现在就读（seal_at）。"""
     h = history(conn)
     skip = h.done | fast_texts(conn, ok_only=False)
-    off = switch.states(conn)
+    flips = switch.history(conn)
+    off = {k for k, v in flips.items() if max(v)[2] == "off"}
+    asked = now_requests(conn)
     now = now or datetime.now(timezone.utc)
     sql, args = TURNS + " WHERE s.kind='user'", []
     if session:
@@ -340,17 +391,19 @@ def fast_ready(conn, session=None, now=None):
         by[(row["source"], row["session"])].append(row)
     out, taken = [], set()
     for key, rows in by.items():
-        if off.get(key) == "off":
+        if key in off:
             continue
         if idle(rows[-1]["started"], key[0], now):
             continue                                   # 告一段落了：走正常预览
         hidden = preview.hidden(rows)
         ok = [r for i, r in enumerate(rows) if (r["closed"] or i < len(rows) - 1) and r["assistant"] and not switch.switch(r["user"])
               and r["text"] not in skip and r["text"] not in taken and r["ordinal"] + 1 not in hidden]
-        sealed, _ = seal(ok)
-        for w in sealed:
+        cuts = [(t, None) for t, _, state, _ in flips.get(key, ()) if state == "on"] + \
+               [(t, rid) for t, rid, after in asked.get(key, ())                 # 申请时所在的那一轮进库了才切
+                if any(r["ordinal"] > after and switch.when(r["started"]) < t for r in rows)]
+        for w, rid in seal_at(ok, cuts):
             taken |= {r["text"] for r in w}
-            out.append(w)
+            out.append((w, rid) if requests else w)
     return out
 
 
@@ -490,10 +543,10 @@ def build_read(conn, group, step, model):
 
 
 def store_read(conn, op_id, pid, group, step, tables, mask, text, output, meta, error, last, cause="new_text", fast=False,
-               reread=None, commit=True):
+               reread=None, commit=True, request=None):
     """写一次观察：act，以及解析出的 event（出处是来源里第一个解析到的轮次，都没解析到就记在这几轮的第一轮）。
     reread：重读（2026-10-25），值是旧的读（粗读、精读或旧版本逐轮观察）的 act；inputs 带上它，读过的轮次更早的 E 整轮被取代（reread_reads）。
-    commit=False：由调用方把一段会话的几次读写一起提交（form 不会看到半段）。"""
+    commit=False：由调用方把一段会话的几次读写一起提交（form 不会看到半段）。request：认领的申请（快道读 observe-now 封上的窗口）。"""
     restored, seconds = mask.restore(output), meta.get("seconds")
     events, nothing = parse.parse_turns(restored, {n: t for n, (_, t) in tables.items()}) if error is None else ([], False)
     if error is None and not events and not nothing:      # 既没有事件也没写“无”：格式不对，留着重试（审查 03，2026-10-28）
@@ -518,6 +571,8 @@ def store_read(conn, op_id, pid, group, step, tables, mask, text, output, meta, 
         inputs["act"] = [pid]
     if reread:
         inputs["reread"] = [reread]
+    if request:
+        inputs["request"] = [request]
     act, result, err = _act(conn, op_id, step, window, inputs, text, output, meta, error, last, ("turns", tuple(group["turns"])), cause)
     write_events(conn, act, events, tables, group["turns"][0])
     if commit:
@@ -783,10 +838,12 @@ def reobserve_requests(conn):
     """给 observe 的范围申请（再观察）：[(编号, 到达, {会话键})]，按到达排。认领过的也在里面：会话还有没预览的轮次，
     ready 照样挑得出来。"""
     out = []
-    for r in st.requests(conn, "observe", "all"):
+    for r in st.requests(conn, "observe", "all", claims=False):
         if st.scope(r["inputs"]) != "range":
             continue
         ids = r["inputs"].get("session", [])
+        if not ids:
+            continue                        # 只带 turn 的是“我”的 observe-now（now_requests），不是再观察
         keys = {(x[0], x[1]) for x in conn.execute(
             f"SELECT source, session FROM session_detail WHERE occurrence IN ({','.join('?' * len(ids))})", ids)} if ids else set()
         started = conn.execute("SELECT started FROM occurrence WHERE id=?", (r["id"],)).fetchone()[0]
@@ -799,10 +856,14 @@ def queue(conn, op_id, session=None, now=None, reobserve=True):
     再观察的在申请写下的那一刻到，同一张申请里的从新往旧。两边都有的会话按再观察算（它的窗口从更早的轮次起）。
     资源平等，没有高低之分（2026-10-19）。reobserve=False：只看新的。"""
     out = {}
-    for req, at, keys in (reobserve_requests(conn) if reobserve else []):
-        for rows, _ in ready(conn, op_id, session, now, keys):
+    reqs = reobserve_requests(conn) if reobserve else []
+    # ready 对各会话的判定互不相干：所有申请的会话一起算一次，再按申请先后分（2026-10-30：一张申请一次，330 张一轮 160 秒）
+    again = ready(conn, op_id, session, now, set().union(*(keys for _, _, keys in reqs))) if reqs else []
+    for req, at, keys in reqs:
+        for rows, _ in again:
             key = (rows[0]["source"], rows[0]["session"])
-            out.setdefault(key, (at, key, req))
+            if key in keys:
+                out.setdefault(key, (at, key, req))
     for rows, _ in ready(conn, op_id, session, now):
         key = (rows[0]["source"], rows[0]["session"])
         if key in out:
@@ -883,17 +944,18 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
         for pid, group, step in to_read(conn, session):
             tables, mask, text = build_read(conn, group, step, obs[step])
             jobs.append((pid, group, step, tables, mask, text))
-        for w in fast_ready(conn, session, now):
+        for w, rid in fast_ready(conn, session, now, requests=True):
             group = {"turns": [r["occurrence"] for r in w], "from": w[0]["ordinal"] + 1, "to": w[-1]["ordinal"] + 1,
                      "how": "粗读", "plan": FAST_PLAN}
             tables, mask, text = build_read(conn, group, "rough", obs["rough"])
-            jobs.append((None, group, "fast", tables, mask, text))
+            jobs.append((rid, group, "fast", tables, mask, text))
         futures = {pool.submit(_call, obs["rough" if j[2] == "fast" else j[2]], j[5]): j for j in jobs}
         for f in concurrent.futures.as_completed(futures):
             pid, group, step, tables, mask, text = futures[f]
             output, meta, error = f.result()
-            if step == "fast":
-                state = store_read(conn, fast_op, None, group, "rough", tables, mask, text, output, meta, error, last, cause, fast=True)
+            if step == "fast":                 # 快道的 pid 位放的是 observe-now 的申请（认领它），没有是 None
+                state = store_read(conn, fast_op, None, group, "rough", tables, mask, text, output, meta, error, last,
+                                   "request" if pid else cause, fast=True, request=pid)
             else:
                 state = store_read(conn, ops[step][0], pid, group, step, tables, mask, text, output, meta, error, last, cause)
             env += state.startswith("env_error")

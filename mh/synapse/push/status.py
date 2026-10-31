@@ -1,6 +1,6 @@
 """手记推送的“项目现状”（design/synapse/设计.md，2026-10-20）：新会话一开头要 ls、git log、看服务、跑检查才摸得清项目，
 这些由程序事先编好。手写的部分在 design/synapse/workspace-status/<工作区>.md（仓库、服务、检查命令、目录说明），其余从 git、
-systemd 和检查命令读。整理循环（rhythm --tidy）定时调 write 编好、调 run_check 跑检查，都存进数据目录；手记推送只读编好的（read），
+服务（rhythm.register：systemd 或 launchd）和检查命令读。整理循环（rhythm --tidy）定时调 write 编好、调 run_check 跑检查，都存进数据目录；手记推送只读编好的（read），
 按宿主去掉它自己给了的节，读不到就不给这一节。纯程序。"""
 import re
 import subprocess
@@ -16,6 +16,7 @@ CUT = 72                 # 一行最多几个字
 ERR_HOURS = 6            # 服务看近几个小时的出错
 ERR = re.compile(r"：(env_error|timeout|content_error)：|出错：|Traceback")   # act 失败（observe、form 的日志行）、循环出错
 CHECK_TIMEOUT = 300      # 检查命令最多跑几秒
+KERNEL_DAYS = 3          # 内核日志看近几天的 warn：窗口外改了内核（elevate.view，2026-10-30；天数和 ACTIVE_DAYS 一样）
 # 宿主自己在会话接入时给了的，不再给（2026-10-20）：Claude Code 自带 git 状态和最近 5 次提交
 HOST_GIVES = {"claude": ("最近的提交", "没提交的改动")}
 
@@ -38,20 +39,22 @@ def _cut(s, n=CUT):
 
 
 def source(ws):
-    """手写的部分 → {"repo", "services", "check", "notes": {目录: 说明}}；这个工作区没写就返回 None。"""
+    """手写的部分 → {"repo", "services", "check", "runbook", "notes": {目录: 说明}}；这个工作区没写就返回 None。"""
     f = SOURCES / f"{ws}.md"
     if not f.exists():
         return None
     text = f.read_text()
-    cfg = {"repo": None, "services": [], "check": None, "notes": {}}
+    cfg = {"repo": None, "services": [], "check": None, "runbook": None, "notes": {}}
     for line in text.splitlines():
-        m = re.match(r"- (仓库|服务|检查)：(.+)", line)
+        m = re.match(r"- (仓库|服务|检查|runbook)：(.+)", line)
         if m and "## 目录" not in text.split(line)[0]:
             k, v = m.groups()
             if k == "仓库":
                 cfg["repo"] = Path(v.strip()).expanduser()
             elif k == "检查":
                 cfg["check"] = v.strip()
+            elif k == "runbook":
+                cfg["runbook"] = v.strip()
             else:
                 cfg["services"] = [x.strip() for x in re.split(r"[、,，]", v) if x.strip()]
     body = text.split("## 目录", 1)[1] if "## 目录" in text else ""
@@ -104,13 +107,13 @@ def _worktrees(repo):
 
 def _services(names):
     """都在跑、近几个小时没出错就压成一行；有异常的才单列（2026-10-24：只推异常）。"""
+    from ...rhythm import register
     ok, bad = [], []
     for s in names:
-        st = _run(["systemctl", "--user", "show", s, "-p", "ActiveState", "--value"]).strip()
+        st = register.state(s)
         if not st:
             continue
-        errs = [x for x in _run(["journalctl", "--user", "-u", s, "--since", f"-{ERR_HOURS}h", "-o", "short-iso",
-                                 "--no-pager"]).splitlines() if ERR.search(x)]
+        errs = [x for x in register.lines(s, ERR_HOURS) if ERR.search(x[1])]
         short = s.removeprefix("memory-harness-")
         if st == "active" and not errs:
             ok.append(short)
@@ -121,11 +124,10 @@ def _services(names):
 
 
 def _errors(lines):
-    """journalctl -o short-iso 里挑出的出错行 → “；近 6 小时出错 N 行，最后一次 HH:MM：……”；没有就说没有。"""
+    """[(ISO 时刻, 正文)] 里挑出的出错行 → “；近 6 小时出错 N 行，最后一次 HH:MM：……”；没有就说没有。"""
     if not lines:
         return f"；近 {ERR_HOURS} 小时没有出错"
-    at, _, msg = lines[-1].partition(" ")
-    msg = msg.split(": ", 1)[1] if ": " in msg else msg                 # 去掉“主机 进程[pid]: ”
+    at, msg = lines[-1]
     return f"；近 {ERR_HOURS} 小时出错 {len(lines)} 行，最后一次 {at[11:16]}：{_cut(msg, 60)}"
 
 
@@ -148,15 +150,36 @@ def compile(ws, home=None):
     svc = _services(cfg["services"])
     if svc:
         parts += ["", "### 服务", *svc]
+    kernel = _kernel(repo)
+    if kernel:
+        parts += ["", "### 内核日志（warn，`python3 -m mh.synapse.push.elevate log` 看全部，给编号展开）", *kernel]
     check = _read_stamped((home or _out()) / f"{ws}.check") if cfg["check"] else None
     if check:
         at, body = check
         prev = _read_stamped((home or _out()) / f"{ws}.check.prev")
         parts += ["", f"### 检查（`{cfg['check']}`，{at:%m-%d %H:%M} 跑）", *changed(body, prev)]
+    if cfg["runbook"]:
+        from . import runbook
+        rb = runbook.section(ws, repo, cfg["runbook"], home)
+        if rb:
+            parts += ["", f"### runbook（`{cfg['runbook']}`）", *rb]
     near = _recent(ws)                 # 放最后：送手记时 recent.drop_self 只切这一节
     if near:
         parts += ["", near]
     return "\n".join(parts)
+
+
+def _kernel(repo, log=None, now=None):
+    """内核（core.md）在这个仓库里时，近 KERNEL_DAYS 天的 warn 行；没有就是空，不出声（像只看 dmesg -l warn）。"""
+    from . import CORE
+    from .elevate import view
+    from ...engram.store import HOME
+    try:
+        Path(CORE).resolve().relative_to(Path(repo).resolve())
+    except ValueError:
+        return []
+    since = (now or datetime.now(timezone.utc)) - timedelta(days=KERNEL_DAYS)
+    return [f"- {x}" for x in view(log or HOME / "kernel-log.jsonl", "warn", since)]
 
 
 def _dirty_sources(repo, files, ws):

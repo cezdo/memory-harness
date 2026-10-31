@@ -28,6 +28,41 @@ quiet = []                                       # 不当“查不到的词”�
 # codex = "codex"                                # codex CLI 的路径（默认按 PATH 找）
 # dsh_test = "~/dsh-test"                        # dsh 测试实例（精读、粗读的 headless 模式）
 
+[invoke]                                        # 远端调用（mh engram serve）：只能在一台机器上跑的模型定义由它代跑
+# listen = "127.0.0.1:3090"                      # 服务端听哪里（默认只听本机）
+# token = ""                                     # 两边一样；不写就不开放
+
+[invoke.remote]                                  # 客户端：哪些模型定义转发到哪里；没写的在本机跑
+# "deepseek-oc-web-deep" = "http://linux-box:3090"
+
+[listen]                                        # 监听 QQ 协议端（mh listen）：OneBot 11 正向 WS
+# remote = "127.0.0.1:3001"                     # 协议端的 WS（在 ssh 那台机器上看）
+# ssh = "qq-box"                                  # 协议端只听另一台机器的本机时，经这台 ssh 隧道连；不写就直连 remote
+# local = 13001                                 # 隧道在本机的端口
+# token_file = "~/.config/memory-harness/qq-onebot.key"   # 协议端配的 token
+
+[reply]                                         # 回复（mh reply）：在一个群里被叫到时回几句；连接沿用 [listen]
+# group = 123456789                             # 只在这个群里回
+# names = ["小号的昵称"]                         # 文字里出现这些名字也算叫到（@、回复我的消息总算）
+# ignore = []                                   # 不回这些号（群里别的 bot）
+# model = "gpt-6.1-terra"                       # codex 上的模型；effort 默认 low
+# private = []                                 # 只回这些号的私聊（说了就回）
+# owner = []                                   # 用户自己的号：叫我、私聊都不计额度
+# bots = []                                    # 群里的 bot：只有它叫我的，算 bot_hourly
+# hourly_max = 30                              # 总量（每小时）：别人叫我、跟复读、主动接话发出去的，含 bot 那份
+# bot_hourly = 10
+# proactive_hourly = 4                         # 主动接话每小时最多问几次（问了不接也算）
+# proactive_gap_minutes = 10
+# proactive_after = 8                          # 上次说话后又有几条别人的话才看一眼
+# echo_after = 2                                # 几个不同的人复读了就跟一句（0 不跟）
+# effort = "medium"
+# hint_chars = 60                               # 提示词里要求的字数
+# max_chars = 100                               # 硬上限：超了重写一次，还超就截
+# day_hour = 7                                  # 每天几点切段（本地时间）
+# gap_minutes = 30                              # 隔多久没人说话也切段
+# persona = "~/chat/AGENTS.md"            # 人设
+# local = 13002                                 # 自己那条隧道在本机的端口
+
 [resources]                                     # 私有文本，独立于代码和发行包
 # core = "~/.config/memory-harness/core.md"         # 内核（手记里不变的那部分）；2026-10-24 前叫 standing
 # glossary = "~/.config/memory-harness/glossary.md"

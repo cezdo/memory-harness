@@ -5,6 +5,9 @@
 - 拦：PreToolUse 看编辑类工具，目标是源文件又不在窗口里就拒绝；Bash 这类不解析，交给比对；
 - 记：PostToolUse 每次比对源文件和快照，变了就记 edit（窗口里）或 unlogged（窗口外，谁发现的记在 found_by）。
 日志是数据目录的 kernel-log.jsonl，只追加。钩子要轻（每次调工具都跑），只用标准库；出错放行，见 hook.py。
+读日志照 Linux 的内核日志（dmesg，2026-10-30）：一条一行、前缀固定（编号、时刻、级别、谁、种类、会话、摘要），按级别筛，
+连着的同类折成一行；diff、哈希留在原件里，按编号展开（view、detail）。grant 的原话、edit 那一轮本来就在宿主的会话记录里，
+采集已经收进库，日志不再收一遍（runbook N3）。
 设计见 design/synapse/设计.md“内核态”。
 """
 import difflib
@@ -29,6 +32,105 @@ GRANTED = ("〔内核态〕这一轮由用户用 /mhcore 临时提权：可以�
 USAGE = "memory-harness：/mhcore 后面要写要求，如“/mhcore 接下来优先把称呼改成示例用户”。"
 DENIED = ("内核（core.md）在用户态下只读（{path}）。要改请用户用 /mhcore <要求> 临时提权；"
           "或者先把想改的句子写给用户看。")
+
+
+LEVELS = ("info", "notice", "warn")
+LEVEL = {"baseline": "info", "close": "info", "grant": "notice", "edit": "notice", "unlogged": "warn"}
+WHO = {"grant": "用户", "edit": "我"}          # 其余是程序记的：基线、关窗，窗口外的改动（不知道是谁改的）
+SUMMARY = 40                                  # 原话、理由在一行里最多几个字
+
+
+def records(log):
+    """日志 → [(编号, 记录)]，编号是行号（从 1 起），坏行跳过。读不到就是空。"""
+    out = []
+    try:
+        with open(log, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("kind") in LEVEL:
+                    out.append((n, d))
+    except OSError:
+        pass
+    return out
+
+
+def _local(t):
+    try:
+        return datetime.fromisoformat(t).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def _churn(diff):
+    lines = (diff or "").splitlines()
+    add = sum(1 for x in lines if x.startswith("+") and not x.startswith("+++"))
+    rm = sum(1 for x in lines if x.startswith("-") and not x.startswith("---"))
+    return f"+{add}-{rm}"
+
+
+def _cut(text, n=SUMMARY):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n] + "…"
+
+
+def _key(d):
+    """折叠用：种类、宿主、会话都一样的连着几条折成一行。窗口外的改动按发现它的会话算。"""
+    by = d.get("found_by") or d
+    return d["kind"], by.get("host", ""), by.get("session", "")
+
+
+def _summary(d, folded=False):
+    """一行的摘要。折起来的几条改动各改各的，行数加起来没有意义，只写工具。"""
+    k = d["kind"]
+    churn = "" if folded else _churn(d.get("diff")) + " "
+    if k == "grant":
+        return _cut(d.get("prompt"))
+    if k == "edit":
+        return f"{churn}{d.get('tool') or ''}".strip()
+    if k == "unlogged":           # 10-24 早先几条把发现者写在顶层
+        by = d.get("found_by") or d
+        return f"{churn}{by.get('tool') or '比对'} 之后发现"
+    if k == "close":
+        return _cut(d.get("why"))
+    return f"快照 {d.get('after', '')}"
+
+
+def view(log, level="notice", since=None):
+    """dmesg 式的行：只给 level 及以上的，since（带时区的 datetime）以后的；连着的同类折成一行，写 ×N 和时段。"""
+    floor = LEVELS.index(level)
+    got = [(n, d) for n, d in records(log) if LEVELS.index(LEVEL[d["kind"]]) >= floor
+           and (since is None or (_local(d.get("time")) or since) >= since)]
+    runs = []
+    for n, d in got:
+        if runs and _key(runs[-1][-1][1]) == _key(d):
+            runs[-1].append((n, d))
+        else:
+            runs.append([(n, d)])
+    out = []
+    for run in runs:
+        (n, d), last = run[0], run[-1][1]
+        t, t2 = _local(d.get("time")), _local(last.get("time"))
+        when = f"{t:%m-%d %H:%M}" if t else "?"
+        if len(run) > 1 and t2:
+            when += f"–{t2:%H:%M}" if t and t2.date() == t.date() else f"–{t2:%m-%d %H:%M}"
+        _, host, ses = _key(d)
+        where = f"{host}:{ses[:8]}" if host or ses else "-"
+        more = f" ×{len(run)}（#{n}–#{run[-1][0]}）" if len(run) > 1 else ""
+        out.append(f"#{n} {when} {LEVEL[d['kind']]} {WHO.get(d['kind'], '程序')} {d['kind']} {where} {_summary(d, len(run) > 1)}{more}")
+    return out
+
+
+def detail(log, n):
+    """按编号展开一条：原件全部字段，diff 原样。"""
+    for i, d in records(log):
+        if i == n:
+            diff = d.pop("diff", None)
+            head = json.dumps(d, ensure_ascii=False, indent=1)
+            return head + ("\n" + diff if diff else "")
+    raise ValueError(f"内核日志里没有 #{n}")
 
 
 class Kernel:

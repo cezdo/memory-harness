@@ -1,8 +1,9 @@
 """采集：observe 的接口。把本机各宿主的会话归一化为轮次，写进新库的 session、turn（design/engram/observe/采集.md）。
 纯程序，不调用模型。
 
-各宿主的解析器在 sources/（claude、codex、dsh，加上钩子写的开关记录 switch），这里写进库：
-- 每一轮在采集时就定好来源：开头是用户的话（human）、宿主注入（host：通知、打断、命令、压缩）还是脚本发起（script）；
+各宿主的解析器在 sources/（claude、codex、dsh，加上钩子和 MCP 工具写的开关记录 switch），这里写进库：
+- 每一轮在采集时就定好来源：开头是用户的话（human）、宿主注入（host：通知、打断、命令、压缩）、脚本发起（script），
+  还是主会话自己的表达（main：开关记录里的 yorimichi）；
 - 结束标记、分叉点、非正常结束记在 turn_detail；之后的更正只从无到有，位置对上、内容不同的不写（原文只追加）；
 - 新会话开始不满 FRESH 不收，也不标记文件，下一轮再看（测试、误开的会话在窗口内删掉就不会进来）。
 """
@@ -17,7 +18,7 @@ from ..store.delete import deleted
 
 SCRIPT_PREFIX = "（定时任务"          # 脚本、定时任务发起的轮次（见 synapse.hosts.HOST）
 HOST_KINDS = {"通知": "notification", "打断": "interrupt", "命令": "command", "压缩": "compaction"}
-COLLECTOR = "observe/collect-v2"         # v2（2026-10-17）：开关记录作为一个来源收进来
+COLLECTOR = "observe/collect-v3"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main
 
 
 def origin(user):
@@ -81,7 +82,7 @@ def save(conn, op, session, turns, log=None):
                            (s.source, s.session, i)).fetchone()
         if old is None:
             oid = occurrence(conn, "turn", op, started=iso(t.started), scale="turn", cause=NA, parent=sid)
-            org, kind = ("human", "command") if s.source == switch.SOURCE else origin(t.user)     # 开关记录：用户的命令
+            org, kind = switch.origin(s) if s.source == switch.SOURCE else origin(t.user)     # 开关记录：用户的命令或“我”的 yorimichi
             conn.execute("INSERT INTO turn_detail VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (oid, t.id, s.source, s.session, i, int(t.closed), ending, prev, st.dumps(t.address), org, kind))
             new += 1

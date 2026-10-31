@@ -25,7 +25,7 @@ DEFAULT_DB = HOME / "engram.db"
 # 两种都沾的（超时的字样加上额度、限流）按环境错误算。
 ENVIRONMENTAL = re.compile(r"quota|insufficient|balance|rate.?limit|usage limit|too many requests|\b40[23]\b|\b429\b|\b50[23]\b"
                            r"|overloaded|\bmodel is at capacity\b|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
-                           r"|waiting for service|did not activate|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
+                           r"|waiting for service|did not activate|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
 # 内容过滤：服务商按内容拦下（如 ark 的 finish_reason: content_filter）。重试不会变，这一份就不要了（2026-10-17）
 FILTERED = re.compile(r"content_filter|content.?(policy|moderation)|内容过滤|内容安全|敏感内容", re.I)
 
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS turn_detail(
   occurrence INTEGER PRIMARY KEY, text TEXT NOT NULL, source TEXT NOT NULL, session TEXT NOT NULL,
   ordinal INTEGER NOT NULL, closed INTEGER NOT NULL, ending TEXT NOT NULL, prev INTEGER NOT NULL,
   address TEXT NOT NULL,
-  origin TEXT NOT NULL,           -- human | host | script：这一轮开头是谁
+  origin TEXT NOT NULL,           -- human | host | script | main（主会话，开关记录里的 yorimichi）：这一轮开头是谁
   host_kind TEXT NOT NULL,        -- notification | interrupt | command | compaction（origin = host 时）
   UNIQUE(source, session, ordinal));
 CREATE INDEX IF NOT EXISTS turn_detail_text ON turn_detail(text);
@@ -412,13 +412,19 @@ def claimed(conn, request_id):
     return sorted(set(out + got))
 
 
-def requests(conn, to_process, state="open"):
+def requests(conn, to_process, state="open", claims=True):
     """给这个过程的申请：[{id, from, to, reason, inputs, parent, acts}]。state：open（还没有成功的 act 认领）、handled（有）、
     failed（只有失败的）、all。成功包括被内容过滤拦下的（不要了，算处理过）。一张申请分几次做时，还剩什么由接收的那一层自己判断
-    （observe 的纠正：correction_targets；form 认领时从 pack 起整段重做，act 的 inputs 不带被点名的记录）。"""
+    （observe 的纠正：correction_targets；form 认领时从 pack 起整段重做，act 的 inputs 不带被点名的记录）。
+    claims=False：只在 state 为 all 时可用，不推认领（claimed 每张申请扫一遍 act，几百张一轮要几秒），acts、state 不给。"""
+    assert claims or state == "all"
     out = []
     for r in conn.execute("SELECT o.id, o.inputs, o.parent, d.from_process, d.to_process, d.reason FROM request_detail d "
                           "JOIN occurrence o ON o.id=d.occurrence WHERE d.to_process=? ORDER BY o.id", (to_process,)):
+        if not claims:
+            out.append({"id": r["id"], "from": r["from_process"], "to": r["to_process"], "reason": r["reason"],
+                        "inputs": json.loads(r["inputs"]), "parent": r["parent"]})
+            continue
         acts = claimed(conn, r["id"])
         inputs = json.loads(r["inputs"])
         ok = any(x in ("ok", "filtered") for _, x in acts)

@@ -42,6 +42,8 @@ QUIET = frozenset(w.lower() for w in _D.get("synapse", {}).get("quiet", ()))   #
 
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # dsh 更新测试实例（精读、粗读用）
+INVOKE = _D.get("invoke", {})                            # 远端调用：listen、token、remote（invoke/serve.py）
+LISTEN = _D.get("listen", {})                            # 监听 QQ 协议端：ssh、remote、local、token_file（observe/listen.py）
 
 
 def resource(name, development, filename):

@@ -87,5 +87,75 @@ class InvokeTest(unittest.TestCase):
         self.assertEqual(runs, [])
 
 
+class Fake:
+    """假的模型：按提示词决定返回什么、抛什么。"""
+    model, platform, isolation, timeout = "fake", "fake-platform", "iso-1", 5
+
+    def __call__(self, prompt):
+        if prompt == "slow":
+            raise TimeoutError("dsh web 观察超时（会话 x）")
+        if prompt == "tool":
+            raise RuntimeError("观察者调用了工具 ['bash: ls']，已取消，结果作废")
+        return prompt.upper(), {"model": self.model, "session": "s1"}
+
+
+class ServeTest(unittest.TestCase):
+    """远端调用（X2，2026-10-29）：转发后拿到的和本地一样；模型那边的错原样带回、照本地规则分类；连不上、
+    Operator 不一致、token 不对算环境错误。不碰 DshWeb。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from . import serve
+        cls.null = open(os.devnull, "w")
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.handler({"fake": Fake}, "t0k", log=cls.null))
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.null.close()
+
+    def remote(self, url=None, token="t0k", local=None):
+        from . import serve
+        return serve.remote("fake", local or Fake(), {"remote": {"fake": url or self.url}, "token": token})
+
+    def kind(self, model, prompt):
+        from ..store import outcome
+        try:
+            model(prompt)
+        except Exception as e:
+            return type(e).__name__, outcome(str(e))[0]
+        return None, "ok"
+
+    def test_pass_through(self):
+        from . import serve
+        r = self.remote()
+        self.assertIsInstance(r, serve.Remote)
+        self.assertEqual((r.model, r.platform, r.isolation), ("fake", "fake-platform", "iso-1"))   # 身份在本地算
+        text, meta = r("abc")
+        self.assertEqual(text, "ABC")
+        self.assertEqual(meta["session"], "s1")
+        self.assertEqual(meta["remote"], self.url)
+        local = Fake()
+        self.assertIs(serve.remote("fake", local, {"remote": {"other": self.url}}), local)       # 没配就在本地跑
+
+    def test_errors(self):
+        self.assertEqual(self.kind(self.remote(), "slow"), ("TimeoutError", "timeout"))
+        self.assertEqual(self.kind(self.remote(), "tool"), ("RuntimeError", "content_error"))
+        stale = Fake()
+        stale.isolation = "iso-0"
+        self.assertEqual(self.kind(self.remote(local=stale), "abc"), ("RuntimeError", "env_error"))   # 两边补丁不一致
+        self.assertEqual(self.kind(self.remote(token="wrong"), "abc"), ("RuntimeError", "env_error"))
+        import socket
+        with socket.socket() as s:                   # 拿一个没人听的端口
+            s.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+        self.assertEqual(self.kind(self.remote(url=dead), "abc"), ("RuntimeError", "env_error"))
+
+
 if __name__ == "__main__":
     unittest.main()

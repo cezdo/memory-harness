@@ -30,7 +30,7 @@ from ...engram.store import absent
 from .. import track
 from . import retrieve
 
-VERSION = "v0.25"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.30"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -47,6 +47,11 @@ VERSION = "v0.25"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.23 话题头下提示“挂线待审视”（中间插入留下的标记，form 设计“挂线是粗筛”；J6，2026-10-27）
                          # v0.24 relive、roam 也去掉 limit，一页固定 SHOW 条，只能翻页（2026-10-27：查看窗口 6–8 条，不让调大绕过去）
                          # v0.25 MCP 加 yorimichi：“我”在对话阶段变了时记一次允许联想拐几次（0 深挖，1–3 发散），联想按它给不给、给几条（2026-10-28）
+                         # v0.26 只给会话记录的主列（form 的归纳）：被归纳的陈述降半级、句柄不变可直达，标归纳进哪条；归纳的 source 列下层陈述（2026-10-29）
+                         # v0.27 yorimichi 记下后回给“我”实情（送达关着、用户关了联想）；一直没判过的对话第 3 句提醒一次；codex 的 bind 覆盖所有 mh 工具（2026-10-30：上线两天零调用）
+                         # v0.28 联想重开送达：按 yorimichi 的数值，0 不送，1–3 截到这么多个话题（用户 2026-10-30）
+                         # v0.29 联想送达的片段按条数放长（1/2/3 条一共 300/400/500 字，放得下给整条），片段带陈述句柄（用户 2026-10-30）
+                         # v0.30 MCP 加 observe-now：“我”让观察现在读掉尾巴，只读不开，记成申请，用户关了的拒绝（用户 2026-10-30）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
@@ -108,6 +113,7 @@ class Layers:
                 h = f"{self.where(nid)}:S{self.sseq.get(it['id'], i)}"
                 self.stmts[it["id"]] = {"text": it["text"], "entry": nid, "h": h, "id": it["id"]}
         self.by_h = {s["h"]: sid for sid, s in self.stmts.items()}
+        self.under = {low: up for n in self.nodes.values() for low, up in n.get("under", {}).items()}   # 降半级的陈述 → 归纳它的那条
         self.conn = conn
         self.j = {}
         for r in conn.execute(J_ROWS):
@@ -173,7 +179,7 @@ class Layers:
     def cites(self):
         """E 编号 → 引用它的陈述。"""
         out = defaultdict(list)
-        ids = [s["id"] for s in self.stmts.values()]
+        ids = [s["id"] for s in self.stmts.values()] + list(self.under)     # 降半级的陈述也算（归纳本身没有 E）
         for i in range(0, len(ids), 900):
             chunk = ids[i:i + 900]
             for r in self.conn.execute(f"SELECT id, refs FROM form_record WHERE id IN ({','.join('?' * len(chunk))})", chunk):
@@ -354,7 +360,11 @@ def _sections(conn, L, items):
     turns = {}
     for it in items:
         row = conn.execute("SELECT refs FROM form_record WHERE id=?", (it["id"],)).fetchone()
-        refs = json.loads(row[0]).get("event", []) if row else []
+        got = json.loads(row[0]) if row else {}
+        if not got.get("event") and got.get("form_record"):       # 归纳：看它归纳的第一条陈述
+            row = conn.execute("SELECT refs FROM form_record WHERE id=?", (got["form_record"][0],)).fetchone()
+            got = json.loads(row[0]) if row else {}
+        refs = got.get("event", [])
         r = refs and conn.execute("SELECT turn FROM event WHERE id=?", (refs[0],)).fetchone()
         turns[it["id"]] = r[0] if r else None
     group = _preview_groups(conn, turns.values())
@@ -487,12 +497,22 @@ def show_stmt(conn, L, sid, h, source=False, said=False, recall=None, section=0,
     """陈述是最小单位（2026-10-19）：只取它时给正文；带 source、said、recall 是取它的属性，只给句柄和属性，
     正文不再重复（evoke、relive 已经给过）。"""
     row = conn.execute("SELECT * FROM form_record WHERE id=?", (sid,)).fetchone()
-    now = sid in L.stmts
-    head = f"[{L.stmt_handle(sid, h)}]" + ("" if now else "（已不是现在的陈述）")
+    now = sid in L.stmts or sid in L.under          # 降半级的陈述照样是现在的，直接给句柄读得到（2026-10-29）
+    head = f"[{L.stmt_handle(sid, h)}]" + ("" if now else "（已不是现在的陈述）") + \
+        (f"（归纳进 {L.stmt_handle(L.under[sid], '')}）" if sid in L.under else "")
     attrs = source or said or files or recall is not None
     out = [head if attrs else head + (" " if now else "") + row["text"]]
-    evs = json.loads(row["refs"]).get("event", [])
+    refs = json.loads(row["refs"])
+    evs = refs.get("event", [])
     shown, secs, name = [], [], None
+    lows = refs.get("form_record", []) if row["kind"] == "session" else []
+    if lows and (source or said or files):         # 归纳：来源是下层的陈述，按句柄列出，要看 E 再往下 relive 它们
+        out.append("归纳了这几条陈述：")
+        out += [f"- {L.stmt_handle(x, f'S{x}')} {conn.execute('SELECT text FROM form_record WHERE id=?', (x,)).fetchone()[0]}"
+                for x in lows]
+        if recall is not None:
+            out += _stmt_history(conn, L, row)
+        return "\n".join(out), {"form_record": [sid] + lows}
     if files and not any(f.get("to") for f in json.loads(row["structures"] or "{}").get("files", [])):
         out.append("这条陈述没有『文件』指向。")
     elif (source or said or files) and evs:

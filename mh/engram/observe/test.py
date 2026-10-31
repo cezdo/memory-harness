@@ -436,6 +436,47 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(waiting(self.conn), [])
         assert_live(self, self.conn)
 
+    def test_fast_do_observe(self):
+        """/do-observe 把尾巴现在读掉（observe 设计“叫醒”）：不够一窗的尾巴也封上；之后的轮次照常攒。"""
+        t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+        at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        before = [Turn("一", "回" * 3000, closed=True, started=at(0)), Turn("二", "回" * 300, closed=True, started=at(5))]
+        self._collect(before, started=at(0))
+        self.assertEqual(observe.fast_ready(self.conn, now=t0 + timedelta(minutes=8)), [])          # 不够一窗：等
+        self._collect(before + [Turn("/do-observe", "", closed=True, started=at(8)),
+                                Turn("三", "回" * 300, closed=True, started=at(9))], started=at(0))
+        now = t0 + timedelta(minutes=10)
+        self.assertEqual([[r["ordinal"] for r in w] for w in observe.fast_ready(self.conn, now=now)], [[0, 1]])   # 第 3 轮的尾巴等
+        self.assertEqual([[r["ordinal"] for r in w] for w, _ in observe.seal_at(
+            [{"started": at(m), "ordinal": m, "assistant": "回" * 3000, "commentary": "[]"} for m in (0, 1, 2)], [(t0 + timedelta(minutes=1), None)])],
+            [[0], [1]])                                                                               # 切点之后照常封窗，尾巴（2）等
+
+    def test_observe_now(self):
+        """“我”的 observe-now（10-30，用户：区分用户行为和模型行为）：写成主会话给 observe 的申请，不是开关；切点之前还有没结束的轮次
+        先等；读的 act 认领它；不当再观察；用户关了的（钩子刚记下、还没采进库的也算）拒绝；没采进库的另报。"""
+        from unittest.mock import patch
+        t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+        at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        one = Turn("一", "回" * 300, closed=True, started=at(0))
+        self._collect([one, Turn("二", "回" * 300, closed=False, started=at(5))], started=at(0))
+        log, op, now = Path(tempfile.mkdtemp()) / "switch.jsonl", st.main_operator(self.conn, "fake-main"), t0 + timedelta(minutes=10)
+        with patch.object(observe.switch._source, "LOG", log):
+            rid = observe.request_now(self.conn, "s1", "做完一件事", op)
+            self.assertEqual(observe.fast_ready(self.conn, now=now), [])                              # 申请时所在的第 2 轮还没进库：等它
+            self._collect([one, Turn("二", "回" * 300, closed=True, started=at(5))], started=at(0))
+            got = observe.fast_ready(self.conn, now=now, requests=True)
+            self.assertEqual([([r["ordinal"] for r in w], x) for w, x in got], [([0, 1], rid)])      # 不够一窗也读
+            self.assertEqual(observe.reobserve_requests(self.conn), [])                               # 不是再观察
+            self.assertEqual(observe.switch.states(self.conn), {})                                    # 不是开关
+            observe.run(self.conn, workers=1, models=self._fakes([], [], [f"### 事件1\n{U}说了一。\n来源：1:U1"]),
+                        log=io.StringIO(), now=now)
+            self.assertEqual([x for _, x in st.claimed(self.conn, rid)], ["ok"])
+            log.write_text(json.dumps({"session": "s1", "state": "off"}) + "\n")                    # 用户刚关，还没采进库
+            with self.assertRaises(PermissionError):
+                observe.request_now(self.conn, "s1", "再记一下", op)
+        with self.assertRaises(LookupError):
+            observe.request_now(self.conn, "没有这段", "x", op)
+
     def test_seal(self):
         rows = lambda sizes: [{"occurrence": i, "assistant": "x" * n, "commentary": "[]"} for i, n in enumerate(sizes)]
         ids = lambda got: ([[r["occurrence"] for r in w] for w in got[0]], [r["occurrence"] for r in got[1]])
@@ -872,6 +913,74 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(self._acts()[-1]["outcome"], "filtered")
         self.assertEqual(observe.to_read(self.conn, "s2"), [])
         self.assertEqual(len(observe.redo(self.conn)), 1)
+
+class ListenTest(unittest.TestCase):
+    """监听：心跳不记、原样记；WS 客户端的握手、分片、ping、close（本机起一个假的协议端）。"""
+
+    def test_record(self):
+        from . import listen
+        at = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+        self.assertIsNone(listen.record('{"post_type":"meta_event","meta_event_type":"heartbeat"}', now=at))
+        msg = {"post_type": "message", "message_type": "private", "raw_message": "你好"}
+        self.assertEqual(json.loads(listen.record(json.dumps(msg), now=at)),
+                         {"received": "2026-10-31T12:00:00.000+00:00", "event": msg})
+        self.assertEqual(json.loads(listen.record("not json", now=at))["raw"], "not json")
+
+    def test_keep_groups(self):
+        from . import listen
+        g = {100000001}
+        self.assertTrue(listen.keep({"post_type": "message", "group_id": 100000001}, g))
+        self.assertTrue(listen.keep({"post_type": "message_sent", "group_id": 100000001}, g))
+        self.assertTrue(listen.keep({"post_type": "meta_event", "meta_event_type": "lifecycle"}, g))
+        self.assertFalse(listen.keep({"post_type": "message", "message_type": "private", "user_id": 1}, g))
+        self.assertFalse(listen.keep({"post_type": "message", "group_id": 1}, g))
+        self.assertFalse(listen.keep({"post_type": "request", "request_type": "friend"}, g))
+        self.assertFalse(listen.keep({"status": "ok", "echo": "a"}, g))
+        self.assertTrue(listen.keep({"post_type": "message", "message_type": "private"}, None))
+        self.assertTrue(listen.keep({"post_type": "message", "message_type": "private", "user_id": 7}, g, {7}))
+        self.assertTrue(listen.keep({"post_type": "message_sent", "message_type": "private", "user_id": 9,
+                                     "target_id": 7}, g, {7}))
+        self.assertFalse(listen.keep({"post_type": "message", "message_type": "private", "user_id": 8}, g, {7}))
+
+    def test_ws(self):
+        import socket
+        import struct
+        import threading
+        from . import listen
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        got = {}
+
+        def frame(op, data, fin=True):
+            return struct.pack(">BB", (0x80 if fin else 0) | op, len(data)) + data
+
+        def peer():
+            c, _ = srv.accept()
+            req = b""
+            while b"\r\n\r\n" not in req:
+                req += c.recv(4096)
+            got["auth"] = b"Authorization: Bearer t0k" in req
+            c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            c.sendall(frame(0x9, b"hi") + frame(0x1, "第一".encode(), fin=False) + frame(0x0, "段".encode())
+                      + frame(0x8, struct.pack(">H", 1000)))
+            b0, b1 = c.recv(2)                          # 客户端回的 pong，带掩码
+            got["pong"] = (b0 & 0x0F, b1 & 0x80, b1 & 0x7F)
+            c.recv(4096)
+            c.close()
+
+        t = threading.Thread(target=peer)
+        t.start()
+        ws = listen.WS("127.0.0.1", srv.getsockname()[1], headers=["Authorization: Bearer t0k"], timeout=5)
+        self.assertEqual(ws.recv(), "第一段")
+        with self.assertRaises(listen.Closed):
+            ws.recv()
+        ws.close()
+        t.join(5)
+        srv.close()
+        self.assertTrue(got["auth"])
+        self.assertEqual(got["pong"], (0xA, 0x80, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

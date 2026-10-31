@@ -1,6 +1,6 @@
 """联想（UserPromptSubmit；送达时的展示名 souhatsu，2026-10-22）：用户说一句话，程序找出相关的记忆，只是线索。重构 E1a（2026-10-19：联想和拉取同时换库）起在新库上：
 候选是现在的陈述（L3:S1）和旧系统导入的 J，分组的主题名换成话题线的名字，足迹是 use（channel = push，mode = associate）。
-送达照旧暂停（DELIVER 为空，只记录），档位、门槛、词段的做法不变：纯程序的部分（词性名词段、回想说法、日常词、组合与名单变体、
+送达按 yorimichi（2026-10-30 重开：0 不送，1–3 截到这么多个话题），档位、门槛、词段的做法不变：纯程序的部分（词性名词段、回想说法、日常词、组合与名单变体、
 读宿主上下文）从旧的 mh/synapse/associate.py 搬到这里（旧库上的做法 E4 删了，来历见 git 历史里那个文件开头的说明）；E2（2026-10-22）
 读宿主上下文、认宿主注入的部分搬进 hosts/。宿主的联想钩子直接调 `python3 -m mh.synapse.push.associate`。
 """
@@ -14,7 +14,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from ...engram.store import HOME
+from ...engram.store import HOME, UNKNOWN
 from ...engram.store.instance import QUIET, USER_ALIASES, USER_NAME
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*")
@@ -24,10 +24,12 @@ K1, B = 1.5, 0.75
 
 
 PHRASE_DF, COMMON_MSGS, SHOW_MAX, HEAD = 20, 10, 5, 40
-DELIVER = set()                        # 送达的档（2026-10-15 定为 {"专名","强回想","组合"}；2026-10-16 清空：推送暂停，改走纯 get/search）
+DELIVER = {"专名", "强回想", "组合"}      # 送达的档（2026-10-15 定；10-16 清空、推送暂停；10-30 用户重开，条数按 yorimichi）
 SHADOW_TIERS = {"专名", "强回想", "组合"}  # 影子里仍按这套档位算「本来会推什么」，与 10-15/10-16 已送达的那批同一口径
 # 2026-10-09 起一直只记录、不推送（SHADOW）；10-15 起按档送达，送达和只记录的写在同一条足迹里，标档位，两边一直能对照；
-# 10-16 起 DELIVER 清空 → 一律只记录：识别、门槛、候选、展示的 K 照旧落足迹和推送流水，只是不再注入会话
+# 10-16 起 DELIVER 清空 → 一律只记录：识别、门槛、候选、展示的 K 照旧落足迹和推送流水，只是不再注入会话；10-30 重开，送不送、几条看 yorimichi
+BUDGET = {1: 300, 2: 400, 3: 500}   # 送达时片段一共多少字，按实际送出的条数，平均分给每条（用户 2026-10-30：少送就多给，省掉 relive）
+FIT = 0.1                            # 放不下整条陈述时，在上限 ±10% 里找句末截断
 CUE_DF = {"强": 60, "弱": 40}     # 有回想的说法时，名词段的稀有门槛放宽到多少（没有时是 PHRASE_DF）
 CUES = {"强": ("来着", "还记得", "记得吗", "我记得", "当时", "那时候", "那会儿", "上次", "上回", "以前", "印象里", "印象中",
                "没记错", "怎么来的", "为什么决定"),
@@ -456,14 +458,36 @@ def by_topic(idx, cand):
     return dict(list(out.items())[:SHOW_MAX])
 
 
-def topic_rows(idx, cand, words):
+def topic_rows(idx, cand, words, keep=None, budget=None):
     """给用户看的和给模型的共用的数据（2026-10-28：算法、内容一致，只有排版不同）：每个话题一行，按相关度排，
-    句柄（话题级，relive 读得到）、日期、话题名、命中几条、一条命中的开头。"""
+    句柄（话题级，relive 读得到）、日期、话题名、命中几条、一条命中的片段和它的陈述句柄。keep：只要前几个话题。
+    budget：{条数: 片段总字数}，给了就按实际的条数平均分（送达时，_fit）；没给是命中词附近的一小段（只记录的对照）。"""
     rows = []
-    for h, ks in by_topic(idx, cand).items():
+    for h, ks in list(by_topic(idx, cand).items())[:keep]:
         d = idx.k[ks[0]]
-        rows.append({"h": h, "date": (d["anchor"] or "")[5:10], "name": d["name"], "n": len(ks), "head": _around(d["text"], words)})
+        rows.append({"h": h, "s": d["h"], "date": (d["anchor"] or "")[5:10], "name": d["name"], "n": len(ks), "text": d["text"]})
+    per = budget.get(len(rows), max(budget.values())) // len(rows) if budget and rows else None
+    for r in rows:
+        text = r.pop("text")
+        r["head"] = _fit(text, words, per) if per else _around(text, words)
     return rows
+
+
+def _fit(text, words, size, before=12):
+    """送达的片段：放得下（size 的 1 + FIT 倍以内）就给整条；放不下从开头给，命中词在前面放不下时从它前面一点起，
+    在 size ± FIT 里找最后一个句末截断，找不到就截在 size。截断处写“……”。"""
+    if len(text) <= size * (1 + FIT):
+        return text
+    low = text.lower()
+    at = min((low.find(w.lower()) for w in words if w.lower() in low), default=-1)
+    a = max(0, at - before) if at >= 0 and at + before > size * (1 - FIT) else 0
+    chunk = text[a:]
+    if len(chunk) <= size * (1 + FIT):
+        return "……" + chunk
+    lo, hi = int(size * (1 - FIT)), int(size * (1 + FIT))
+    ends = [i for i in range(lo, min(hi, len(chunk))) if chunk[i] in "。！？；"]
+    cut = chunk[:ends[-1] + 1] if ends else chunk[:size].rstrip("，。；、：！？,.;:!? \n") + "……"
+    return ("……" if a else "") + cut
 
 
 def shown_keys(idx, cand):
@@ -474,14 +498,14 @@ def shown_keys(idx, cand):
 def clues(rows):
     """给模型的排版（线索式的联想，2026-10-10；2026-10-28 改成按话题）：和其他注入一样包在 <memory-harness> 里，
     第一行 [Souhatsu] 说明这是联想，不写用法提示。"""
-    body = [f"- {r['h']} · {r['date']} · {r['name']} · {r['n']}：{r['head']}" for r in rows]
+    body = [f"- {r['h']} · {r['date']} · {r['name']} · {r['n']}：（{r['s']}）{r['head']}" for r in rows]
     return "\n".join([f"<{TAG}>", "[Souhatsu]"] + body + [f"</{TAG}>"])
 
 
 def shown_text(rows, delivered, yorimichi=""):
     """给用户看的排版：同样的内容，一个话题两行，片段缩进在下一行。标题后面带上当前的 yorimichi（允许拐几次），一眼看出判得对不对。"""
     return "\n".join(["[Souhatsu]" + ("" if delivered else " 只记录，未推送") + (f" · {yorimichi}" if yorimichi else "")]
-                     + [f"{i}> {r['name']} · {r['h']} · {r['date']} · {r['n']}\n   {r['head']}" for i, r in enumerate(rows, 1)])
+                     + [f"{i}> {r['name']} · {r['h']} · {r['date']} · {r['n']}\n   （{r['s']}）{r['head']}" for i, r in enumerate(rows, 1)])
 
 
 def _seen(conn, session):
@@ -501,6 +525,32 @@ def _seen(conn, session):
     return out
 
 
+NUDGE_AT = 3      # 一段对话一直没判过 yorimichi 的，第几句用户的话时提醒“我”一次（2026-10-30 起步值：头一两句多是交代任务，看不出阶段）
+NOT_SAID = ("空", "命令", "宿主注入")      # 这几种跳过的不是用户自己说的话，不算句数
+
+
+def nudge(conn, session):
+    """该不该提醒“我”判一下 yorimichi（2026-10-30：上线两天零调用）：这段对话没判过、没提醒过，这是第 NUDGE_AT 句以后。"""
+    from . import yorimichi
+    if not session or "time" in yorimichi.state(session):
+        return False
+    said = 0
+    for (query,) in conn.execute("SELECT query FROM use_detail WHERE session=? AND channel='push' AND mode='associate'", (session,)):
+        rec = json.loads(query).get("associate", {})
+        if rec.get("nudge"):
+            return False
+        said += rec.get("skip") not in NOT_SAID
+    return said + 1 >= NUDGE_AT
+
+
+def nudge_note():
+    """提醒的那一行 → (给模型的，给用户看的)。"""
+    line = ("这段对话还没告诉记忆聊到了哪个阶段（yorimichi）：在一个点上深挖记 0，聊开了记 1–3；之后阶段变了再记，没变不用。"
+            f"联想的送达现在关着，只记下判断给{USER_NAME}对照。判过一次就不再提醒。") if not DELIVER else \
+           "这段对话还没告诉记忆聊到了哪个阶段（yorimichi）：在一个点上深挖记 0，聊开了记 1–3；之后阶段变了再记，没变不用。判过一次就不再提醒。"
+    return f"<{TAG}>{line}</{TAG}>", "memory-harness · 提醒“我”判一下 yorimichi"
+
+
 def _sent_words(conn, session):
     """会话里实际注入过的词，包含旧版每轮送出的 missing；影子候选不算。"""
     if not session:
@@ -515,6 +565,22 @@ def _sent_words(conn, session):
             if not rec.get("shadow", True):
                 words += rec.get("used", [])
         out.update(_norm(w) for w in words)
+    return out
+
+
+def _flagged(conn):
+    """哪个会话里说过“没印象”的词，以后都不再说（用户 2026-10-30：真是新词，以后记忆里就有了；是误判，也不该再推）。
+    认 use 的 query.associate.missing_sent；没有它的版本按 sent_words 认，再旧的每轮把 missing 全送了（同 _sent_words）。
+    全库一次约 10 毫秒（10-30：1349 条联想的足迹）。"""
+    out = set()
+    for (query,) in conn.execute("SELECT query FROM use_detail WHERE channel='push' AND mode='associate' AND session NOT IN ('', ?) "
+                                 "AND json_array_length(query, '$.associate.missing') > 0", (UNKNOWN,)):   # 没有会话的（调试）不算
+        rec = json.loads(query)["associate"]
+        said = rec.get("missing_sent")
+        if said is None:
+            sent = rec.get("sent_words")
+            said = rec["missing"] if sent is None else [w for w in rec["missing"] if _norm(w) in {_norm(x) for x in sent}]
+        out.update(_norm(w) for w in said if isinstance(w, str))
     return out
 
 
@@ -573,6 +639,9 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     rec["in_transcript"] = found
     if injected:
         return done("宿主注入", host=hosts.host_event(text, injected))
+    if switch.state(session) != "off" and nudge(conn, session):     # 一直没判过 yorimichi：提醒一次（push/yorimichi）；
+        rec["nudge"] = True                                        # 用不到分词，排在它前面（词性未就绪也照样提醒）
+        note, shown_line = nudge_note()
     toks = pos.tag([text])
     if toks is None:
         return done("词性未就绪")
@@ -581,8 +650,11 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     idx_k.update(idx.k)
     lost = missing(data, toks[0], text) if "stmts" in data else []
     sent = _sent_words(conn, session)
-    fresh = [w for w in lost if _norm(w) not in sent]
-    note, shown_line = recall_note(fresh) if fresh else (None, None)
+    told = _flagged(conn) if lost else set()
+    fresh = [w for w in lost if _norm(w) not in sent and _norm(w) not in told]
+    if fresh:
+        n, line = recall_note(fresh)
+        note, shown_line = "\n".join(x for x in (n, note) if x), "\n".join(x for x in (line, shown_line) if x)
     rec["missing"] = lost
     rec["missing_sent"] = fresh
     rec["sent_words"] = list(fresh)
@@ -613,7 +685,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     def pick(hit):
         allk = set().union(*hit.values())
         own = {k: sum(_norm(t) in _norm(idx.k[k]["text"]) for t in hit) for k in allk}
-        pool = sorted(allk - seen, key=lambda k: (-own[k], -score.get(k, 0), idx.k[k]["anchor"] or ""), reverse=False)
+        pool = sorted(allk - seen, key=lambda k: (-own[k], -score.get(k, 0), idx.k[k]["anchor"] or "", k))   # 最后按编号：集合的次序随哈希变，同分的不能跟着变（10-30）
         cand, there = [], []
         for k in pool:
             (there if grams and in_context(grams, idx.k[k]["text"]) else cand).append(k)
@@ -651,13 +723,13 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     rec.update(candidates=hs(cand[:20]), in_context=hs(there[:20]), seen=nseen, workspace=here, same_workspace=same(cand),
                n_candidates=len(cand), n_in_context=len(there), used=words)
     try:      # 往外一跳只记录，不显示不送达；出了错不影响这一轮
-        rec["hop"] = hop(data, sorted(set().union(*use.values()), key=lambda k: -score.get(k, 0)), score, seen | set(there))
+        rec["hop"] = hop(data, sorted(set().union(*use.values()), key=lambda k: (-score.get(k, 0), k)), score, seen | set(there))
     except Exception as e:
         rec["hop"] = {"error": repr(e)}
     if not cand:
         return done("都已出现过")
     keep = width if delivered else None                   # 送达时按 yorimichi 截；只记录的照旧列出来对照
-    rows = topic_rows(idx, cand, words)[:keep]
+    rows = topic_rows(idx, cand, words, keep, BUDGET if delivered else None)
     shown = shown_keys(idx, cand)[:keep]
     rest = len(cand) - sum(r["n"] for r in rows)          # 没列出来的：不在这几个话题里的候选
     out = clues(rows)
@@ -687,7 +759,8 @@ def hook(stdin=sys.stdin, stdout=sys.stdout):
                         d.get("transcript_path"), d.get("host") or "claude", d.get("host_kind"))
         if got:
             ctx, msg = got
-            out = {"systemMessage": msg}
+            # Claude Code 显示时在前面加“UserPromptSubmit says:”，去不掉；另起一行，标题不和它挤在一行（用户 10-30）
+            out = {"systemMessage": ("\n" if (d.get("host") or "claude") == "claude" else "") + msg}
             if ctx:
                 out["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}
             json.dump(out, stdout, ensure_ascii=False)

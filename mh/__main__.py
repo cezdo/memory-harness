@@ -38,7 +38,7 @@ class Parser(argparse.ArgumentParser):
         super().__init__(*a, **k)
 
 
-ENGRAM = ["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve", "correct", "feedback", "skeleton"]
+ENGRAM = ["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve", "correct", "feedback", "skeleton", "serve", "listen"]
 SYNAPSE = ["inject", "evoke", "relive", "boot", "standing", "roam", "backfill"]
 
 
@@ -63,7 +63,9 @@ def main():
                                        "reobserve --reread --session … --reason …：补读（当时判了不读、按现在的规则要读的，程序重算、粗读）；"
                                        "correct [--limit N]：按给 observe 的点名申请纠正那几条 E（C1b）；"
                                        "skeleton --workspace … --root … --file … --section … --placements …：按文件申请骨架（--dry-run 预览）；"
-                                       "feedback T<入口> --name …|--topic … --reason … --model …：主会话直写的反馈（会话入口）")
+                                       "feedback T<入口> --name …|--topic … --reason … --model …：主会话直写的反馈（会话入口）；"
+                                       "serve：远端调用的服务端，代跑只能在这台机器上跑的模型定义（实例配置 [invoke]）；"
+                                       "listen：监听 QQ 协议端，事件原样追加进数据目录（实例配置 [listen]）")
     eg.add_argument("action", choices=ENGRAM)
     eg.add_argument("--workspace", help="skeleton：骨架所属的工作区")
     eg.add_argument("--root", type=Path, help="skeleton：工作区根目录")
@@ -97,6 +99,9 @@ def main():
     rh.add_argument("--form", action="store_true", help="跑形成循环，不跑观察循环")
     rh.add_argument("--tidy", action="store_true", help="跑整理循环（维护手记推送的项目现状、检查……），memory-harness-tidy.service 跑它")
     rh.add_argument("--once", action="store_true", help="只跑一轮就退出")
+    rh.add_argument("--register", nargs="*", metavar="服务", help="常驻服务按这个平台（systemd / launchd）生成，看和装着的差在哪；"
+                                                                  "不点名是三个循环，远端调用的服务端要点名 memory-harness-invoke")
+    rh.add_argument("--apply", action="store_true", help="--register：写进去、登记开机自启（不重启正在跑的服务）")
     rh.add_argument("--engram-db", type=Path, default=None, help="新库路径（默认数据目录下的 engram.db）")
     sy = top.add_parser("synapse", help="读：inject、evoke、relive、boot、roam、backfill")
     sub = sy.add_subparsers(dest="cmd", required=True)
@@ -125,11 +130,25 @@ def main():
     for x in (gt, mp):
         x.add_argument("--page", type=int, default=None, help="第几页，从 1 起（一页 8 条）")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
-    qa = top.add_parser("quota", help="三家订阅的额度（codex / claude / ark），只读，不发模型请求")
+    top.add_parser("reply", help="回复：在实例配置 [reply] 的群里被叫到时回几句（常驻，memory-harness-reply 服务跑它）")
+    qa = top.add_parser("quota", help="三家订阅的额度（codex / claude / opencode-go），只读，不发模型请求")
     qa.add_argument("names", nargs="*", help="只看这几家")
     qa.add_argument("--json", action="store_true")
     qa.add_argument("--wait", action="store_true", help="只看一家：用完了就打印要等到的 unix 秒，没用完打印 0，读不到打印 -1")
     args = ap.parse_args(_grouped(sys.argv[1:]))
+    if args.cmd == "engram" and args.action == "serve":       # 常驻，不开库
+        from .engram import observe
+        from .engram.invoke import serve
+        serve.serve(serve.servable(observe.MODELS))
+        return
+    if args.cmd == "reply":                                   # 常驻，不开库
+        from . import reply
+        reply.serve()
+        return
+    if args.cmd == "engram" and args.action == "listen":      # 常驻，不开库
+        from .engram.observe import listen
+        listen.serve()
+        return
     if args.cmd == "engram":
         from .engram import store as estore
         from .engram import check as echeck, show
@@ -284,16 +303,26 @@ def main():
             print(json.dumps(qs, ensure_ascii=False, indent=1) if args.json else quota.text(qs))
     elif args.cmd == "rhythm":
         from . import rhythm
+        from .rhythm import register
+        if args.register is not None:
+            names = args.register or list(register.SERVICES)
+            if args.apply:
+                register.apply(names)
+            else:
+                print("\n".join(register.diff(n) or f"{register.target(n)}：和生成的一样" for n in names))
+            return
+        register.stamp()
+        log = sys.stderr                    # stamp 换过 stderr，循环的默认参数还是旧的，显式传
         if args.tidy:
-            got = rhythm.tidy_loop(args.engram_db, once=args.once)
+            got = rhythm.tidy_loop(args.engram_db, once=args.once, log=log)
             if args.once:
                 print(f"整理：{'、'.join(got or []) or '没有到周期的任务'}")
         elif args.form:
-            got = rhythm.form_loop(args.engram_db, once=args.once)
+            got = rhythm.form_loop(args.engram_db, once=args.once, log=log)
             if args.once and got:
                 print(f"形成 处理 {got[0]}，环境错误 {got[1]}")
         else:
-            got = rhythm.observe_loop(args.engram_db, once=args.once)
+            got = rhythm.observe_loop(args.engram_db, once=args.once, log=log)
             if args.once and got:
                 print(f"新轮次 {got[0]}，处理 {got[1]}，环境错误 {got[2]}")
 

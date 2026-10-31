@@ -2,8 +2,9 @@
 
 这里放精读、粗读这一步的 Operator 定义（哪个模型、经哪个宿主、叠哪些补丁、怎样隔离）和给模型的输入；调用本身在 mh/engram/invoke/。
 2026-10-17 起（tmp/observe-e4/）：
-- 精读 deepseek-ark-web-deep：常驻 dsh web（端口 3085），minimal 预设原样带 bash，只放行字数命令（白名单外判失败），high；
-- 粗读 deepseek-ark-web-rough：另起的 dsh web（端口 3086），bare 预设去掉全部工具，low（到 2026-10-19）。
+- 精读 deepseek-oc-web-deep：常驻 dsh web（端口 3085），minimal 预设原样带 bash，只放行字数命令（白名单外判失败），high；
+  2026-10-31 从 deepseek-ark-web-deep 改名：ark 订阅用完，provider 换成 OpenCode Go（模型仍是 DeepSeek V4.1 Flash）。
+- 粗读 deepseek-ark-web-rough：另起的 dsh web（端口 3086），bare 预设去掉全部工具，low（到 2026-10-19，已退役）。
 2026-10-19 起（tmp/window/ 实验三到六，用户：粗读是常态、精读是精品，各用所长）：
 - 粗读 luna-codex-rough：codex exec 上的 Luna，low，用了工具就作废；提示词 rough-read-v0.2（10-26 前 v0.1）。
   一次最多读 ROUGH_CAP 字的回复（写窗口：一次读得越多写得越粗），超出的组按轮切开分几次读（切开的各段都带这组的计划）；
@@ -19,6 +20,7 @@ from pathlib import Path
 import re
 
 from ..invoke import Codex, DshWeb
+from ..invoke.serve import remote
 from ..store import HOME, absent, blocks
 from . import guard, label
 
@@ -26,14 +28,16 @@ PATCHES = Path(__file__).parent / "patches"
 MINIMAL_PATCH = PATCHES / "dsh-minimal.patch.yml"
 WEB_PATCH = PATCHES / "dsh-web.patch.yml"
 ROUGH_PATCH = PATCHES / "dsh-rough.patch.yml"
-MODEL = "deepseek-v4-1-flash-260910"          # 模型名写在 dsh-web.patch.yml，这里是给人看的
+MODEL = "deepseek-v4.1-flash"                 # 模型名写在 dsh-web.patch.yml（2026-10-31 起走 OpenCode Go），这里是给人看的
 
 MODELS = {
-    "deepseek-ark-web-deep": lambda: DshWeb(MODEL, "dsh web 常驻（测试实例，ark，minimal 预设，high，bash 只放行 mh-count）",
-                                            patches=(MINIMAL_PATCH, WEB_PATCH), allow=guard.allow, allow_tag="mh-count"),
-    "deepseek-ark-web-rough": lambda: DshWeb(MODEL, "dsh web 常驻（测试实例，ark，bare 预设无工具，low）",
-                                             port=3086, box=HOME / "dsh-web-rough", preset="bare",
-                                             patches=(MINIMAL_PATCH, WEB_PATCH, ROUGH_PATCH)),
+    # DshWeb 只能在 Linux 上跑；实例配置 [invoke.remote] 给了地址的，转发给那台机器上的 mh engram serve（X2）
+    "deepseek-oc-web-deep": lambda: remote("deepseek-oc-web-deep", DshWeb(
+        MODEL, "dsh web 常驻（测试实例，opencode-go，minimal 预设，high，bash 只放行 mh-count）",
+        patches=(MINIMAL_PATCH, WEB_PATCH), allow=guard.allow, allow_tag="mh-count")),
+    "deepseek-ark-web-rough": lambda: remote("deepseek-ark-web-rough", DshWeb(
+        MODEL, "dsh web 常驻（测试实例，opencode-go，bare 预设无工具，low）", port=3086, box=HOME / "dsh-web-rough", preset="bare",
+        patches=(MINIMAL_PATCH, WEB_PATCH, ROUGH_PATCH))),
     "luna-codex-rough": lambda: Codex("gpt-6-luna", "low", isolation="codex-home-v1-low", no_tools=True),
 }
 # 粗读的写窗口（2026-10-19，tmp/window/：Luna 4000 字在细和不丢之间，8000 起丢掉判断；数字没验证过，按使用调）

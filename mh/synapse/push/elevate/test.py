@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from . import HERE, WINDOW, Kernel, handle, install, request
+from . import HERE, WINDOW, Kernel, detail, handle, install, request, view
 
 
 class Base(unittest.TestCase):
@@ -96,6 +96,30 @@ class Flow(Base):
         self.src.write_text("手改\n")
         self.ev("prompt", prompt="/mhcore 改称呼")
         self.assertEqual([r["kind"] for r in self.log()], ["baseline", "unlogged", "grant"])
+
+    def test_view_like_dmesg(self):
+        """读日志：一条一行、按级别筛、连着的同类折成一行（行数不加），按编号展开原件。"""
+        self.ev("post", tool_name="Read")
+        self.ev("prompt", prompt="/mhcore 接下来优先把称呼改成示例用户")
+        self.src.write_text("# core\n\n- 你：称呼示例用户。\n")
+        self.ev("post", tool_name="Edit")
+        self.ev("stop")
+        for i in range(3):                                                # 窗口外连着改了三次，codex 的同一个会话发现
+            self.src.write_text(f"手改 {i}\n")
+            self.ev("post", "codex", "s9", tool_name="shell")
+        lines = view(self.k.log, "info")
+        self.assertEqual(len(lines), 5)
+        self.assertRegex(lines[0], r"^#1 \d\d-\d\d \d\d:\d\d info 程序 baseline claude:s1 快照 ")
+        self.assertRegex(lines[1], r"^#2 .* notice 用户 grant claude:s1 接下来优先把称呼改成示例用户$")
+        self.assertRegex(lines[2], r"^#3 .* notice 我 edit claude:s1 \+1-1 Edit$")
+        self.assertRegex(lines[4], r"^#5 .* warn 程序 unlogged codex:s9 shell 之后发现 ×3（#5–#7）$")
+        self.assertEqual(view(self.k.log, "warn"), lines[4:])
+        self.assertEqual(view(self.k.log, "notice"), lines[1:3] + lines[4:])
+        self.assertIn("+手改 2", detail(self.k.log, 7))
+        self.assertIn('"found_by"', detail(self.k.log, 7))
+        with self.assertRaises(ValueError):
+            detail(self.k.log, 99)
+        self.assertEqual(view(Path(self.tmp.name) / "没有.jsonl"), [])
 
     def test_window_closes_on_next_prompt_and_expires(self):
         self.ev("prompt", prompt="/mhcore 改称呼")

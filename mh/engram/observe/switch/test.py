@@ -36,10 +36,11 @@ class SwitchTest(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.conn = st.connect(self.dir / "engram.db")
-        self.saved, source.LOG = source.LOG, self.dir / "none.jsonl"      # 不读真实数据目录里的开关记录
+        self.saved = source.LOG, source.SOUHATSU, source.YORIMICHI       # 不读真实数据目录里的开关记录
+        source.LOG, source.SOUHATSU, source.YORIMICHI = (self.dir / f"none-{n}.jsonl" for n in range(3))
 
     def tearDown(self):
-        source.LOG = self.saved
+        source.LOG, source.SOUHATSU, source.YORIMICHI = self.saved
 
     def _collect(self, **sessions):
         src = {}
@@ -86,10 +87,23 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual([(t.user, t.assistant) for t in turns],
                          [("你好", "你好呀"), ("/no-observe", ""), ("/do-observe", "")])   # 进行中的一轮先收完
 
-    def _hook(self, host, prompt, log):
-        p = subprocess.run([sys.executable, "-I", "-S", str(HERE / "hook.py"), host, str(log)], capture_output=True, text=True,
-                           input=json.dumps({"session_id": "s9", "transcript_path": str(self.dir / "s9.jsonl"), "prompt": prompt}))
+    def _hook(self, host, prompt, log, *extra):
+        p = subprocess.run([sys.executable, "-I", "-S", str(HERE / "hook.py"), host, *extra, str(log)], capture_output=True, text=True,
+                           input=json.dumps({"session_id": "s9", "transcript_path": str(self.dir / "s9.jsonl"), "prompt": prompt}),
+                           env={"MH_HOME": str(self.dir / "home")})
         return p.returncode, p.stdout, p.stderr
+
+    def test_wake(self):
+        """叫醒（observe 设计“叫醒”）：Stop 碰一下数据目录的 observe.wake，什么也不输出；/do-observe 同样叫醒，/no-observe 不叫。"""
+        wake = self.dir / "home/observe.wake"
+        self.assertEqual(self._hook("claude", "", self.dir / "x", "stop")[:2], (0, ""))
+        self.assertTrue(wake.exists())
+        self.assertFalse((self.dir / "x").exists())                         # stop 不记开关
+        log = self.dir / "w/switch.jsonl"
+        self._hook("codex", "$no-observe", log)
+        self.assertFalse((self.dir / "w/observe.wake").exists())
+        self._hook("codex", "$do-observe", log)
+        self.assertTrue((self.dir / "w/observe.wake").exists())
 
     def test_hook(self):
         log = self.dir / "switch.jsonl"
@@ -129,20 +143,42 @@ class SwitchTest(unittest.TestCase):
         op, _ = operator(self.conn)
         self.assertFalse([rows for rows, _ in ready(self.conn, op) if rows[0]["source"] == "switch"])   # 开关那一轮不预览
 
+    def test_synapse_logs(self):
+        """联想开关、yorimichi 的记录也收成 turn：各成一个会话，谁做的记在 origin；不影响 observe 开关的判定，也不预览。"""
+        source.SOUHATSU, source.YORIMICHI = self.dir / "souhatsu-switch.jsonl", self.dir / "yorimichi.jsonl"
+        source.SOUHATSU.write_text(json.dumps({"time": "2027-01-01T00:00:00+00:00", "source": "claude", "session": "s",
+                                               "state": "off", "prompt": "/no-souhatsu"}) + "\n")
+        source.YORIMICHI.write_text("\n".join(json.dumps(e) for e in [
+            {"time": "2027-01-01T00:00:01+00:00", "source": "claude", "session": "s", "width": 2, "why": "聊开了"},
+            {"time": "2027-01-01T00:00:02+00:00", "source": "", "session": "t", "width": 0, "why": ""},
+            {"time": "2027-01-01T00:00:03+00:00", "source": "", "session": "t", "width": "2"}]) + "\n")   # 不是整数的不收
+        got = collect.run(self.conn, sources=("switch",), log=io.StringIO())
+        self.assertEqual(got["switch"]["turns"], 3)
+        rows = self.conn.execute("SELECT d.session, d.origin, d.host_kind, x.user, s.parent, s.title FROM turn_detail d "
+                                 "JOIN turn_text x ON x.id=d.text JOIN session_detail s ON s.source=d.source AND s.session=d.session "
+                                 "WHERE d.source='switch' ORDER BY d.session").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [(":t#yorimichi", "main", st.NA, "yorimichi 0", "t", "yorimichi"),
+                                                    ("claude:s#souhatsu", "human", "command", "/no-souhatsu", "s", "联想开关"),
+                                                    ("claude:s#yorimichi", "main", st.NA, "yorimichi 2：聊开了", "s", "yorimichi")])
+        self.assertEqual(states(self.conn), {})
+        op, _ = operator(self.conn)
+        self.assertFalse([rows for rows, _ in ready(self.conn, op) if rows[0]["source"] == "switch"])
+
     def test_install(self):
         home = self.dir / "home"
         (home / ".claude").mkdir(parents=True)
         (home / ".claude/settings.json").write_text(json.dumps({"model": "x", "hooks": {"UserPromptSubmit": [
             {"hooks": [{"type": "command", "command": "synapse"}]}]}}))
         done = install(home)
-        self.assertEqual(len(done), 6)
+        self.assertEqual(len(done), 8)
         self.assertTrue((home / ".claude/commands/no-observe.md").read_text().startswith("---"))
         self.assertTrue((home / ".codex/skills/do-observe/SKILL.md").exists())
         cfg = json.loads((home / ".claude/settings.json").read_text())
         self.assertEqual(cfg["model"], "x")                                  # 别的设置原样留着
         self.assertEqual([g["hooks"][0]["command"].split()[-1] for g in cfg["hooks"]["UserPromptSubmit"]], ["synapse", "claude"])
         self.assertEqual(len(list((home / ".claude").glob("settings.json.bak-observe-switch-*"))), 1)
-        self.assertTrue(json.loads((home / ".codex/hooks.json").read_text())["hooks"]["UserPromptSubmit"])
+        self.assertEqual(cfg["hooks"]["Stop"][0]["hooks"][0]["command"].split()[-2:], ["claude", "stop"])   # 叫醒
+        self.assertEqual(set(json.loads((home / ".codex/hooks.json").read_text())["hooks"]), {"UserPromptSubmit", "Stop"})
         self.assertEqual(install(home), [])                                # 再装一次什么都不做
         (home / ".claude/commands/do-observe.md").unlink()
         (home / ".claude/commands/do-observe.md").write_text("别人的")

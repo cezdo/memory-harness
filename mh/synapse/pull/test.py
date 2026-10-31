@@ -410,7 +410,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         finally:
             pos.tag = real
         self.assertTrue(got[1].startswith("[Souhatsu] 只记录，未推送 · Yorimichi 0\n1> "))      # 只记录：给用户看的是带序号的话题，没有附加上下文
-        self.assertNotIn("L1:T1:S1", got[1])
+        self.assertIn("（L1:T1:S1）", got[1])                                  # 片段带陈述句柄（10-30）
         self.assertIsNone(got[0])
         u = self._uses()[-1]
         self.assertEqual((u["channel"], u["mode"], u["purpose"]), ("push", "associate", "prefetch"))
@@ -418,6 +418,16 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertTrue(q["shadow"])
         self.assertIn("L1:T1:S1", q["candidates"])
         self.assertIn("X 升级", u["shown"])                              # 分组的主题名是话题线的名字
+
+    def test_associate_skips_host_memory_agent(self):
+        """codex 的自动记忆任务是宿主起的，不当用户的话：不联想、不算查不到的词，只记宿主事件（10-26 埋点盘点）。"""
+        from ..push import associate
+        got = associate.associate(self.conn, "## Memory Writing Agent: Phase 2 (Consolidation)\n\nYou are a Memory Writing Agent.",
+                                  session="t", cwd="/home/u/.codex/memories", host="codex")
+        self.assertIsNone(got)
+        q = json.loads(self._uses()[-1]["query"])["associate"]
+        self.assertEqual((q["skip"], q["host"]["kind"]), ("宿主注入", "宿主自动记忆任务"))
+        self.assertNotIn("missing", q)
 
     def test_associate_follows_yorimichi(self):
         """yorimichi：0 不送达；1–3 送达，按条数截。"""
@@ -451,6 +461,25 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("挂线待审视：晚到的 E", head)
         self.assertIn("feedback", head)
 
+    def test_status_kernel(self):
+        """内核在这个仓库里时，近况列近几天的内核日志 warn；旧的、不到 warn 的不列。"""
+        import json
+        from datetime import datetime, timezone
+        from unittest import mock
+        from ..push import status
+        repo, log = self.dir / "repo-k", self.dir / "kernel-log.jsonl"
+        (repo / "design").mkdir(parents=True)
+        log.write_text("\n".join(json.dumps(r) for r in [
+            {"time": "2026-10-20T00:00:00+00:00", "kind": "unlogged", "diff": "+a\n", "found_by": {"host": "claude", "session": "old"}},
+            {"time": "2026-10-29T00:00:00+00:00", "kind": "grant", "host": "claude", "session": "s", "prompt": "改称呼"},
+            {"time": "2026-10-29T01:00:00+00:00", "kind": "unlogged", "diff": "+b\n", "found_by": {"host": "codex", "session": "s9", "tool": "shell"}}]) + "\n")
+        now = datetime(2026, 10, 30, tzinfo=timezone.utc)
+        with mock.patch("mh.synapse.push.CORE", repo / "design" / "core.md"):
+            got = status._kernel(repo, log, now)
+            self.assertEqual(len(got), 1)
+            self.assertRegex(got[0], r"^- #3 .* warn 程序 unlogged codex:s9 \+1-0 shell 之后发现$")
+            self.assertEqual(status._kernel(self.dir / "别的仓库", log, now), [])
+
     def test_status(self):
         """项目现状：手写的部分（仓库、检查命令、目录说明）加上从 git 读的（活跃、不进 git、最近的提交、没提交的改动）和检查的结果；
         不推操作文档；手记推送只读编好的，按宿主去掉它自己给了的节，没有就不给这一节。"""
@@ -477,6 +506,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             self.assertIn("1 个文件（可能是别的会话做到一半）：design/new.md", text)
             self.assertNotIn("数据层", text)                                   # 操作文档不推
             self.assertNotIn("### 检查", text)                                 # 检查还没跑过
+            self.assertNotIn("### 内核日志", text)                             # 内核不在这个仓库里：不看内核日志
             self.assertIsNone(status.compile("没写的工作区"))
             self.assertTrue(status.run_check("w", home=self.dir / "status"))
             self.assertTrue(status.write("w", home=self.dir / "status"))
@@ -499,8 +529,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("### 检查", cc)
         self.assertEqual(status.read("没编过的", home=self.dir / "status"), "")
         self.assertEqual(status._errors([]), "；近 6 小时没有出错")
-        self.assertEqual(status._errors(["2026-10-20T09:00:00+09:00 host python3[1]: [预览] x 第 1–2 轮：env_error：坏了",
-                                         "2026-10-20T09:05:00+09:00 host python3[1]: 本轮出错：OperationalError('locked')"]),
+        self.assertEqual(status._errors([("2026-10-20T09:00:00+09:00", "[预览] x 第 1–2 轮：env_error：坏了"),
+                                         ("2026-10-20T09:05:00+09:00", "本轮出错：OperationalError('locked')")]),
                          "；近 6 小时出错 2 行，最后一次 09:05：本轮出错：OperationalError('locked')")
 
     def test_missing_words(self):
@@ -529,7 +559,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_mcp(self):
         names = [t["name"] for t in mcp.handle(self.conn, {"id": 1, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["evoke", "relive", "roam", "feedback", "yorimichi"])
+        self.assertEqual(names, ["evoke", "relive", "roam", "feedback", "yorimichi", "observe-now"])
         r = mcp.handle(self.conn, {"id": 2, "method": "tools/call",
                                    "params": {"name": "relive", "arguments": {"handles": ["s-1"], "session": "t"}}})["result"]
         self.assertFalse(r["isError"])

@@ -1,7 +1,6 @@
 """分词、词性与依存句法（LTP small），给联想挑名词段用（依存的 ATT 分开“会话记录”这样的定中和“判断内容”这样的动宾）。
 
-LTP 加载要八秒多、常驻约 680MB，联想每轮起一个进程不行，常驻又占内存，所以按需常驻：
-第一次用时由客户端在后台拉起（用 LTP 的 venv 跑本文件），空闲 IDLE 秒后自己退出；手记钩子 顺手预热。
+第一次用时由客户端在后台拉起（用 LTP 的 venv 跑本文件），之后保持常驻，不因空闲退出；手记钩子顺手预热。
 还没加载好的那一轮，tag() 返回 None，联想这一轮不做（不退回旧的不分词做法）。
 
 本文件两用：mh 里 import 它当客户端（只用标准库）；用 LTP 的 venv 直接运行它就是服务端（`pos.py serve`）。
@@ -20,7 +19,6 @@ VENV = os.environ.get("MH_LTP_PYTHON", "/usr/local/mh-tools/ltp/venv/bin/python"
 MODEL = os.environ.get("MH_LTP_MODEL", "/usr/local/mh-tools/ltp/model")
 HOME = Path(os.environ.get("MH_HOME", Path.home() / ".local/share/memory-harness"))   # 同 collect.store.HOME（服务端不 import mh）
 SOCK, LOCK, LOG = HOME / "pos.sock", HOME / "pos.lock", HOME / "pos.log"
-IDLE = 3600          # 空闲多久退出（秒）
 THREADS = 2          # torch 线程数：单句 20ms 左右，不跟观察、形成抢 CPU
 
 
@@ -93,13 +91,9 @@ def serve():
     srv.bind(str(SOCK))
     os.chmod(SOCK, 0o600)
     srv.listen(8)
-    srv.settimeout(IDLE)
     try:
         while True:
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                break
+            conn, _ = srv.accept()
             with conn:
                 conn.settimeout(10)
                 try:
@@ -122,7 +116,7 @@ def serve():
     finally:
         srv.close()
         SOCK.unlink(missing_ok=True)
-        print(f"{time.strftime('%F %T')} 空闲 {IDLE}s，退出", flush=True)
+        print(f"{time.strftime('%F %T')} 退出", flush=True)
 
 
 if __name__ == "__main__" and sys.argv[1:] == ["serve"]:

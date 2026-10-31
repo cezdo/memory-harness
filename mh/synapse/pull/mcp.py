@@ -7,6 +7,7 @@
 - 库：新库 engram.db，经 mh/synapse/pull 取（2026-10-19 换库，E1a；旧库 E4 归档）。环境变量 MH_DB 可以换（测试用拷贝，不在正式库上留足迹）。
 - 进程常驻于一段会话：pull 的读视图按库的变化缓存，get、map 不用每次重建。
 - 出错不让会话断：返回 isError 和错误文字，进程继续。
+- observe-now（2026-10-30）：“我”让观察现在把尾巴读掉；只读、不开观察，用户关了的对话拒绝（权限和用户的开关分开）；实现在 engram/observe 的 request_now。
 - yorimichi（2026-10-28）：“我”在对话阶段变了时记一次允许联想拐几次（0 深挖，1–3 发散），联想的钩子读它；实现在 push/yorimichi。
 - feedback（2026-10-19）：和拉取工具并列的反馈入口，写进新库 engram.db（Engram 的 form.feedback，Synapse 只是转交）；
   主会话的模型由调用方填。现在只接话题（会话入口，T5）。
@@ -75,6 +76,13 @@ TOOLS = [
          "width": {"type": "integer", "description": "0 深挖不给联想，1–3 给几条"},
          "why": {"type": "string", "description": "一句话：为什么这么判"}},
          "required": ["width"]}},
+    {"name": "observe-now",
+     "description": f"把这段对话到现在还没读的尾巴现在交给观察读掉，不等攒够、不等告一段落。一件事做完、值得马上记下时调。"
+                    f"只读尾巴、不开观察：{USER_NAME}关了观察的对话会被拒绝，开关只有{USER_NAME}能动。",
+     "inputSchema": {"type": "object", "properties": {
+         "reason": {"type": "string", "description": "一句话：为什么现在要记"},
+         "model": {"type": "string", "description": "你的模型名"}},
+         "required": ["reason"]}},
 ]
 
 
@@ -121,6 +129,8 @@ def call(conn, name, args):
         from ..push import yorimichi
         return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "",
                            host="claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
+    if name == "observe-now":   # “我”的现在读掉（2026-10-30）：只读尾巴、不开观察，写成主会话给 observe 的申请
+        return _observe_now(kw["session"], args)
     if name == "feedback":
         scope = args.get("scope", "record")
         if scope == "presentation":
@@ -145,6 +155,24 @@ def call(conn, name, args):
         finally:
             econn.close()
     raise ValueError(f"没有工具 {name}")
+
+
+def _observe_now(session, args):
+    from ...engram import observe, store as estore
+    from ...engram.observe.switch.hook import wake
+    if not session:
+        raise ValueError("拿不到会话号，记不下")
+    econn = estore.connect(estore.DEFAULT_DB)
+    try:
+        rid = observe.request_now(econn, session, args.get("reason") or "", estore.main_operator(econn, args.get("model") or estore.UNKNOWN))
+    except LookupError:
+        wake()
+        return "这段对话还没采集进库（刚开不久），已经叫醒观察循环；过一会儿再调。"
+    except PermissionError as e:
+        return f"{e}。没有写申请。"
+    finally:
+        econn.close()
+    return f"记下了：申请 {rid}。这一轮结束时观察循环被叫醒，把到这一轮为止还没读的轮次读掉，读的那次认领这张申请。"
 
 
 def _call_new(conn, name, args, kw):

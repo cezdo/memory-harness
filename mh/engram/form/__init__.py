@@ -3,6 +3,9 @@
 三步，每步一次模型调用（B2，2026-10-18 定下；实验 tmp/logical-session/、tmp/form-attach/）：
 - ① pack（pack.py）：一个会话（一个单位）的全部 E，加上每轮写进的文件 → 会话记录（名字、主题、陈述）。陈述存 form_record
   （kind = session，出生于 pack 的 act），来源是 E。先按物理会话，不切逻辑会话。
+- ①′ 归纳（induce.py，G6 2026-10-29）：pack 写出的陈述 → 陈述之上的陈述（现在只归纳排查），也存 form_record
+  （出生于 induce 的 act），来源是陈述（refs.form_record）；被归纳的陈述降半级，不在会话记录的主列里，句柄不变、可以直达。
+  只给现行 pack 提示词写出的单位做（旧的不全量补）；失败不挡起名、挂线。
 - ② label（label.py）：会话记录 → 会话入口（名字、停在、模型写的索引词），存 session_entry。程序补的词、别名是缓存，读时重算。
 - ③ attach（attach.py）：用 Synapse 的检索（mh/synapse/pull/retrieve.py）在已有的会话入口和话题线里挑候选，有骨架的工作区再给骨架
   （skeleton.py）和写进的文件算出的落点；模型选节点和线（或新起一条），存 attachment（新线存 topic_line）。
@@ -40,14 +43,15 @@ from ..store import NA, UNKNOWN, absent, cost, dumps, occurrence, operator as re
 from ..observe.label import USER_NAME
 from ...synapse import track
 from ...synapse.pull import retrieve
-from . import attach, glossary, label, pack, restate as _restate, skeleton
+from . import attach, glossary, induce, label, pack, restate as _restate, skeleton
 
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数
-CURRENT = {"pack": ("sol-low", "pack-v0.5"),   # v0.3：结构标记写『引用：』『文件：』（2026-10-22，用户看过样本）；
+CURRENT = {"pack": ("sol-low", "pack-v0.7"),   # v0.7：排查里被推翻的猜测也落在陈述上，下一步归纳（G6，2026-10-29）   # v0.3：结构标记写『引用：』『文件：』（2026-10-22，用户看过样本）；
                                                # v0.4：一条一事、来源一页以内、两页要同一段、不写范围，程序检查不合规的重写一次（2026-10-27）
                                                # v0.5：上限不是为了少记，装不下就多写一条，不因此略去（v0.4 离线重跑略去的 E 从 51 涨到 594）；
                                                # 检查 v2 加覆盖：用户的话不略去，略去超过一成的重写
+           "induce": ("sol-low", "induce-v0.1"),               # 归纳：只归纳排查，一句话只说查什么、落在哪（G6，2026-10-29）
            "label": ("sol-low", "label-v0.2"),
            "attach": ("sol-low", "attach-v0.3"),               # 有骨架的工作区（v0.3：判据是以后能不能找到，目标只是线索，2026-10-24 L44）
            "attach_lines": ("sol-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
@@ -70,6 +74,9 @@ def window_params(step):
         return {"idle": IDLE, "max_chars": MAX_CHARS, "written": "observe.written", "redact": "store.SECRET",
                 "check": ["pack.check-v2", pack.LIMIT, pack.HARD, pack.DROP_SHARE, "observe.groups"], "rewrite": REWRITES,
                 "languages": ["observe.languages", observe.label.RECORD_LANGUAGE, "skeleton-v1", observe.label.SKELETON_MIN, observe.label.SKELETON_LEAD]}
+    if step == "induce":
+        return {"kind": "排查", "input": "pack 的陈述（现在的）+ 轮次", "check": ["induce.check-v1", induce.LIMIT, induce.HARD],
+                "measure": "induce.measure-v1", "redact": "store.SECRET"}
     if step == "restate":
         return {"changes": "observe.fate", "format": "pack-v0.3 的陈述格式"}
     if step == "label":
@@ -118,7 +125,7 @@ def redact(text):
 # ---- 形成史（只读 form 自己的 act）----
 
 ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, a.output FROM act_detail a
-          JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','label','attach') ORDER BY o.id"""
+          JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','induce','label','attach') ORDER BY o.id"""
 
 
 # 修订提示（observe 写来的：E 被取代、不成立、撤下、恢复）认领以后怎么做（2026-10-21：两个方案都留着做成选项，先用前者）：
@@ -183,14 +190,16 @@ def redo_requests(conn):
 
 def history(conn):
     """ok        {(step, 单位): act}：成功的那次（同一单位同一步以最后一次成功为准）；
-    fails     {(step, 单位, Operator): {timeout | content_error: 次数}}，环境错误不算；
+    fails     {(step, 单位, Operator): {timeout | content_error: 次数}}，环境错误不算；只数最近一次成功之后的（旧的成功
+              不代表这次重做会成功，成功之前的失败也不该挡住之后的重做；G9，2026-10-30）；
     last      {(step, 单位): 最近一次 act}，下一次以它为前身；
     packed    已经整理进会话记录的 E。单位 = (来源, 会话, 第一条 E)。
     empty     最后一次成功的 pack 整理出“无”的单位（没有陈述，不写会话入口）；
     carried   {单位: label 的 act}：这次 label 沿用了原来入口的挂线，不用再 attach。
+    induced   {pack 的 act: induce 的 act}：对这次 pack 的陈述最后一次成功的归纳（pack 重做了，旧的归纳跟着不算）。
     申请重做（redo_requests）：一段会话里早于最新一张申请的整理、起名、挂线都不再算数，这段会话从 pack 起重做。"""
     ok, fails, last, packed = {}, collections.defaultdict(collections.Counter), {}, set()
-    empty, carried = set(), {}
+    empty, carried, induced = set(), {}, {}
     cut = {}                                 # {会话: {步骤: 最新一张要重做这一步的申请编号}}（按申请的级别，REDO_STEPS）
     for k, rs in redo_requests(conn).items():
         cut[k] = {x: 0 for x in ("pack", "label", "attach")}
@@ -207,14 +216,17 @@ def history(conn):
             continue                         # 申请之前的：被重做掉
         if result == "ok":
             ok[(step, unit)] = oid
+            fails.pop((step, unit, op), None)
             if step == "pack":
                 packed.update(json.loads(inputs).get("event", []))
                 (empty.add if (output or "").strip() == "无" else empty.discard)(unit)
+            if step == "induce":
+                induced[w.get("pack")] = oid
             if step == "label" and json.loads(meta or "{}").get("carry") is not None and oid >= cut.get(unit[:2], {}).get("attach", 0):
                 carried[unit] = oid          # 沿用的挂线，要晚于最近一张挂线级的申请才算数
         elif result in ("timeout", "content_error"):
             fails[(step, unit, op)][result] += 1
-    return types.SimpleNamespace(ok=ok, fails=fails, last=last, packed=packed, empty=empty, carried=carried)
+    return types.SimpleNamespace(ok=ok, fails=fails, last=last, packed=packed, empty=empty, carried=carried, induced=induced)
 
 
 def _complete(h, unit):
@@ -358,7 +370,7 @@ def replacements(conn):
 
 def statement_seq(conn, swap=None):
     """陈述在会话里的序号（Synapse v0.11 起的句柄 S…，2026-10-22 从 Synapse 移到这里，cognize 的引用也要用）：同一段会话的 pack
-    写出的陈述按写出的先后编（pack 的 act、它里面的顺序），只增不减；续上、重新整理都是新的 pack，接着往后编。会话按窗口里的 unit
+    写出的陈述按写出的先后编（pack 的 act、它里面的顺序；归纳写出的陈述同样接着编，2026-10-29），只增不减；续上、重新整理都是新的 pack，接着往后编。会话按窗口里的 unit
     （_act 每次都写 [来源, 会话, …]）认，没有 unit 再看 session 是不是 [来源, 会话]；旧系统导入的 pack（没有 unit，session 是编号）不编。
     修订提示改写的陈述沿用原来那条的序号（句柄不变、内容换新）。返回 (seq {陈述: 序号}, at {(会话, 序号): 陈述}, sess {陈述: 会话})，
     at 里是现在的那条。"""
@@ -367,7 +379,7 @@ def statement_seq(conn, swap=None):
             "SELECT f.id, coalesce(json_extract(a.window, '$.unit[0]'), json_extract(a.window, '$.session[0]')), "
             "coalesce(json_extract(a.window, '$.unit[1]'), json_extract(a.window, '$.session[1]')) "
             "FROM form_record f JOIN act_detail a ON a.occurrence=f.born "
-            "WHERE f.kind='session' AND a.step='pack' "
+            "WHERE f.kind='session' AND a.step IN ('pack','induce') "
             "AND (json_type(a.window, '$.unit')='array' OR json_type(a.window, '$.session')='array') ORDER BY f.born, f.idx"):
         k = (src, ses)
         nxt[k] += 1
@@ -465,7 +477,11 @@ def entries(conn, h=None):
     for key, f in latest.items():
         packs = [h.ok[("pack", u)] for u in sorted(u for (step, u) in h.ok if step == "pack" and u[:2] == key)
                  if u not in h.empty] or [f["record"]]
-        items = [it for pa in packs for it in record(conn, pa, swap)[2]]
+        items, under = [], {}
+        for pa in packs:                                   # 主列：被归纳的陈述降半级，归纳放在它第一条的位置（2026-10-29）
+            col, low = induce.column(record(conn, pa, swap)[2], induced(conn, pa, h))
+            items += col
+            under.update(low)
         mine = record(conn, f["record"], swap)[2]
         nums = {**{it["was"]: it["n"] for it in mine}, **{it["id"]: it["n"] for it in mine}}   # 停在的依据写的是 pack 的那条
         out[f"T{f['id']}"] = {
@@ -475,7 +491,8 @@ def entries(conn, h=None):
             "parent": f"L{place[f['id']]}" if f["id"] in place else None, "date": _date(conn, f["record"]),
             "review": review.get(f["id"], ""),
             "session": (f["source"], f["session"]), "row": f["id"], "ws": ws.get((f["source"], f["session"]), ""),
-            "items": items}                # 这段会话全部现行的陈述（Synapse 的 get 往下一层用）
+            "items": items,                # 这段会话的主列：现行的标准陈述（Synapse 的 get 往下一层用）
+            "under": under}                # 降半级的陈述 → 归纳它的那条
     return out
 
 
@@ -640,6 +657,62 @@ def store_pack(conn, op_id, u, text, written, output, meta, error, h, cause):
         h.ok[("pack", u["unit"])] = act
     conn.commit()
     return f"{result}：{err[:160]}" if result != "ok" else f"陈述 {len(items)} 条（E {len(evs)}）"
+
+
+def build_induce(conn, unit, pack_act):
+    """归纳的输入：这次 pack 现在的陈述（修订提示改写过的用现在的那条），标上编号和轮次。→ (文本, 陈述 [{"n", "id", "text", "ords"}])。"""
+    items = record(conn, pack_act)[2]
+    ordinal = {}
+    rows = []
+    for k, it in enumerate(items, 1):
+        refs = json.loads(conn.execute("SELECT refs FROM form_record WHERE id=?", (it["id"],)).fetchone()[0]).get("event", [])
+        ords = []
+        for e in refs:
+            if e not in ordinal:
+                r = conn.execute("SELECT d.ordinal FROM event e JOIN turn_detail d ON d.occurrence=e.turn WHERE e.id=?", (e,)).fetchone()
+                ordinal[e] = r[0] if r else None
+            if ordinal[e] is not None:
+                ords.append(ordinal[e])
+        rows.append({"n": k, "id": it["id"], "text": it["text"], "ords": sorted(set(ords))})
+    return redact(prompt("induce") + "\n\n## 记录\n\n" + induce.block(rows)), rows
+
+
+def store_induce(conn, op_id, u, pack_act, text, rows, output, meta, error, h, cause):
+    """归纳入库：合规的每条一行 form_record（来源是陈述，refs.form_record），正文补上程序算的数字；不合规的那条不入库，记在 meta。"""
+    unit = u["unit"]
+    found = induce.parse(output) if error is None else []
+    if error is None and not found and (output or "").strip() != "无":
+        error = "content_error: 没有解析出归纳"
+    bad = induce.check(found, {r["n"] for r in rows}) if error is None else []
+    skip = {n for n, _ in bad}
+    by = {r["n"]: r for r in rows}
+    starts = {t["ordinal"]: t["started"] for t in u["session"]["turns"]}
+    meta.update(found=len(found), violations=bad)
+    act, result, err = _act(conn, op_id, "induce", unit, {"pack": pack_act}, {"form_record": [r["id"] for r in rows]},
+                            text, output, meta, error, h, cause)
+    kept = 0
+    if result == "ok":
+        h.induced[pack_act] = act
+        for g in found:
+            if g["n"] in skip:
+                continue
+            m = induce.measure([o for n in g["from"] for o in by[n]["ords"]], starts, u["session"]["end"])
+            ids = [by[n]["id"] for n in g["from"]]
+            conn.execute("INSERT INTO form_record(born, idx, kind, text, refs, labels, structures, unresolved) VALUES(?,?,?,?,?,?,?,?)",
+                         (act, kept, "session", g["text"] + induce.tail(m, len(g["pivots"])), dumps({"form_record": ids}),
+                          dumps([f"归纳{g['n']}"]), dumps({"from": ids, "pivots": [by[n]["id"] for n in g["pivots"]], **m}), "[]"))
+            kept += 1
+    conn.commit()
+    return f"{result}" + (f"：{err[:160]}" if result != "ok" else f"：归纳 {kept} 条" + (f"，{len(bad)} 条不合规没入库" if bad else ""))
+
+
+def induced(conn, pack_act, h=None):
+    """这次 pack 现在的归纳：[{"id", "text", "from": [陈述 id]}]；没归纳过是空的。"""
+    act = (h or history(conn)).induced.get(pack_act)
+    if not act:
+        return []
+    return [{"id": r["id"], "text": st.restyle(r["text"]), "from": json.loads(r["refs"]).get("form_record", [])}
+            for r in conn.execute("SELECT id, text, refs FROM form_record WHERE born=? ORDER BY idx", (act,))]
 
 
 def _others(conn, u):
@@ -971,7 +1044,12 @@ def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_po
         elif ns and (not node or node not in {n["id"] for n in ns.values()}):
             error = f"content_error: 节点 {node} 不在骨架里"
         elif ns and name is None and the_pool[target]["parent"] != node:
-            error = f"content_error: {target} 没挂在节点 {node} 下"
+            path_of = {n["id"]: p for p, n in ns.items()}
+            up = path_of.get(the_pool[target]["parent"])
+            if up is not None and (up == "" or path_of[node].startswith(up + "/")):   # 选的节点比线深（L18，10-30）：节点以线为准
+                meta["node_from_line"], node = node, the_pool[target]["parent"]
+            else:
+                error = f"content_error: {target} 没挂在节点 {node} 下"
     meta.update(node=node, target=target, parent=parent, why=why, picks=picks, nodes=count)
     inputs = {"act": [label_act]}
     pending = _pending(conn, u, "attach")
@@ -1115,6 +1193,20 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
     return done, env
 
 
+def induce_todo(conn, h, ops, session=None):
+    """要归纳的单位：最后一次成功的 pack 是现行 pack Operator 写的、有陈述、还没归纳过、没失败满。→ [{"unit", "pack", "session"}]。"""
+    out = []
+    for (step, unit), pa in sorted(h.ok.items(), key=lambda x: x[1]):
+        if step != "pack" or unit in h.empty or pa in h.induced or (session and not unit[1].startswith(session)):
+            continue
+        if conn.execute("SELECT operator FROM occurrence WHERE id=?", (pa,)).fetchone()[0] != ops["pack"]:
+            continue
+        if _failed(h, "induce", unit, ops["induce"]):
+            continue
+        out.append({"unit": unit, "pack": pa, "session": _session(conn, unit[0], unit[1])})
+    return out
+
+
 def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stderr, models=None, now=None, corpus=None):
     """跑一批（rhythm 调它）：最多 limit 个单位。pack、label 可以并行（模型调用并行，库只在主线程里写）；attach 按时间顺序一个个来。
     返回 (处理了几件, 环境错误几次)；有环境错误时这一批提前结束。"""
@@ -1150,6 +1242,15 @@ def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stder
             jobs.append({"u": u, "step": "pack", "text": text, "written": written,
                          "call": functools.partial(pack_call, mods["pack"], text, u["events"], grp)})
     parallel(jobs, lambda j, o, m, e: store_pack(conn, ops["pack"], j["u"], j["text"], j["written"], o, m, e, h, cause), "整理")
+    if env:
+        return done, env
+    # ①′ 归纳：现行 pack 提示词写出、还没归纳过的（旧的不全量补）；失败不挡起名、挂线
+    jobs = []
+    for u in induce_todo(conn, h, ops, session)[:limit]:
+        text, rows = build_induce(conn, u["unit"], u["pack"])
+        jobs.append({"u": u, "step": "induce", "text": text, "rows": rows})
+    parallel(jobs, lambda j, o, m, e: store_induce(conn, ops["induce"], j["u"], j["u"]["pack"], j["text"], j["rows"], o, m, e, h, cause),
+             "归纳")
     if env:
         return done, env
     # ② label（整理出“无”的单位没有陈述，不写会话入口）
@@ -1347,8 +1448,9 @@ def feedback(conn, operator_id, handle, reason, name=None, topic=None, stops=Non
 
 
 def redo(conn):
-    """待重做清单：当前 Operator 下失败满次数、又没有成功的单位。[(步骤, 单位, {失败种类: 次数})]"""
+    """待重做清单：当前 Operator 下最近一次成功之后失败满次数的单位（从没成功过的，和旧的成功过、后来重做又失败满次数的，
+    G9 2026-10-30：后者原来漏列，循环跳过它、清单里又没有）。[(步骤, 单位, {失败种类: 次数})]"""
     h = history(conn)
     ops = {operator(conn, step)[0] for step in CURRENT}
     return [(step, unit, dict(c)) for (step, unit, op), c in h.fails.items()
-            if op in ops and (step, unit) not in h.ok and any(n >= MAX_FAILURES for n in c.values())]
+            if op in ops and any(n >= MAX_FAILURES for n in c.values())]

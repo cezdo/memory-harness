@@ -331,8 +331,8 @@ class FormTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             form.feedback(self.conn, me, "K12", "旧认识")                    # 现在只接会话入口
 
-    def _fakes(self, packs=(), labels=(), attaches=()):
-        return {"pack": FakeModel(list(packs)), "label": FakeModel(list(labels)),
+    def _fakes(self, packs=(), labels=(), attaches=(), induces=()):
+        return {"pack": FakeModel(list(packs)), "induce": FakeModel(list(induces) or ["无"] * 20), "label": FakeModel(list(labels)),
                 "attach": FakeModel(list(attaches)), "attach_lines": FakeModel(list(attaches))}
 
     def _run(self, fakes, **kw):
@@ -542,7 +542,7 @@ class FormTest(unittest.TestCase):
                             ["挂到：新线 X 升级｜为什么：新的目标", "挂到：L1｜为什么：同一个目标"])
         self._run(fakes)
         steps = [r[0] for r in self.conn.execute("SELECT a.step FROM act_detail a WHERE a.process='form' ORDER BY a.occurrence")]
-        self.assertEqual(steps, ["pack", "pack", "label", "label", "attach", "attach"])
+        self.assertEqual(steps, ["pack", "pack", "induce", "induce", "label", "label", "attach", "attach"])
         import hashlib
         for r in self.conn.execute("SELECT input,meta FROM act_detail WHERE process='form'"):
             ex = json.loads(r['meta'])['expression']
@@ -584,6 +584,60 @@ class FormTest(unittest.TestCase):
         first = self.conn.execute("SELECT input FROM act_detail WHERE step='pack' ORDER BY occurrence").fetchone()[0]
         self.assertIn(f"[E{a[0]}]", first)
         self.assertIn("## 第 2 轮", first)
+
+    def test_induce_program(self):
+        """归纳的程序部分（G6，2026-10-29）：解析、检查、程序补的数字、主列。"""
+        from . import induce
+        out = "### 归纳1\nX 起不来，查明是数据目录变了。\n来源：陈述2、陈述3、陈述4\n转折：陈述3\n\n### 归纳2\nY。\n来源：陈述4、陈述5\n转折：陈述1\n"
+        got = induce.parse(out)
+        self.assertEqual([(g["n"], g["from"], g["pivots"]) for g in got], [(1, [2, 3, 4], [3]), (2, [4, 5], [1])])
+        self.assertEqual(induce.parse("无"), [])
+        bad = induce.check(got, {1, 2, 3, 4, 5})
+        self.assertEqual([n for n, _ in bad], [2])                         # 转折不在来源里
+        self.assertEqual([n for n, _ in induce.check([{"n": 1, "from": [1, 3, 5, 7, 9, 11, 13, 15, 17], "pivots": []}], set(range(1, 20)))], [1])
+        self.assertEqual(induce.check([{"n": 1, "from": list(range(1, 10)), "pivots": []}], set(range(1, 20))), [])   # 9 条连着的可以
+        self.assertEqual([n for n, _ in induce.check([{"n": 1, "from": [1, 2], "pivots": []}, {"n": 2, "from": [2, 3], "pivots": []}],
+                                                      {1, 2, 3})], [2])                 # 一条陈述只归纳一次
+        starts = {3: "2026-10-17T08:00:00Z", 4: "2026-10-17T08:10:00Z", 5: "2026-10-17T08:30:00Z"}
+        m = induce.measure([3, 4, 4], starts, "2026-10-17T09:00:00Z")
+        self.assertEqual(m, {"turns": 2, "minutes": 30})                   # 到下一轮开始，含等用户的时间
+        self.assertEqual(induce.measure([5], starts, "2026-10-17T09:00:00Z")["minutes"], 30)     # 最后一轮：到会话结束
+        self.assertEqual(induce.tail(m, 1), "（排查 2 轮、约 30 分钟、转折 1 次）")
+        items = [{"id": i, "was": i} for i in (1, 2, 3, 4)]
+        col, under = induce.column(items, [{"id": 9, "text": "归", "from": [2, 3]}])
+        self.assertEqual([x["id"] for x in col], [1, 9, 4])
+        self.assertEqual(under, {2: 9, 3: 9})
+
+    def test_induce_flow(self):
+        """pack 之后归纳：被归纳的陈述不在主列里，句柄不变、直接给句柄读得到并标出归纳进哪条；归纳的来源是那几条陈述。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        pk = PACK.format(a=a[0], b=a[1]).replace("### 陈述2", "### 陈述2\n我先疑配置，又疑端口。\n来源：E{a}\n### 陈述3".format(a=a[0]))
+        ind = "### 归纳1\n升级排查：查明是数据目录变了。\n来源：陈述2、陈述3\n转折：陈述3\n"
+        self._run(self._fakes([pk], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"], [ind]))
+        steps = [r[0] for r in self.conn.execute("SELECT step FROM act_detail WHERE process='form' ORDER BY occurrence")]
+        self.assertEqual(steps, ["pack", "induce", "label", "attach"])
+        rows = self.conn.execute("SELECT id, text, refs, labels FROM form_record WHERE kind='session' ORDER BY id").fetchall()
+        self.assertEqual(len(rows), 4)
+        up = rows[-1]
+        self.assertEqual(json.loads(up["refs"]), {"form_record": [rows[1]["id"], rows[2]["id"]]})
+        self.assertTrue(up["text"].startswith("升级排查：查明是数据目录变了。（排查 "))
+        ent = next(iter(form.entries(self.conn).values()))
+        self.assertEqual([it["id"] for it in ent["items"]], [rows[0]["id"], up["id"]])
+        self.assertEqual(ent["under"], {rows[1]["id"]: up["id"], rows[2]["id"]: up["id"]})
+        seq = form.statement_seq(self.conn)[0]
+        self.assertEqual([seq[r["id"]] for r in rows], [1, 2, 3, 4])                     # 归纳接着编，原来的不变
+        self.assertEqual(check.check(self.conn, self.dir / "engram.db").count("指向不存在"), 0)
+        from ...synapse import pull
+        L = pull.Layers(self.conn)
+        text, _ = pull.show_stmt(self.conn, L, rows[1]["id"], "S2")
+        self.assertIn("（归纳进 L1:T1:S4）", text)
+        self.assertNotIn("已不是现在的陈述", text)
+        text, ins = pull.show_stmt(self.conn, L, up["id"], "S4", source=True)
+        self.assertIn("归纳了这几条陈述：", text)
+        self.assertIn("L1:T1:S2 我先疑配置，又疑端口。", text)
+        self.assertEqual(ins["form_record"], [up["id"], rows[1]["id"], rows[2]["id"]])
+        self._run(self._fakes())
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='induce'").fetchone()[0], 1)   # 归纳过的不再归纳
 
     def test_line_words_share(self):
         """线的索引词要够多子入口都有：15 个子入口要 3 个（LINE_SHARE 两成），只有两个的不收；成员少时两个就够。"""
@@ -772,6 +826,22 @@ class FormTest(unittest.TestCase):
         self.assertEqual([r[0] for r in form.redo(self.conn)], ["pack"])
         self.assertEqual([tuple(r) for r in self.conn.execute("SELECT entry, line FROM attachment")], [(1, 1)])
 
+    def test_redo_after_old_success(self):
+        """旧的 pack 成功过，晚到的 E 让它重做，重做失败满次数：进待重做清单（G9）；成功之前的失败不算进重做的次数。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        first = self._fakes([TimeoutError("超时"), TimeoutError("超时"), PACK.format(a=a[0], b=a[1])], [LABEL],
+                            ["挂到：新线 X 升级｜为什么：新的目标"])
+        for _ in range(3):
+            self._run(first)
+        self.assertEqual(form.redo(self.conn), [])                         # 两次失败之后成功了
+        self._late(a[0])
+        fakes = self._fakes([TimeoutError("超时")] * 3, [], [])
+        self._run(fakes)
+        self.assertEqual(form.redo(self.conn), [])                         # 重做只失败了一次：成功之前那两次不算
+        self._run(fakes)
+        self._run(fakes)
+        self.assertEqual([(r[0], r[1][1], r[2]) for r in form.redo(self.conn)], [("pack", "s1", {"timeout": 3})])
+
     def test_capacity_retries_then_recovers(self):
         a = self._session("s1", "2026-10-17T08:00:00Z")
         busy = RuntimeError("Selected model is at capacity. Please try a different model.")
@@ -838,6 +908,18 @@ class FormTest(unittest.TestCase):
             text = self.conn.execute("SELECT input FROM act_detail WHERE step='attach'").fetchone()[0]
             self.assertIn("[k-engram-form] form", text)
             self.assertEqual(form.pool(self.conn)["L1"]["parent"], "k-engram-form")
+            b = self._session("s2", "2026-10-17T09:00:00Z", cwd="/home/u/proj")
+            c = self._session("s3", "2026-10-17T10:00:00Z", cwd="/home/u/proj")
+            d = self._session("s4", "2026-10-17T11:00:00Z", cwd="/home/u/proj")
+            self._run(self._fakes([PACK.format(a=x[0], b=x[1]) for x in (b, c, d)], [LABEL] * 3,
+                                  ["节点：k-engram｜挂到：新线 Engram 整体｜为什么：跨了几个子模块",
+                                   "节点：k-engram-form｜挂到：L2｜为什么：选的节点比线深（L18，10-30）",
+                                   "节点：k-engram｜挂到：L1｜为什么：选的节点比线浅：不收"]))
+            rows = self.conn.execute("SELECT o.outcome, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                     "WHERE a.step='attach' ORDER BY o.id").fetchall()
+            self.assertEqual([r[0] for r in rows], ["ok", "ok", "ok", "content_error"])
+            meta = json.loads(rows[2][1])
+            self.assertEqual((meta["node"], meta["node_from_line"]), ("k-engram", "k-engram-form"))
         finally:
             skeleton.WORKSPACES.clear()
             skeleton.WORKSPACES.update(saved)

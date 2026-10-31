@@ -9,6 +9,9 @@ form 自己按 observe 的接口（progress 里待观测的）定门槛，跟在
 - 每个循环只有一个实例（数据目录里的文件锁 observe.lock、form.lock）。
 - 有环境错误（额度、限流、连接……）这一批提前结束，休眠后再试；失败次数和待重做清单归各过程。
 - 一轮出错不让常驻进程退出，记下来，休眠后接着跑。
+- 叫醒（observe 设计“叫醒”）：休眠时每 5 秒看两样，变了就提前醒。一是数据目录的 {循环名}.wake：库里还没有的宿主事件
+  （Stop 钩子、/do-observe）碰 observe.wake；二是库里这个循环自己的输入（watch）：form 看新的 E 和写给 form 的申请，observe 看
+  写给 observe 的申请（G2，用户 2026-10-30：什么时候醒归节律，写申请的一方只管写库）。整理循环每分钟醒、任务按自己的周期跑，不用叫醒。
 以后加上睡眠（第 5 步）、额度的使用（quota.py 现在只读，供 mh quota 和长实验用）。
 """
 import fcntl
@@ -30,6 +33,8 @@ PROVIDER = {"sol": "codex", "sonnet": "claude"}    # 预览池（observe.POOL）
 BUSY_5H = 80            # 5 小时额度用到这么多（%）就排到后面
 QUOTA_TTL = 600         # 额度读一次管多久（秒）
 TIDY_INTERVAL = 60      # 整理循环多久醒一次（秒）；每个任务按自己的周期决定这次跑不跑
+WAKE_POLL = 5           # 休眠时每几秒看一眼叫醒文件
+WAKE_SETTLE = 5         # 被叫醒后再等几秒：宿主的 Stop 可能在这一轮写进会话文件之前发（dsh 的 turn-stopping 在 turn/end 之前）
 
 
 def _status(conn, log):
@@ -59,12 +64,28 @@ def _cite(conn, log):
     return f"〖〗回填 {wrote} 轮" + (f"，出错 {failed} 轮（下次再试）" if failed else "") if wrote or failed else ""
 
 
+def _runbook(conn, log):
+    """runbook 更新稿（用户 2026-10-29）：手写部分写了 runbook 的工作区，每天让模型对照新提交写一份，放进数据目录，不改仓库。"""
+    from ..synapse.push import runbook, status
+    wrote = [ws for ws in status.workspaces()
+             if (cfg := status.source(ws)) and cfg["runbook"] and cfg["repo"]
+             and runbook.draft(ws, cfg["repo"], cfg["runbook"], _runbook_model())]
+    return f"runbook 更新稿：{'、'.join(wrote)}" if wrote else ""
+
+
+def _runbook_model():
+    """写稿要读整份 runbook 和一天的提交，按读整段的放宽超时；不给工具（codex 的只读沙箱拦不住读文件）。"""
+    from ..engram import invoke
+    return invoke.whole(invoke.Codex("gpt-6.1-sol", "low", isolation="codex-home-v1-low", no_tools=True))
+
+
 # 整理循环的任务（2026-10-20）：维护工作集，让手记推送这一侧跟上项目和记忆的实际状态。周期跟着成本走：
 # 程序任务分钟到小时级，模型任务按轻重几个小时到一周。一个任务：(名字, 程序 | 模型, 周期秒数, 做什么)。
 TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面：第一次醒来编的现状就带上检查
         ("项目现状", "程序", 300, _status),
         ("补 form 内部足迹", "程序", 86400, _backfill),
-        ("〖〗回填", "模型", 86400, _cite)]          # 调 Jev 判转述说的是哪一条（2026-10-22）
+        ("〖〗回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
+        ("runbook 更新稿", "模型", 86400, _runbook)]  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）
 
 
 def lock(name, home=None):
@@ -125,14 +146,54 @@ def form_once(conn, log=sys.stderr, models=None, limit=FORM_LIMIT, workers=FORM_
     return form.run(conn, limit=limit, workers=workers, cause="schedule", log=log, models=models)
 
 
-def _loop(name, step, db, interval, log, once):
-    """常驻循环的共同部分：拿锁，一轮轮跑 step(conn) → (说明, 忙不忙, 结果)，不忙就休眠。once：只跑一轮就返回。"""
-    held = lock(name, (db.parent if db else None))
+def _touched(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _requests_to(process):
+    """watch：库里写给这一层的最新一张申请。"""
+    return lambda conn: conn.execute("SELECT MAX(occurrence) FROM request_detail WHERE to_process=?", (process,)).fetchone()[0]
+
+
+def _form_inputs(conn):
+    """watch：form 的输入，最新的 E 和写给 form 的最新一张申请。"""
+    return conn.execute("SELECT MAX(id) FROM event").fetchone()[0], _requests_to("form")(conn)
+
+
+def _rest(path, since, interval, sleep=time.sleep, watch=None, seen=None):
+    """休眠 interval 秒；叫醒文件比 since（这一轮开始前看到的）新了、或者 watch() 和 seen（这一轮开始前看到的）不一样了，
+    就提前醒，再等 WAKE_SETTLE。一轮跑着时变了的，跑完立即醒。返回是不是被叫醒的。"""
+    end = time.monotonic() + interval
+    while (left := end - time.monotonic()) > 0:
+        if _touched(path) != since or (watch and watch() != seen):
+            sleep(WAKE_SETTLE)
+            return True
+        sleep(min(WAKE_POLL, left))
+    return False
+
+
+def _loop(name, step, db, interval, log, once, watch=None):
+    """常驻循环的共同部分：拿锁，一轮轮跑 step(conn) → (说明, 忙不忙, 结果)，不忙就休眠（可以被叫醒）。once：只跑一轮就返回。
+    watch(conn)：库里这个循环的输入，休眠时变了就醒（读不到当没变）。"""
+    home = db.parent if db else store.HOME
+    held = lock(name, home)
     if held is None:
         print(f"{name} 循环已经在运行", file=log)
         return None
     conn = store.connect(db or store.DEFAULT_DB)
+    wake = home / f"{name}.wake"
+    def look():
+        try:
+            return watch(conn)
+        except Exception:               # 库忙、表还没建：当没变
+            return seen
+    seen = None
     while True:
+        since = _touched(wake)
+        seen = look() if watch else None
         try:
             note, busy, got = step(conn)
             if note:
@@ -144,7 +205,7 @@ def _loop(name, step, db, interval, log, once):
             held.close()
             return got
         if not busy:
-            time.sleep(interval)
+            _rest(wake, since, interval, watch=look if watch else None, seen=seen)
 
 
 def tidy_once(conn, log=sys.stderr, tasks=None, state=None, now=None):
@@ -188,7 +249,7 @@ def observe_loop(db=None, interval=INTERVAL, log=sys.stderr, once=False, **kw):
         new, done, env = observe_once(conn, log=log, models=models, **kw)
         note = f"新轮次 {new}，处理 {done}" + (f"，环境错误 {env}" if env else "") if new or done else ""
         return note, bool(done and not env), (new, done, env)
-    return _loop("observe", step, db, interval, log, once)
+    return _loop("observe", step, db, interval, log, once, watch=_requests_to("observe"))
 
 
 def form_loop(db=None, interval=INTERVAL, log=sys.stderr, once=False, **kw):
@@ -199,4 +260,4 @@ def form_loop(db=None, interval=INTERVAL, log=sys.stderr, once=False, **kw):
         done, env = form_once(conn, log=log, models=models, **kw)
         note = f"形成 处理 {done}" + (f"，环境错误 {env}" if env else "") if done else ""
         return note, bool(done and not env), (done, env)
-    return _loop("form", step, db, interval, log, once)
+    return _loop("form", step, db, interval, log, once, watch=_form_inputs)

@@ -4,10 +4,12 @@
 # web profile 的记忆工具（日记、记忆查询）挂在 profile 层、会进每个会话；观察者不能看到
 - id: memory-tools
   disabled: true
-# 模型 DeepSeek V4.1 Flash（2026-10-09 ark 订阅上线；指令遵循更好，细粒度更细，用户），推理档位 high。
+# 模型 DeepSeek V4.1 Flash，推理档位 high（2026-10-09 起；指令遵循更好，细粒度更细，用户）。
+# 2026-10-31：ark 订阅用完，换 OpenCode Go 的同一模型（用户）；provider 名与 apiKeyEnv 都在 web profile 的
+# llm-pi-ai 里，这里只指过去，密钥仍只从 dsh 自己的凭据读。
 # 补丁会整段替换这一项的 config，所以 provider、model 一起写
 - id: agent-default-model
   config:
-    provider: ark
-    model: deepseek-v4-1-flash-260910
+    provider: opencode-go
+    model: deepseek-v4.1-flash
     reasoningEffort: high

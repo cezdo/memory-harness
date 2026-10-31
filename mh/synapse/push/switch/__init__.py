@@ -3,7 +3,8 @@
 `/no-souhatsu` 关、`/do-souhatsu` 开（codex 里写成 `$no-souhatsu`、`$do-souhatsu`，skill）。联想的 UserPromptSubmit 钩子认出
 整句命令，记下、拦下，不调用模型（照 observe 开关的路子）。最后一次说了算，按会话，默认开。关掉的只是联想；“查不到的词”照旧。
 
-记录追加到数据目录的 souhatsu-switch.jsonl：时间、宿主、会话 ID、开还是关、原话。读状态就是找这个会话最后一行。
+记录追加到数据目录的 souhatsu-switch.jsonl：时间、宿主、会话 ID、开还是关、原话。读状态就是找这个会话最后一行（每轮要最新的）；
+观察循环的采集把它收成 turn 进库（observe 的 switch 来源，origin 是用户，2026-10-30 runbook N3），足迹、检查从库里看。
 钩子读不到、写不进都不挡用户：命令文件和 skill 还在，命令照常发给模型，模型只回一句确认。
 """
 import json

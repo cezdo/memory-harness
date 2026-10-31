@@ -5,19 +5,39 @@ tui 4bfb59ad → ea43d745）。SessionStart 钩子（新会话、恢复、clear�
 钩子往上找到 claude 进程，写 <HOME>/run/claude/<pid>；MCP 是 claude 的直接子进程，按父进程读。读不到照旧用环境变量。"""
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 RUN = Path(os.environ.get("MH_HOME", Path.home() / ".local/share/memory-harness")) / "run" / "claude"   # 同 store.HOME
 
 
 def _parent(pid):
-    """/proc 里 pid 的 (父进程, 名字)；读不到给 (0, "")。"""
+    """pid 的 (父进程, 名字们)；读不到给 (0, ())。Linux 读 /proc；别的平台（macOS）问 ps：claude 的可执行文件名是版本号，
+    改的是进程标题，所以 ucomm 和 command 的第一段都看（macOS 上哪个是 claude 待迁过去实测，X4）。"""
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            name, rest = stat[stat.index("(") + 1:stat.rindex(")")], stat[stat.rindex(")") + 2:].split()
+            return int(rest[1]), (name,)
+        except (OSError, ValueError, IndexError):
+            return 0, ()
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        name, rest = stat[stat.index("(") + 1:stat.rindex(")")], stat[stat.rindex(")") + 2:].split()
-        return int(rest[1]), name
-    except (OSError, ValueError, IndexError):
-        return 0, ""
+        out = subprocess.run(["ps", "-o", "ppid=,ucomm=,command=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.split(None, 2)
+        return int(out[0]), (out[1], Path(out[2].split()[0]).name if len(out) > 2 else "")
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return 0, ()
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 
 def host_pid(start=None):
@@ -26,8 +46,8 @@ def host_pid(start=None):
     for _ in range(8):
         if pid <= 1:
             return 0
-        ppid, name = _parent(pid)
-        if name == "claude":
+        ppid, names = _parent(pid)
+        if "claude" in names:
             return pid
         pid = ppid
     return 0
@@ -44,7 +64,7 @@ def bind(session, pid=None):
         tmp.write_text(session)
         tmp.replace(RUN / str(pid))
         for f in RUN.iterdir():
-            if f.name.isdigit() and not Path(f"/proc/{f.name}").exists():
+            if f.name.isdigit() and not _alive(int(f.name)):
                 f.unlink(missing_ok=True)
     except OSError:
         pass

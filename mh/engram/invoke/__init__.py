@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -44,7 +45,9 @@ def whole(model):
 # --strict-config：写错的键直接报错；之前手写的 plugins_enabled 就是被静默忽略的无效键
 OFFLINE_FEATURES = [a for f in ("plugins", "apps", "remote_plugin") for a in ("-c", f"features.{f}=false")]
 # 隔离的 home 没有宿主那份配置，更新检查得单独关（宿主 ~/.codex/config.toml 里是 check_for_update_on_startup=false）
-NO_UPDATE = ["-c", "check_for_update_on_startup=false"]
+# 统计上报也关：2026-10-31 strace 量 codex 0.165 的一次 exec，ab.chatgpt.com 上传 634KB，比请求本身（约 100KB）大六倍；
+# analytics.enabled=false 后这条连接没了。不影响模型行为，不换 isolation（同上面的插件）
+NO_UPDATE = ["-c", "check_for_update_on_startup=false", "-c", "analytics.enabled=false"]
 
 # 模型目录：codex 每次进程启动都会在线拉一份（实测约 0.66MB，2026-10-28）。观察、形成每次调用都是一个新进程，
 # 一天上千次就是几百 MB。把目录落盘，调用时用 model_catalog_json 指过去：过期（CATALOG_DAYS）或里面没有要用的
@@ -141,19 +144,27 @@ class Codex:
     home = HOME / "codex-home"
     isolation = "codex-home-v1"
 
-    def __init__(self, model="gpt-6-luna", effort="medium", platform="codex", isolation=None, no_tools=False):
+    def __init__(self, model="gpt-6-luna", effort="medium", platform="codex", isolation=None, no_tools=False, allow=(),
+                 config=(), instructions=None):
         # 推理强度显式写死，等于 codex-home-v1 以来各模型实际用的默认值（Luna medium、Sol low）；
         # 改档位要换 isolation 标签，让它进 Operator 身份。
         # no_tools：codex 的只读沙箱拦不住读文件，用了工具就判失败、结果作废（观察者，2026-10-19；进 isolation 标签）
-        self.model, self.effort, self.platform, self.no_tools = model, effort, platform, no_tools
+        # allow：no_tools 下仍放行的条目类型（回复放行 web_search，2026-10-31：不读本机文件，但能查资料）
+        # config：额外的 -c 键值；instructions：换掉 codex 自带系统提示的文件（model_instructions_file）。
+        # 两样都会改模型看到的东西，用的一方要换 isolation 标签（回复，2026-10-31）
+        self.model, self.effort, self.platform, self.no_tools, self.allow = model, effort, platform, no_tools, frozenset(allow)
+        self.config, self.instructions = [a for kv in config for a in ("-c", kv)], instructions
         if isolation:
             self.isolation = isolation
         if no_tools:
-            self.isolation += "-notools"
+            self.isolation += "-notools" + "".join(f"+{a}" for a in sorted(self.allow))
 
-    def __call__(self, prompt):
+    def __call__(self, prompt, images=()):
+        # images：附在提示词上的图片文件（回复看清时的图，2026-10-31）；--image=路径 逐张写，免得 -i 把后面的 "-" 也当成图
         env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
         cat = catalog(self.model)
+        own = self.config + (["-c", f'model_instructions_file="{self.instructions}"'] if self.instructions else [])
+        began = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="mh-codex-") as tmp:
             out = Path(tmp) / "last.txt"
 
@@ -161,9 +172,9 @@ class Codex:
                 # 有本地模型目录就指过去，省掉这次进程启动的在线目录；没有（刷新失败）就照原样在线拉
                 extra = ["-c", f"model_catalog_json={cat}"] if cat else []
                 return subprocess.run(
-                    ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, *NO_UPDATE, *extra,
+                    ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, *NO_UPDATE, *own, *extra,
                      "--strict-config", "--ephemeral", "--skip-git-repo-check",
-                     "-s", "read-only", "-C", tmp, "-o", str(out), "--json", "-"],
+                     "-s", "read-only", "-C", tmp, "-o", str(out), "--json", *(f"--image={i}" for i in images), "-"],
                     input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env)
 
             p = run(cat)
@@ -184,10 +195,15 @@ class Codex:
             # 按条目类型认工具调用：只有回答、推理、出错这几类是文字。原先找 "command" 子串，回答里引用了
             # 「exec_command」这类词也会被当成用了工具（C 实验 i2 段 1312、1320，2026-10-15）
             tools = {(e.get("item") or {}).get("id") for e in events
-                     if (e.get("item") or {}).get("type") not in (None, "agent_message", "reasoning", "error")}
+                     if (e.get("item") or {}).get("type") not in (None, "agent_message", "reasoning", "error", *self.allow)}
             if self.no_tools and tools:
                 raise RuntimeError(f"观察者调用了工具（{len(tools)} 次），结果作废")
-            return out.read_text(), {"model": self.model, "tool_events": len(tools), "isolation": self.isolation}
+            usage = {}
+            for e in events:                        # 每次请求的 token：输入、其中命中缓存的、输出（2026-10-31 起记）
+                for k, v in (e.get("usage") or {}).items() if e.get("type") == "turn.completed" else ():
+                    usage[k] = usage.get(k, 0) + v
+            return out.read_text(), {"model": self.model, "tool_events": len(tools), "isolation": self.isolation,
+                                     "usage": usage, "seconds": round(time.monotonic() - began, 1)}
 
 
 class Dsh:
@@ -206,7 +222,7 @@ class Dsh:
     def __call__(self, prompt):
         env = dict(os.environ, DSH_HOME=str(self.root / "home"))
         with tempfile.TemporaryDirectory(prefix="mh-dsh-") as tmp:
-            # 叠加某个 profile 的 patch，借用它的 provider 配置（如 web 里从 settings.yaml 导入的 ark）
+            # 叠加某个 profile 的 patch，借用它的 provider 配置（如 web 里 llm-pi-ai 声明的 opencode-go）
             patch = ["--patch", str(self.root / f"home/profiles/{self.profile}/cordis.patch.yml")] if self.profile else []
             patch += [a for p in self.extra for a in ("--patch", str(p))]
             p = subprocess.run(["node", str(self.root / "env-next/lib/bin.js"), "headless", *patch, "--json", "-"],
@@ -236,7 +252,10 @@ class Dsh:
 
 
 def _die_with_parent():
-    """子进程里执行：父进程（常驻循环或命令行）退出时，内核给它发 SIGTERM，不留下占着端口的孤儿（Linux）。"""
+    """子进程里执行：父进程（常驻循环或命令行）退出时，内核给它发 SIGTERM，不留下占着端口的孤儿（Linux）。
+    别的平台没有这个调用，什么也不做：DshWeb（bwrap 沙箱）只跑在 Linux 上，迁到 macOS 后由另一台 Linux 上的服务提供（X2）。"""
+    if not sys.platform.startswith("linux"):
+        return
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)       # PR_SET_PDEATHSIG
 
 
@@ -290,7 +309,7 @@ class DshWeb(Dsh):
         return dict(os.environ, DSH_HOME=str(self.root / "home"), DSH_PERMISSION_MODE=self.permission, HOME="/tmp")
 
     def _box(self, argv):
-        """把命令包进 bwrap：网络共享（要连 ark），其余命名空间全部隔开；父进程退出它也退出。"""
+        """把命令包进 bwrap：网络共享（要连模型服务），其余命名空间全部隔开；父进程退出它也退出。"""
         home, box = self.root / "home", self.box
         args = ["bwrap", "--unshare-all", "--share-net", "--die-with-parent",
                 "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve",

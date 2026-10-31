@@ -1,4 +1,4 @@
-"""三家订阅的额度（2026-10-13）：Codex（ChatGPT）、Claude（Claude Code 订阅）、ark（火山方舟 Agent Plan）。只读，不发模型请求。
+"""三家订阅的额度（2026-10-13）：Codex（ChatGPT）、Claude（Claude Code 订阅）、OpenCode Go（Go 套餐）。只读，不发模型请求。
 节律（rhythm）取额度用；长实验在额度用完时自动等重置（tmp/cexp/supervise.sh，经 python3 -m mh quota）。2026-10-17 从 mh/synapse/ 搬来（重构 A12）。
 
 - codex：codex app-server 的 JSON-RPC account/rateLimits/read；独立 CODEX_HOME，里面只有认证的符号链接。
@@ -6,25 +6,31 @@
   过期时这里只报过期，不代为刷新）。接口未公开，要带 User-Agent claude-code/<版本>，否则容易 429。
   2026-10-25：这个接口按出口限流（不带令牌也 429），被限时也可能不回 429、在 TLS 握手时掐断（SSL EOF）。所以读到的
   结果落盘缓存 CLAUDE_TTL 秒，期间不再请求；读不到时退回上次读到的，注明是多久以前的（"stale"）。
-- ark：2026-10-13：没有 AK/SK 就不查（不大量用用不完）。接口是火山引擎 OpenAPI GetAFPUsage（Agent Plan；Coding Plan 是 GetCodingPlanUsage），要账号 AccessKey（AK/SK，
-  只需 ArkReadOnlyAccess），不能用 API Key。AK/SK 放 ~/.config/memory-harness/volc.json：{"ak": "...", "sk": "..."}。
-  不要用 Plan 的 API Key 直接打推理接口探额度：方舟说明 Plan 只能在 AI 编程工具里用。
+- opencode-go：2026-10-31 起（ark 订阅用完，用户换成 OpenCode Go）。GET opencode.ai/zen/go/v1/usage，一次给三个窗口
+  （rolling 5h、weekly、monthly）的已用百分比和重置时刻；要套餐的 API Key，只读账户状态，不算一次模型请求。
+  密钥先看环境变量 OPENCODE_GO_API_KEY，再看 dsh 自己的凭据（$DSH_HOME/.credentials.yaml，默认 ~/.dsh/.credentials.yaml；
+  dsh 把 key 存在 refs 里）；别拿 key 打推理接口探额度。
 
 每家统一成 {"name", "plan", "windows": [{"name": "5h" | "week" | "month", "used": 0–100, "resets": unix 秒}], "ok": 能不能用}；
 读不到时 {"name", "error"}；退回旧结果时多一个 "stale"（多久以前、为什么）。
 """
-import hashlib, hmac, json, os, subprocess, threading, time, urllib.error, urllib.parse, urllib.request
-from datetime import datetime, timezone
+import json, os, re, subprocess, threading, time, urllib.error, urllib.request
+from datetime import datetime
 from pathlib import Path
 
 from ..engram.store import HOME
 from ..engram.invoke import NO_UPDATE, OFFLINE_FEATURES, catalog   # 启动 app-server 也要关掉插件、apps 和在线模型目录
 
-from ..engram.store.instance import CODEX              # codex CLI 的路径：实例配置（这台机器上绕过 ~/.local/bin/codex 的包装）
+from ..engram.store.instance import CODEX, DSH_TEST   # codex CLI 的路径、dsh 测试实例的位置：实例配置
 CODEX_HOME = HOME / "codex-quota-home"
 CLAUDE_CRED = Path.home() / ".claude/.credentials.json"
-VOLC = Path.home() / ".config/memory-harness/volc.json"
 CLAUDE_CACHE = HOME / "quota-claude.json"
+# dsh 把 provider 的 key 存在自己的凭据文件里；DSH_HOME 指到测试实例时先看那里，最后也看家目录那份
+OPENCODE_URL = "https://opencode.ai/zen/go/v1/usage"
+OPENCODE_CREDS = tuple(dict.fromkeys(
+    p for p in (Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh") / ".credentials.yaml",
+                Path.home() / ".dsh/.credentials.yaml",
+                *([DSH_TEST / "home/.credentials.yaml"] if DSH_TEST else []))))
 CODEX_TIMEOUT = 60      # 读 codex 额度最多等多久（秒）：app-server 不出声也不退出时，到点杀掉，记“读不到”，不卡住节律（审查 09，2026-10-28）
 CLAUDE_TTL = 600        # Claude 额度读一次管多久（秒）：接口限流，不必高频查
 
@@ -116,51 +122,57 @@ def _claude_fetch():
     return {"name": "claude", "plan": cred.get("subscriptionType"), "windows": ws, "ok": all(w["used"] < 100 for w in ws)}
 
 
-def _volc_call(action, ak, sk, host="open.volcengineapi.com", service="ark", region="cn-beijing", version="2024-01-01"):
-    """火山引擎 OpenAPI 签名（HMAC-SHA256，POST 空 body）。"""
-    query = "&".join(f"{k}={urllib.parse.quote(v, safe='-_.~')}" for k, v in
-                     sorted({"Action": action, "Region": region, "Version": version}.items()))
-    now = datetime.now(timezone.utc)
-    xdate, short = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-    bh = hashlib.sha256(b"").hexdigest()
-    ct = "application/json; charset=utf-8"
-    headers = f"host:{host}\nx-date:{xdate}\nx-content-sha256:{bh}\ncontent-type:{ct}\n"
-    signed = "host;x-date;x-content-sha256;content-type"
-    creq = f"POST\n/\n{query}\n{headers}\n{signed}\n{bh}"
-    scope = f"{short}/{region}/{service}/request"
-    sts = f"HMAC-SHA256\n{xdate}\n{scope}\n{hashlib.sha256(creq.encode()).hexdigest()}"
-    k = sk.encode()
-    for part in (short, region, service, "request"):
-        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
-    sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(f"https://{host}/?{query}", data=b"", method="POST", headers={
-        "X-Date": xdate, "X-Content-Sha256": bh, "Content-Type": ct,
-        "Authorization": f"HMAC-SHA256 Credential={ak}/{scope}, SignedHeaders={signed}, Signature={sig}"})
-    try:
-        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
-    except urllib.error.HTTPError as e:
-        d = json.loads(e.read() or b"{}")
-    err = (d.get("ResponseMetadata") or {}).get("Error")
-    if err:
-        raise RuntimeError(f"{err.get('Code')}: {err.get('Message')}")
-    return d.get("Result") or d
+def _opencode_key():
+    """OpenCode 套餐的 key：环境变量优先，其次 dsh 的凭据文件（dsh 存在 refs 下，一行一个）。"""
+    key = (os.environ.get("OPENCODE_GO_API_KEY") or "").strip()
+    if key:
+        return key
+    for path in OPENCODE_CREDS:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        m = re.search(r"^\s*OPENCODE_GO_API_KEY:\s*['\"]?([^\s'\"]+)['\"]?\s*$", text, re.M)
+        if m:
+            return m.group(1)
+    raise RuntimeError(f"没有 OPENCODE_GO_API_KEY（环境变量或 dsh 的凭据 {OPENCODE_CREDS[0]}），查不了 OpenCode Go 的额度")
 
 
-def ark():
-    if not VOLC.exists():
-        raise RuntimeError(f"没有火山引擎 AK/SK（{VOLC}），查不了 Agent Plan 额度")
-    c = json.loads(VOLC.read_text())
-    r = _volc_call("GetAFPUsage", c["ak"], c["sk"])
+def _opencode_usage(d):
+    """接口返回的三个窗口 → 统一的额度结构。没有 percent 的窗口跳过；一个都没有算读不到。"""
     ws = []
-    for key, name in (("AFPFiveHour", "5h"), ("AFPWeekly", "week"), ("AFPMonthly", "month")):
-        w = r.get(key)
-        if w and float(w.get("Quota") or 0) > 0:
-            ws.append({"name": name, "used": round(min(float(w.get("Used") or 0) / float(w["Quota"]) * 100, 100), 1),
-                       "resets": int(w["ResetTime"]) if str(w.get("ResetTime") or "").lstrip("-").isdigit() else None})
-    return {"name": "ark", "plan": r.get("PlanType"), "windows": ws, "ok": all(w["used"] < 100 for w in ws)}
+    for key, name in (("rolling", "5h"), ("weekly", "week"), ("monthly", "month")):
+        w = (d.get("usage") or {}).get(key) or {}
+        if w.get("percent") is None:
+            continue
+        reset = w.get("resetsAt")
+        try:
+            resets = int(datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp()) if reset else None
+        except (AttributeError, ValueError):
+            resets = None
+        ws.append({"name": name, "used": round(float(w["percent"]), 1), "resets": resets})
+    if not ws:
+        raise RuntimeError(f"额度接口没给三个窗口：{str(d)[:200]}")
+    return {"name": "opencode-go", "plan": "go", "windows": ws, "ok": all(w["used"] < 100 for w in ws)}
 
 
-PROVIDERS = {"codex": codex, "claude": claude, "ark": ark}
+def _opencode_fetch():
+    # Cloudflare 不认 urllib 默认的 User-Agent（error 1010），随便带一个自己的
+    req = urllib.request.Request(OPENCODE_URL, headers={"Authorization": f"Bearer {_opencode_key()}",
+                                                       "User-Agent": "mh-quota/0.1"})
+    try:
+        raw = urllib.request.urlopen(req, timeout=30).read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"OpenCode Go 额度接口返回 {e.code}：{e.read()[:300].decode('utf-8', 'replace')}") from e
+    return _opencode_usage(json.loads(raw))
+
+
+def opencode_go(fetch=None):
+    """读一次 OpenCode Go 的额度。fetch：测试替换。"""
+    return (fetch or _opencode_fetch)()
+
+
+PROVIDERS = {"codex": codex, "claude": claude, "opencode-go": opencode_go}
 
 
 def read(names=None):
