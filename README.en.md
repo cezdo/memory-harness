@@ -90,7 +90,7 @@ They plug into hosts as MCP tools and also work from the command line: `mh evoke
 Under active development; mainly for Linux, Chinese-language conversations and local use.
 
 - **Working**: collection, observation, session records and topic lines, notebook delivery, MCP recall, traces and feedback, integrity checks.
-- **In progress**: automatic cognition from session records and topic lines, Atlas map rebuilding and unified scheduling. Per-turn association is recorded but not delivered; “no memory of this word” hints are delivered.
+- **In progress**: automatic cognition from session records and topic lines, Atlas map rebuilding and unified scheduling. Per-turn association is delivered according to the yorimichi width (0–3) the assistant records, and users can turn it off per session.
 
 The bundled Claude Code, Codex and dsh adapters are ready-to-use examples. To support another harness, write your own adapter following them.
 
