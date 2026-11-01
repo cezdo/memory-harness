@@ -2,6 +2,7 @@
 
 - Keep instance configuration, profiles, real conversations, runtime data and private Git history outside this repository.
 - Maintain README.md in Chinese and README.en.md as its English mirror.
+- Include privacy review in project checks and before publication. Follow the [review procedure](design/release/设计.md#项目检查与公开前审查), covering third-party identities, test data, full history and tags, Git metadata, other public surfaces, and post-cleanup verification.
 - Use synthetic fixtures and temporary instances. Run `python3 tools/test.py` after code changes.
 - Preserve source attribution and revision history. New interpretations supersede earlier records.
 - Update bundled prompts, patches and host resources when changing their callers.

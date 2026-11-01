@@ -2,7 +2,7 @@
   "format": 1,
   "files": {
     ".gitignore": "d0b2ff85a81c68b969ec1e64ba7573c9572fe42dd94f652f6aba8a7ccf9a3dff",
-    "AGENTS.md": "9e97906e58422cb4fea680061f67631c1096fcd66b86d3b5c077ce42c9d9ecb3",
+    "AGENTS.md": "c72173410a105c9280c44dbe3c5376b8530b1ae02211a4190a9b5f884cffc65e",
     "AGENTS.zh-CN.md": "c787ce628dca247ced88bd34ede703757afb0643a347bede83184ceb7d994a80",
     "LICENSE": "77fdba97e090782022a7b198ec34aedf554acadc1d0ff9c3b50397acafb4355a",
     "MANIFEST.in": "1f41be3a75b768a4a0649f6fe385195fd1e8363f823bdbbd869913c5e486ea3e",
@@ -20,7 +20,7 @@
     "design/global/使用.md": "860e27136c0d87ddb049170d3a4df8f69b4c2a8af09d041ac038cd7779f527ec",
     "design/global/设计.md": "890fc55a831cd6addb269d79fa0bde1ab31aba0c2bd7410c58a94f7be77a9c41",
     "design/global/词典.md": "1b4efe1ef613628423b2ff84a13adb12e935163dbb2cf6a348b6c0161196b234",
-    "design/release/设计.md": "62a024ff2b6105d09ea742c6ec189cec3898e488d70c4af1d9b46e572f59c175",
+    "design/release/设计.md": "38b94fd193d86bda3949d8920c546232f4821da6f59d07978e381acea7758129",
     "design/reply/设计.md": "778ac0e7f3b784dcfee61ed4064b0e5829358fb5fd090f5891aa8dc2c55317f8",
     "design/rhythm/设计.md": "fa907444b3ad37185e5b5bc64d1ba6f08d9e9ac5fe574af04d2a0ed4ff7770e7",
     "design/synapse/设计.md": "3adaa9818cc7a99a426ac7293d9ae2db2ca7ff53fa64745ac9e8a5beadff8b66",
