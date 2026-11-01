@@ -1,4 +1,4 @@
-"""〖〗回填（design/synapse/设计.md 足迹一节，runbook F2，2026-10-22）：“我”用到了记忆里的内容，就在正文里用〖〗标出那半句
+"""引用回填（11-01 前叫“〖〗回填”；design/synapse/设计.md 足迹一节，runbook F2，2026-10-22）：“我”用到了记忆里的内容，就在正文里用〖〗标出那半句
 （可以转述）。程序认出转述的是哪一条：
 1. 取出回复里〖〗中的内容（至少 MIN_CHARS 个字）；
 2. 候选是这段会话到这一轮结束为止给看到过的陈述（旧 J 2026-10-23 退役；evoke / search、relive / get、roam / map 和送达的联想；form 内部的检索、
@@ -165,7 +165,7 @@ def backfill(conn, judge=None, limit=200, now=None):
             recs = [cite(q, cands, texts, judge, L) for q in spans(reply)]
         except Exception as e:
             failed += 1
-            print(f"〖〗回填：轮次 {tid} 出错：{repr(e)[:200]}")
+            print(f"引用回填：轮次 {tid} 出错：{repr(e)[:200]}")
             continue
         linked = {}
         for r in recs:

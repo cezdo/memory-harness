@@ -44,21 +44,46 @@ def _clip(text):
     return f"{text[:keep]}\n…（中间省略 {len(text) - 2 * keep} 字）…\n{text[-keep:]}"
 
 
-def number(turn):
-    """返回 {编号: 原文段落} 以及可直接放进提示词的文本。"""
+def number(turn, marks=None):
+    """返回 {编号: 原文段落} 以及可直接放进提示词的文本。
+    extra：别的会话发来的消息（turn_detail.asides，2026-11-01）：排在 U 后面，每条前面写明是谁、不是用户的话；
+    轮后发来的（after），“我”的回答 reply 排在 A 最后。marks 给一个 dict 时，把这些编号的说明写进去，
+    调用方按它渲染（原文段落本身不改，回溯还按原话找）。"""
     user = split(turn["user"])
     process = [b for c in turn["commentary"] for b in split(c)]
     final = split(turn["assistant"])
     table, lines = {}, []
-    for i, b in enumerate(user, 1):
-        table[f"U{i}"] = b
-        lines.append(f"[U{i}] {_clip(b)}")
+    n = 0
+    for b in user:
+        n += 1
+        table[f"U{n}"] = b
+        lines.append(f"[U{n}] {_clip(b)}")
+    replies = []
+    for x in turn.get("extra") or ():
+        mark = f"（{'这一轮结束之后' if x.get('after') else ''}{x['who']}发来消息，不是用户的话）"
+        for b in split(x["text"]):
+            n += 1
+            table[f"U{n}"] = b
+            lines.append(f"[U{n}] {mark}{_clip(b)}")
+            if marks is not None:
+                marks[f"U{n}"] = mark
+        if x.get("reply"):
+            replies.append((x["who"], x["reply"]))
     lines.append("")
     if turn.get("ending"):          # 中止、出错：没有最终回答（2026-10-11）
         lines.append("（这一轮没有正常结束，A 都是过程中的话）")
     elif process:
         lines.append(f"（A1–A{len(process)} 是过程中的话，A{len(process) + 1} 起是最终回答）")
+    i = 0
     for i, b in enumerate(process + final, 1):
         table[f"A{i}"] = b
         lines.append(f"[A{i}] {_clip(b)}")
+    for who, text in replies:
+        mark = f"（这一轮结束之后“我”对{who}的回答）"
+        for b in split(text):
+            i += 1
+            table[f"A{i}"] = b
+            lines.append(f"[A{i}] {mark}{_clip(b)}")
+            if marks is not None:
+                marks[f"A{i}"] = mark
     return table, "\n\n".join(lines)

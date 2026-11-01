@@ -85,7 +85,8 @@ def fold_line(t):
 
 
 def turn_line(t, folded=()):
-    """一轮在预览里的样子：用户的话（转来的长文本只给开头）和“我”这一轮的统计；folded：接在它下面的通知、压缩。"""
+    """一轮在预览里的样子：用户的话（转来的长文本只给开头）和“我”这一轮的统计；folded：接在它下面的通知、压缩。
+    别的会话发来的消息（label.asides）只写有几条、是谁，正文读的时候才给。"""
     user = label.user_text(t["user"])[0]
     tag = {"host": f"（宿主：{t['host_kind']}）", "script": "（脚本发起）"}.get(t["origin"], "")
     relay = relayed(t["user"])
@@ -97,7 +98,14 @@ def turn_line(t, folded=()):
     if folded:
         a, b = folded[0]["ordinal"] + 1, folded[-1]["ordinal"] + 1
         head += f"（连同第 {a} 轮）" if a == b else f"（连同第 {a}–{b} 轮）"
-    return "\n".join([head, f"{label.USER_NAME}：{user}", f"我这一轮：{_stat(t)}", *map(fold_line, folded)])
+    peers = []
+    for after, where in ((False, "这一轮中间夹着"), (True, "这一轮结束之后又有")):
+        xs = [a for a in label.asides(t) if bool(a.get("after")) == after]
+        if xs:
+            said = sum(len(a.get("reply") or "") for a in xs)
+            peers.append(f"（{where}{'、'.join(sorted({a['who'] for a in xs}))}发来的 {len(xs)} 条消息，不是{label.USER_NAME}的话"
+                         + (f"，我回了 {said} 字" if after else "") + "；读的时候附上）")
+    return "\n".join([head, f"{label.USER_NAME}：{user}", f"我这一轮：{_stat(t)}", *peers, *map(fold_line, folded)])
 
 
 JUDGE = re.compile(r"判断\s*[:：]\s*(.*)")

@@ -25,7 +25,8 @@ SERVICES = {
 # 只在某台机器上装的（点名才生成）：远端调用的服务端，跑在能跑 DshWeb 的 Linux 上（X2）；监听 QQ 协议端、回复（G7）
 EXTRA = {"memory-harness-invoke": (["engram", "serve"], "mh engram serve：远端调用，代跑精读的 dsh web"),
          "memory-harness-listen": (["engram", "listen"], "mh engram listen：监听 QQ 协议端，事件原样追加进数据目录（G7）"),
-         "memory-harness-reply": (["reply"], "mh reply：在一个群里被叫到时回几句（G7）")}
+         "memory-harness-reply": (["reply"], "mh reply：在一个群里被叫到时回几句（G7）"),
+         "memory-harness-show": (["rhythm", "--show"], "mh rhythm --show：展示自己的窗口，只读网页（N3）")}
 ALL = {**SERVICES, **EXTRA}
 # 循环要调的外部程序：服务的 PATH 由它们此刻所在的目录拼成（dsh 要 Node 24，系统自带的 node 可能太旧）
 TOOLS = ("node", "claude", "codex")

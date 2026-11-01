@@ -59,10 +59,12 @@ class StoreTest(unittest.TestCase):
         turns = {}
         for ses in ("a", "b"):
             sid = occurrence(c, "session", op)
-            c.execute("INSERT INTO session_detail VALUES(?,?,?,?,?,?,?,?,?)", (sid, "claude", ses, NA, "user", NA, "/w", NA, NA))
+            c.execute("INSERT INTO session_detail(occurrence,source,session,file,kind,parent,cwd,model,title)"
+                      " VALUES(?,?,?,?,?,?,?,?,?)", (sid, "claude", ses, NA, "user", NA, "/w", NA, NA))
             c.execute("INSERT INTO turn_text VALUES(?,?,?,?,?,?,?)", (f"t{ses}", "u", "a", "[]", "[]", "[]", st.now()))
             turns[ses] = occurrence(c, "turn", op, parent=sid)
-            c.execute("INSERT INTO turn_detail VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO turn_detail(occurrence,text,source,session,ordinal,closed,ending,prev,address,"
+                      "origin,host_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (turns[ses], f"t{ses}", "claude", ses, 0, 1, "normal", NA, "[]", "human", "chat"))
         act = occurrence(c, "act", op, inputs={"turn": [turns["a"]]}, outcome="ok")
         c.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved)"

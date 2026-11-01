@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS turn_detail(
   address TEXT NOT NULL,
   origin TEXT NOT NULL,           -- human | host | script | main（主会话，开关记录里的 yorimichi）：这一轮开头是谁
   host_kind TEXT NOT NULL,        -- notification | interrupt | command | compaction（origin = host 时）
+  asides TEXT NOT NULL DEFAULT '[]',   -- 别的会话发来、不成轮的消息 [{"who", "text"}，轮后的加 "after", "reply"]（2026-11-01）
   UNIQUE(source, session, ordinal));
 CREATE INDEX IF NOT EXISTS turn_detail_text ON turn_detail(text);
 CREATE TABLE IF NOT EXISTS collect_file(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL);
@@ -246,6 +247,10 @@ def _migrate(conn):
         if cols and "relations" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN relations TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(turn_detail)")]
+    if cols and "asides" not in cols:                  # 别的会话发来的消息（2026-11-01）
+        conn.execute("ALTER TABLE turn_detail ADD COLUMN asides TEXT NOT NULL DEFAULT '[]'")
+        conn.commit()
     cols = [r[1] for r in conn.execute("PRAGMA table_info(request_detail)")]
     if "target" in cols:
         if conn.execute("SELECT COUNT(*) FROM request_detail").fetchone()[0]:

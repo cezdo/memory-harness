@@ -28,6 +28,10 @@ quiet = []                                       # 不当“查不到的词”�
 # codex = "codex"                                # codex CLI 的路径（默认按 PATH 找）
 # dsh_test = "~/dsh-test"                        # dsh 测试实例（精读、粗读的 headless 模式）
 
+[vector]                                        # 检索面的向量一路（Synapse v0.33）：服务端是 mh/synapse/pull/vector_serve.py，跑在有 numpy 和 bge-m3 的机器上
+# url = "http://127.0.0.1:28082"                 # 不写就只有字面一路
+# key_file = "~/.config/memory-harness/vector.key"
+
 [invoke]                                        # 远端调用（mh engram serve）：只能在一台机器上跑的模型定义由它代跑
 # listen = "127.0.0.1:3090"                      # 服务端听哪里（默认只听本机）
 # token = ""                                     # 两边一样；不写就不开放
@@ -67,3 +71,16 @@ quiet = []                                       # 不当“查不到的词”�
 # core = "~/.config/memory-harness/core.md"         # 内核（手记里不变的那部分）；2026-10-24 前叫 standing
 # glossary = "~/.config/memory-harness/glossary.md"
 # workspace_status = "~/.config/memory-harness/workspace-status"
+
+[show]                                          # 展示自己的窗口（mh rhythm --show）：只读网页，打开时现编
+# listen = "127.0.0.1:3089"                     # 只听这个地址（例如 tailscale 的地址），由前面的 nginx 管登录
+# allow = ["127.0.0.1"]                         # 只放这些来源进来
+# local_model = "http://192.0.2.20:28080"       # 本地模型服务（看加载了哪个）；不写就不看
+# local_model_key = "~/.config/memory-harness/local-model.key"
+# local_model_status = "local_model.json"       # 占用记录（服务自己写）；不写就不看
+# dsh_port = 3080                               # 宿主 dsh 的端口（重启后看它在不在）
+# backup_unit = "dsh-backup.service"            # 每天备份的用户级 unit
+# chain = "协议端 → ssh 隧道 → listen 记、reply 回"   # QQ 那一格的一行说明
+# [[show.entries]]                              # 入口：name、url、note
+# [[show.hosts]]                                # 机器：name、note；写了 os（linux / mac / windows）的会被量占用，别的机器加 ssh 别名
+# [[show.paths]]                                # 东西都在哪：name、path、note

@@ -2,6 +2,7 @@
 数据照 form 的测试造（假模型），旧系统导入的 J 手写一条。python3 -m unittest mh.synapse.pull.test
 """
 import json
+import re
 
 from ...engram import store as st
 from ...engram.form import test as ft
@@ -89,8 +90,10 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
     def test_search_get_layers(self):
         text = pull.evoke(self.conn, ["X 升级"], **self.kw)
         self.assertIn("T1 X 升级", text)
-        self.assertIn("- L1 X 升级（1 个话题", text)
+        self.assertNotIn("- L1 X 升级（1 个话题", text)                   # v0.32：S、T 只给话题和陈述，线要 grain=L
+        self.assertIn("- L1 X 升级（1 个话题", pull.evoke(self.conn, ["X 升级"], grain="L", **dict(self.kw, session="t9")))
         self.assertNotIn("往下", text)                                  # 只给主要内容，不带说明
+        self.assertIn("〖〗", text)                                      # v0.31：结果末尾提醒用到就标半句，引用回填靠它连回
         u = self._uses()[-1]
         self.assertEqual((u["channel"], u["mode"]), ("pull", "evoke"))
         born = self.conn.execute("SELECT born FROM session_entry WHERE id=1").fetchone()[0]
@@ -200,16 +203,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual(self._uses()[-1]["mode"], "roam")
 
     def test_paging(self):
-        """v0.14：一页话题和线、陈述各占一半，不够的让给另一路；按页模拟不重不漏；条数固定、只翻页；截断写出下一页（v0.16 旧 J 退役，不再分名额）。"""
-        rem = {"node": list(range(10)), "stmt": list(range(100, 110))}
-        self.assertEqual(pull._alloc(rem, 8), {"node": 4, "stmt": 4})
-        self.assertEqual(pull._alloc({"node": [1], "stmt": list(range(20))}, 8), {"node": 1, "stmt": 7})
-        seen = []
-        for _ in range(5):
-            take = pull._alloc(rem, 8)
-            seen += rem["node"][:take["node"]] + rem["stmt"][:take["stmt"]]
-            rem = {k: rem[k][take[k]:] for k in rem}
-        self.assertEqual(sorted(seen), list(range(10)) + list(range(100, 110)))
+        """v0.14：relive、roam 条数固定、只翻页；截断写出下一页（evoke 的一半一半 v0.32 去掉：陈述和话题按同时含几个词排在一起）。"""
         self.assertEqual(pull.paging(0), (pull.SHOW, 1))
         self.assertEqual(pull.paging("x"), (pull.SHOW, 1))
         self.assertEqual(pull.paging(3), (pull.SHOW, 3))
@@ -315,11 +309,75 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_evoke_fit(self):
         """v0.17：一页至少 6 条，字数够的话加到 8 条，超过 EVOKE_CHARS 就停；结果不够 6 条的全给。"""
-        rem = {"node": list(range(10)), "stmt": list(range(100, 110))}
-        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 10).values()), 8)
-        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 300).values()), 6)
-        self.assertEqual(sum(pull._fit(rem, lambda k, x: "x" * 110).values()), 7)
-        self.assertEqual(pull._fit({"node": [1], "stmt": [2, 3]}, lambda k, x: "x"), {"node": 1, "stmt": 2})
+        items = list(range(20))
+        self.assertEqual(pull._fit(items, lambda x: "x" * 10), 8)
+        self.assertEqual(pull._fit(items, lambda x: "x" * 300), 6)
+        self.assertEqual(pull._fit(items, lambda x: "x" * 110), 7)
+        self.assertEqual(pull._fit([1, 2, 3], lambda x: "x"), 3)
+
+    def test_evoke_tail(self):
+        """v0.31：只沾到一个词的不报个数——那是底数，不是还能读的结果（dsh 看到一千多条就丢下不用）；v0.32：几个词时按同时含几个词报。"""
+        self.assertEqual(pull._tail(0, [], [1, 1, 1], 1, "话题"), "（还有 3 个话题：再 evoke 就接着往下）")
+        self.assertEqual(pull._tail(0, [], [1] * pull.MORE_CAP, 1, "话题"), "（还有 16 个话题：再 evoke 就接着往下）")
+        self.assertEqual(pull._tail(0, [], [1] * 1855, 1, "话题"), "（再 evoke 就是接着往下）")
+        self.assertEqual(pull._tail(0, [], [3, 2, 2] + [1] * 900, 4, "话题"),
+                         "（往下：含 3 个词的 1 个、含 2 个词的 2 个，其余只沾到一个词或意思相近；再 evoke 就接着往下）")
+        self.assertNotIn("900", pull._tail(0, [], [1] * 900, 4, "话题"))
+        self.assertEqual(pull._tail(7, ["L1", "L2"], [], 2, "话题"), "（这一轮前面给过的 7 条不再列，其中这次也排在前面的：L1、L2）")
+        self.assertEqual(pull._tail(0, [], [], 2, "话题"), "")
+
+    def test_evoke_terms(self):
+        """v0.32：查词按空白切成词，每个词单独认；英文按整词（at 不算 format 里的），汉字按去掉空白的子串。"""
+        from . import retrieve
+        self.assertEqual(retrieve.terms(["vps 代理", "VPS", "mihomo", " 代理 "]), ["vps", "代理", "mihomo"])
+        f = retrieve.finder("at")
+        self.assertFalse(f(retrieve.plain("format 和 Status")))
+        self.assertTrue(f(retrieve.plain("被 @ 时（at）回")))
+        self.assertTrue(retrieve.finder("外接键盘")(retrieve.plain("接上 外接 键盘")))
+        self.assertTrue(retrieve.finder("ds·")(retrieve.plain("例如「ds·Deepseek」")))
+
+    def test_evoke_head(self):
+        """v0.32：页头说同时含全部词的有几个；一个没有就说去掉哪个词有几个（查得太严时给个松开的方向）；没命中、太常见的也说。"""
+        ts = ["QQ", "主动", "接话"]
+        cover = {"T1": frozenset({0, 1}), "T2": frozenset({0, 1}), "T3": frozenset({0, 2}), "T4": frozenset({0})}
+        self.assertEqual(pull._evoke_head(ts, cover, [], [], "话题"),
+                         "（没有同时含全部 3 个词的话题：去掉「接话」有 2 个，去掉「主动」有 1 个）")
+        cover["T5"] = frozenset({0, 1, 2})
+        self.assertEqual(pull._evoke_head(ts, cover, [], [], "话题"), "（同时含全部 3 个词的话题 1 个）")
+        self.assertEqual(pull._evoke_head(["QQ", "甲乙"], {"T1": frozenset({0})}, [], ["甲乙"], "话题"),
+                         "（没有同时含全部 2 个词的话题：去掉「甲乙」有 1 个；字面没有命中：「甲乙」）")
+        self.assertEqual(pull._evoke_head(["QQ"], {"T1": frozenset({0})}, [], [], "话题"), "")
+
+    def test_evoke_vector(self):
+        """v0.33：向量一路和字面按 RRF 合并，只有向量认得出的话题写“意思相近”；向量用不了（None）和以前一样；临时库不开向量。"""
+        from . import vector
+        L = pull.layers(self.conn)
+        self.assertFalse(vector._main_db(self.conn))                    # 测试的临时库：不同步、不查
+        self.assertIsNone(vector.topics(L, "X 升级"))
+        self.assertEqual(pull._rrf(["a", "b", "c"], ["c", "d"]), ["c", "a", "b", "d"])
+        plain = body(pull.evoke(self.conn, ["甲服务"], **dict(self.kw, session="v1")))
+        real = vector.topics
+        try:
+            vector.topics = lambda L, text, kinds=("entry",): ["T1"]
+            self.assertEqual(body(pull.evoke(self.conn, ["甲服务"], **dict(self.kw, session="v2"))), plain)   # 字面也认得出：和以前一样
+            vector.topics = lambda L, text, kinds=("entry",): ["T1"]
+            got = body(pull.evoke(self.conn, ["完全不相干的说法"], **dict(self.kw, session="v3")))
+            self.assertIn("L1:T1 X 升级", got)
+            self.assertIn("意思相近", got)
+        finally:
+            vector.topics = real
+
+    def test_evoke_cited(self):
+        """v0.32：每行标被〖〗引用过几次（只看引用回填，evoke 给看到不作数）；被新版本取代的回填不算。"""
+        L = pull.layers(self.conn)
+        sid = L.by_h["L1:T1:S1"]
+        kw = dict(session="t", purpose="dev", channel="track")
+        old = track.use(self.conn, pull.VERSION, "cite", {}, "", {"turn": [1], "form_record": [sid]}, **kw)
+        track.use(self.conn, pull.VERSION, "cite", {}, "", {"turn": [1], "form_record": [sid], "use": [old]}, **kw)
+        track.use(self.conn, pull.VERSION, "cite", {}, "", {"turn": [2], "form_record": [sid]}, **kw)
+        self.assertEqual(pull._cited(self.conn, L)[sid], 2)
+        self.assertEqual(pull._cited(self.conn, L)["T1"], 2)
+        self.assertIn("引用过 2 次", pull.evoke(self.conn, ["甲服务"], **dict(self.kw, session="t8")))
 
     def test_evoke_round(self):
         """v0.17：同一轮前面 evoke 给过的不再列，再查同样的词就是接着往下；联想推送（新的一轮）以后重新给；别的会话不受影响。"""
@@ -328,7 +386,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         again = body(pull.evoke(self.conn, ["X 升级"], **self.kw))
         self.assertTrue(again.startswith("这一轮前面已经都给过了"), again)
         self.assertIn("排在前面的：L1", again)                               # 这次也相关的附句柄
-        self.assertEqual(json.loads(self._uses()[-1]["query"])["skipped"], first.count("\n- ") + 1)
+        self.assertEqual(json.loads(self._uses()[-1]["query"])["skipped"], len(re.findall(r"^- ", first, re.M)))
         self.assertIn("X 升级", pull.evoke(self.conn, ["X 升级"], **dict(self.kw, session="t2")))
         track.use(self.conn, pull.VERSION, "associate", {"associate": {"prompt": "下一句"}}, "", {}, session="t",
                   purpose="prefetch", channel="push")
@@ -400,13 +458,15 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertNotIn("发生的输入指向", str(report))
 
     def test_associate(self):
-        from ..push import pos
+        from unittest.mock import patch
+        from ..push import pos, yorimichi
         from ..push import associate
         real = pos.tag
         pos.tag = lambda texts, timeout=5: [[("甲服务", "nz", 2, "SBV"), ("当时", "nt", 3, "ADV"), ("怎么", "r", 3, "ADV"),
                                              ("升级", "v", 0, "HED"), ("来着", "u", 4, "RAD")]]
         try:
-            got = associate.associate(self.conn, "甲服务当时怎么升级来着", session="t", cwd="/w")
+            with patch.object(yorimichi, "state", return_value={"width": 0}):     # 只记录的样子；送达按宽度另有测试
+                got = associate.associate(self.conn, "甲服务当时怎么升级来着", session="t", cwd="/w")
         finally:
             pos.tag = real
         self.assertTrue(got[1].startswith("[Souhatsu] 只记录，未推送 · Yorimichi 0\n1> "))      # 只记录：给用户看的是带序号的话题，没有附加上下文

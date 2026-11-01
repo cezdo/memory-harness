@@ -159,14 +159,30 @@ def _ending(row):
 
 
 def turn_blocks(row, extra=()):
-    """一轮的全文，段落编号前面加轮号（3:A2）。extra：附在这一轮开头说明里的行（粗读的读写文件）。返回 (段落表, 文本)。"""
+    """一轮的全文，段落编号前面加轮号（3:A2）。extra：附在这一轮开头说明里的行（粗读的读写文件）。
+    别的会话发来的消息（label.asides，2026-11-01）排在 U 后面，轮后那几条的回答排在 A 最后，开头说明写明是谁、排在哪。
+    返回 (段落表, 文本)。"""
     n = row["ordinal"] + 1
+    marks, asides = {}, label.asides(row)
     table, _ = blocks.number({"user": label.user_text(row["user"])[0], "assistant": row["assistant"],
-                              "commentary": json.loads(row["commentary"]), "ending": _ending(row)})
-    lines = [f"[{n}:{k}] {blocks._clip(v) if len(v) > blocks.BLOCK_CAP else v}" for k, v in table.items()]
+                              "commentary": json.loads(row["commentary"]), "ending": _ending(row), "extra": asides}, marks)
+    lines = [f"[{n}:{k}] {marks.get(k, '')}{blocks._clip(v) if len(v) > blocks.BLOCK_CAP else v}" for k, v in table.items()]
     notes = label.notes(row["user"], row["assistant"], row["closed"], None, False, _ending(row))
     if label.relayed(row["user"]) is not None:
         notes.append(f"这一轮{label.USER_NAME}贴了一段转来的长文本：带 Markdown 结构的那部分不是{label.USER_NAME}自己写的。")
+    at = lambda keep: "、".join(k for k in table if k in marks and keep(marks[k]))
+    names = lambda xs: "、".join(sorted({a["who"] for a in xs}))
+    inside = [a for a in asides if not a.get("after")]
+    later = [a for a in asides if a.get("after")]
+    if inside:
+        notes.append(f"这一轮中间夹着{names(inside)}发来的 {len(inside)} 条消息，排在 "
+                     f"{at(lambda m: '发来消息' in m and '结束之后' not in m)}，不是{label.USER_NAME}的话；"
+                     f"紧接着的“我”的回复是对它们的回答。")
+    if later:
+        replied = at(lambda m: "的回答" in m)
+        notes.append(f"这一轮结束之后，{names(later)}又发来 {len(later)} 条消息，排在 "
+                     f"{at(lambda m: '发来消息' in m and '结束之后' in m)}，不是{label.USER_NAME}的话"
+                     + (f"；“我”对它们的回答排在 {replied}" if replied else "；“我”没有用文字回答") + "。")
     notes += list(extra)
     return table, f"## 第 {n} 轮" + ("\n" + "\n".join(notes) if notes else "") + "\n" + "\n\n".join(lines)
 

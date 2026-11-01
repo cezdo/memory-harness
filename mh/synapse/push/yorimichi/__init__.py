@@ -2,10 +2,10 @@
 只在阶段变了的时候经 MCP 工具 `yorimichi` 改一次；联想的钩子每轮读它，决定给不给、给几条。
 
 - width 0：在一个点上深挖，不给联想；1–3：在发散、轻松地聊，给几条。
-- 按会话，最后一次说了算；没说过就是 0（宁可少给）。用户的 `/no-souhatsu`（push/switch）优先：关了就不联想。
+- 按会话，最后一次说了算；没说过是 DEFAULT（1，用户 2026-11-02；10-28 起原来是 0，宁可少给）。用户的 `/no-souhatsu`（push/switch）优先：关了就不联想。
 - 记录追加到数据目录的 yorimichi.jsonl：时间、宿主、会话 ID、条数、理由。读状态就是找这个会话最后一行（每轮要最新的）；
   观察循环的采集把它收成 turn 进库（observe 的 switch 来源，origin 是 main，即“我”；2026-10-30 runbook N3）。
-- 读不到、写不进都不挡对话：读不到当 0。
+- 读不到、写不进都不挡对话：读不到当 DEFAULT；没有会话号的（隔离的实验）当 0。
 - 记下以后回给“我”现在的实情（2026-10-30）：送达还关着（联想的 DELIVER 是空的）就说这次只记下判断；用户关了这个会话的联想
   也说一声。“我”这边不另设联想开关：对“我”来说 0 就是关，用户的开关优先。
 - 一段对话一直没判过的，联想在第 NUDGE_AT 句用户的话时提醒“我”一次（push/associate 的 nudge）。
@@ -17,6 +17,7 @@ from ....engram.store import HOME
 
 LOG = HOME / "yorimichi.jsonl"
 WIDTH_MAX = 3
+DEFAULT = 1          # 没判过的对话给几条（用户 2026-11-02 改成 1；之前是 0）
 
 
 def check(width):
@@ -31,10 +32,10 @@ def check(width):
 
 
 def state(session, log=None):
-    """这个会话现在的 → {"width"}（还有 time、why，说过的话）。没有会话号、没说过、读不到都是 0。"""
-    got = {"width": 0}
+    """这个会话现在的 → {"width"}（还有 time、why，说过的话）。没说过、读不到是 DEFAULT；没有会话号是 0。"""
     if not session:
-        return got
+        return {"width": 0}
+    got = {"width": DEFAULT}
     try:
         with open(log or LOG, encoding="utf-8") as f:
             for line in f:

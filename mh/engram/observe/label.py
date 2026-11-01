@@ -85,6 +85,15 @@ def user_text(user, compaction=True):
     return condense(text, compaction).strip(), notes
 
 
+def asides(row):
+    """别的会话发来、不成轮的消息（turn_detail.asides，采集时由程序认出）：[{"who", "text"}，轮后的加 "after", "reply"]。"""
+    try:
+        v = row["asides"]
+    except (KeyError, IndexError):
+        return []
+    return json.loads(v) if isinstance(v, str) else list(v or [])
+
+
 def environment(row, model):
     """输入里的“环境”一节：对话平台、工作目录、当时的“我”、回看的“我”（总设计“我是谁”的两层环境）。"""
     unknown = lambda v: not v or str(v).startswith("?")

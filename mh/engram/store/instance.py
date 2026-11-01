@@ -44,6 +44,8 @@ CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # dsh 更新测试实例（精读、粗读用）
 INVOKE = _D.get("invoke", {})                            # 远端调用：listen、token、remote（invoke/serve.py）
 LISTEN = _D.get("listen", {})                            # 监听 QQ 协议端：ssh、remote、local、token_file（observe/listen.py）
+SHOW = _D.get("show", {})                                # 展示自己的窗口：listen、allow、local_model、入口、机器、路径（rhythm/show）
+VECTOR = _D.get("vector", {})                            # 检索面的向量一路：url、key_file（synapse/pull/vector.py）；没配就只有字面
 
 
 def resource(name, development, filename):

@@ -124,6 +124,32 @@ def tokens(text):
     return out
 
 
+def terms(words):
+    """evoke 的查词 → 词（v0.32）：每个查词按空白切开，每一段单独算一个词；归一后去重，保留原样给人看。"""
+    out, seen = [], set()
+    for w in words:
+        for p in str(w).split():
+            if norm(p) and norm(p) not in seen:
+                seen.add(norm(p))
+                out.append(p)
+    return out
+
+
+def plain(text):
+    """给 finder 认的文本：小写（英文按整词认），和去掉空白的小写（汉字按子串认）。"""
+    low = (text or "").lower()
+    return low, re.sub(r"\s", "", low)
+
+
+def finder(term):
+    """一个词在文本（plain 的结果）里在不在：英文、数字按整词认（at 不算 format 里的），别的按去掉空白后的子串认（v0.32）。"""
+    k = norm(term)
+    if re.fullmatch(r"[a-z0-9._\-]+", k):
+        pat = re.compile(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])")
+        return lambda t: bool(pat.search(t[0]))
+    return lambda t: k in t[1]
+
+
 def doc(entry):
     return " ".join([entry["name"], entry.get("topic", "")] + [a for items in entry["words"]["lists"] for a in items]
                     + list(entry.get("stops", [])))

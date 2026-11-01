@@ -292,6 +292,39 @@ class CluesTest(unittest.TestCase):
         self.assertNotRegex(got, r"[，。；、：,.;:]……$")
 
 
+class DenseTest(unittest.TestCase):
+    """向量一路（2026-11-02）：交替合并；候选去掉这段对话出现过的、在上下文里的、同一段会话自己写出的；用不了是 None。"""
+
+    def setUp(self):
+        mk = lambda t, i, sess, text: {"h": f"L1:T{t}:S{i}", "name": "甲", "text": text, "anchor": "", "entry": f"T{t}",
+                                       "session": f"('dsh', '{sess}')"}
+        self.idx = SimpleNamespace(k={("s", 1): mk(1, 1, "a", "配色方案定了"), ("s", 2): mk(2, 1, "b", "本段会话写的"),
+                                      ("s", 3): mk(3, 1, "a", "已经出现过"), ("s", 4): mk(4, 1, "a", "上下文里原样有这句话呢")})
+
+    def test_alternate(self):
+        self.assertEqual(a.alternate([1, 2, 3], [2, 4]), [1, 2, 4, 3])
+        self.assertEqual(a.alternate([], [5, 6]), [5, 6])
+
+    def test_dense_filters(self):
+        from ..pull import vector
+        hits = [("s:1", 0.7), ("s:2", 0.69), ("s:3", 0.68), ("s:4", 0.67), ("s:99", 0.66), ("n:T1", 0.6)]
+        nc = a._norm("上下文里原样有这句话呢")
+        grams = {nc[i:i + a.COVER_N] for i in range(len(nc) - a.COVER_N + 1)}
+        with patch.object(vector, "search", lambda conn, q, k: hits):
+            got = a.dense(None, self.idx, "配色", "b", {("s", 3)}, grams)
+        self.assertEqual(got, [(("s", 1), 0.7)])
+        with patch.object(vector, "search", lambda conn, q, k: None):
+            self.assertIsNone(a.dense(None, self.idx, "配色", "b", set(), set()))
+
+    def test_subject(self):
+        import sqlite3
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE session_detail(session TEXT, title TEXT)")
+        c.execute("INSERT INTO session_detail VALUES('x', '提升QQ对话积极性')")
+        self.assertEqual(a.subject(c, "x", "改了 mh/reply/__init__.py 和 design/reply/设计.md"), "提升QQ对话积极性｜设计.md __init__.py")
+        self.assertEqual(a.subject(c, "y", ""), "")
+
+
 class SwitchTest(unittest.TestCase):
     """联想开关：整句命令、按会话最后一次说了算、拦法；关了以后联想不做、“查不到的词”照旧。"""
 
@@ -368,16 +401,17 @@ class MissingNamesTest(unittest.TestCase):
 
 
 class YorimichiTest(unittest.TestCase):
-    """yorimichi：按会话最后一次说了算，默认 0；0 不送达，1–3 按条数截；给用户看的标题带上它。"""
+    """yorimichi：按会话最后一次说了算，默认 1；0 不送达，1–3 按条数截；给用户看的标题带上它。"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.log = Path(self.tmp.name) / 'yorimichi.jsonl'
 
-    def test_last_one_wins_default_zero(self):
+    def test_last_one_wins_default_one(self):
         from . import yorimichi as y
-        self.assertEqual(y.state('s', self.log)['width'], 0)                             # 没说过：深挖，宁可少给
+        self.assertEqual(y.state('s', self.log)['width'], 1)                             # 没说过：给 1 条（用户 2026-11-02，之前是 0）
+        self.assertNotIn('time', y.state('s', self.log))                                 # 默认值不算判过：第 3 句照旧提醒
         y.record('s', 2, '在闲聊', log=self.log)
         y.record('t', 0, log=self.log)
         self.assertEqual(y.state('s', self.log)['width'], 2)

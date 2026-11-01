@@ -28,9 +28,9 @@ from collections import Counter, defaultdict
 from ...engram import form, observe, show
 from ...engram.store import absent
 from .. import track
-from . import retrieve
+from . import retrieve, vector
 
-VERSION = "v0.30"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.34"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -52,10 +52,18 @@ VERSION = "v0.30"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.28 联想重开送达：按 yorimichi 的数值，0 不送，1–3 截到这么多个话题（用户 2026-10-30）
                          # v0.29 联想送达的片段按条数放长（1/2/3 条一共 300/400/500 字，放得下给整条），片段带陈述句柄（用户 2026-10-30）
                          # v0.30 MCP 加 observe-now：“我”让观察现在读掉尾巴，只读不开，记成申请，用户关了的拒绝（用户 2026-10-30）
+                         # v0.31 evoke 的页脚不再报底数：剩下的超过两页（MORE_CAP）就只说接着往下，不写“还有 1135 条”（2026-11-01，dsh 看到
+                         # 一千多条就丢下不用）；结果末尾提醒用到就标〖〗（引用回填靠它连回）
+                         # v0.32 evoke 多词有“且”：每个词单独认，话题按同一处同时含几个词分层，结果多时只给话题；页头说去掉哪个词有几个，
+                         # 页脚按层报往下还有的；每行标被〖〗引用过几次（用户 2026-11-01）
+                         # v0.33 evoke 加向量一路（检索面按 RAG，用户 2026-11-02）：bge-m3 在向量服务上，和字面按 RRF 合并；连不上只用字面
+                         # v0.34 联想也双轨（用户 2026-11-02）：送不送照旧由字面的档定，送什么字面、向量交替；双轨一致、没有词段时的向量只记
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
 EVOKE_CHARS = 800        # 超过 6 条时一页最多多少字：近期 8 条满页的中位约 800 字（10-27 量的）
+MORE_CAP = 16            # 页脚最多报多少条剩下的（两页）：再多就不报数字，只说接着往下（v0.31，2026-11-01）
+CITE = "（用到其中的内容，就在正文里用〖〗标出那半句：引用回填靠它连回是哪条。）"
 GRAINS = {"L": ("line", "node"), "T": ("line", "node", "entry"), "S": ("line", "node", "entry")}   # evoke 最小给到哪一层（v0.14）
 K1, B = 1.5, 0.75
 OLD_NODE = re.compile(r"(D\d+G\d+|D\d+|O:.+|M\d{4}-\d{2}(-\d{2})?)")   # 旧地图的节点编号（旧的主题 T47 和新的话题同形，按话题认）
@@ -194,6 +202,12 @@ class Layers:
     @functools.cached_property
     def stmt_index(self):
         return Index({sid: s["text"] for sid, s in self.stmts.items()})
+
+    @functools.cached_property
+    def plain(self):
+        """evoke 按词认的文本（v0.32）：陈述的正文；话题、线、骨架的名字、主题、索引词、停在。"""
+        return {"stmt": {sid: retrieve.plain(s["text"]) for sid, s in self.stmts.items()},
+                "node": {nid: retrieve.plain(retrieve.doc(n)) for nid, n in self.nodes.items() if not n.get("retired")}}
 
 
 
@@ -769,17 +783,6 @@ def query_workspace(conn, session, cwd):
     return session_workspace(rows[0][0], session, rows[0][1]) if len(rows) == 1 else workspace(cwd)
 
 
-def _alloc(rem, n):
-    """一页 n 条怎么分（v0.14 把 v0.13 的 8 条按比例推开）：话题和线、陈述各先占一半，哪一路不够就让给别的。"""
-    take = {"node": min((n + 1) // 2, len(rem["node"])), "stmt": min(n // 2, len(rem["stmt"]))}
-    spare = n - sum(take.values())
-    for k in ("node", "stmt"):                         # 让出来的名额按顺序补给还有剩的
-        more = min(spare, len(rem[k]) - take[k])
-        take[k] += more
-        spare -= more
-    return take
-
-
 def seen_this_round(conn, session):
     """这一轮前面的 evoke 已经给看过的（v0.17）。一轮从这段会话最近一次联想推送算起（用户每说一句，宿主的钩子写一次）；
     这段会话没有推送的（没挂钩子，如隔离的实验），整段会话算一轮。没有会话编号认不出轮，不去重。"""
@@ -800,59 +803,207 @@ def _round_metas(conn, session, mode):
                                                    "AND d.mode=? AND d.occurrence>? ORDER BY d.occurrence", [*args, mode, start])]
 
 
-def _fit(rem, line):
-    """一页几条（v0.17）：至少 EVOKE_PAGE[0] 条，再往上加到 EVOKE_PAGE[1]，字数超过 EVOKE_CHARS 就停。每个条数都按 _alloc 分。"""
-    best = None
-    for n in range(EVOKE_PAGE[0], EVOKE_PAGE[1] + 1):
-        take = _alloc(rem, n)
-        if best is not None and (take == best or sum(len(line(k, x)) for k in rem for x in rem[k][:take[k]]) > EVOKE_CHARS):
-            break
-        best = take
-    return best
+def _fit(items, line):
+    """一页几条（v0.17）：至少 EVOKE_PAGE[0] 条，再往上加到 EVOKE_PAGE[1]，字数超过 EVOKE_CHARS 就停。"""
+    n = min(EVOKE_PAGE[0], len(items))
+    while n < min(EVOKE_PAGE[1], len(items)) and sum(len(line(x)) for x in items[:n + 1]) <= EVOKE_CHARS:
+        n += 1
+    return n
+
+
+def _cover(L, ts, kinds, big=()):
+    """每个词在哪里（v0.32）。返回 (节点 → 同时含的词, 陈述 → 自己含的词)。big：几乎处处都有的词（第几个），只在名字、索引词里认，
+    不在陈述里认（同 v0.12 起的大词：它在正文里到处都是，认了等于没认；名字、索引词里有它还是有意义的）。
+    节点含的词按“同一处同时出现”算：话题取它自己（名字、主题、索引词、停在）加上它的任一条陈述，取含得最多的那一条；
+    线、骨架取自己，线再和它下面的话题比，取多的。不把一个话题的几条陈述并起来：大话题不该因为陈述多就像是“都含”。"""
+    fs = [retrieve.finder(t) for t in ts]
+    hit = lambda t, skip=(): frozenset(i for i, f in enumerate(fs) if i not in skip and f(t))
+    own = {nid: h for nid, t in L.plain["node"].items() if (h := hit(t))}
+    sown = {sid: h for sid, t in L.plain["stmt"].items() if (h := hit(t, big))}
+    cover = dict(own)
+    for sid, h in sown.items():
+        e = L.stmts[sid]["entry"]
+        both = h | own.get(e, frozenset())
+        if len(both) > len(cover.get(e, ())):
+            cover[e] = both
+    for nid, h in list(cover.items()):
+        n = L.nodes[nid]
+        if n["kind"] == "entry" and n["parent"] in L.nodes and not L.nodes[n["parent"]].get("retired"):
+            up = h | own.get(n["parent"], frozenset())
+            if len(up) > len(cover.get(n["parent"], ())):
+                cover[n["parent"]] = up
+    return {k: v for k, v in cover.items() if L.nodes[k]["kind"] in kinds and not L.nodes[k].get("retired")}, sown
+
+
+def _cited(conn, L):
+    """被〖〗引用过几次（v0.32，用户 2026-11-01：只看引用，evoke 给看到不作数）：按引用回填（track / cite）连上的陈述、话题数轮次，
+    被新版本取代的回填不算。话题算它自己和它下面陈述的，线再加上它下面的话题。"""
+    rows = conn.execute("SELECT o.id, o.inputs, d.meta FROM use_detail d JOIN occurrence o ON o.id=d.occurrence "
+                        "WHERE d.channel='track' AND d.mode='cite'").fetchall()
+    rows = [(r[0], json.loads(r[1]), json.loads(r[2] or "{}")) for r in rows]
+    gone = {u for _, inp, _ in rows for u in inp.get("use", [])}
+    turns = defaultdict(set)
+    for oid, inp, meta in rows:
+        if oid in gone:
+            continue
+        turn = tuple(inp.get("turn", [oid]))
+        for rid in inp.get("form_record", []):
+            sid = rid if rid in L.stmts else L.under.get(rid)
+            if sid in L.stmts:
+                turns[sid].add(turn)
+                turns[L.stmts[sid]["entry"]].add(turn)
+        for x in (meta.get("handles") or {}).get("session_entry", []):
+            if f"T{x}" in L.nodes:
+                turns[f"T{x}"].add(turn)
+    for k in [k for k in turns if k in L.nodes and L.nodes[k]["kind"] == "entry"]:
+        if L.nodes[k]["parent"] in L.nodes:
+            turns[L.nodes[k]["parent"]] |= turns[k]
+    return {k: len(v) for k, v in turns.items()}
+
+
+def _tail(skipped, again, rest, n, unit):
+    """evoke 的页脚：这一轮前面给过的不再列；往下还有的按同时含几个词报（v0.32）。只沾到一个词的不报个数——
+    那是“沾到一个词”的底数，不是还能读的结果，报出来像“你只看到零头”（v0.31，2026-11-01，dsh 看到一千多条就丢下不用）。
+    rest：往下还有的，每个是它含几个词；n：一共几个词。"""
+    parts = []
+    if skipped:
+        parts.append(f"这一轮前面给过的 {skipped} 条不再列" + (f"，其中这次也排在前面的：{'、'.join(again)}" if again else ""))
+    if rest:
+        layers_ = Counter(k for k in rest if k >= 2) if n >= 2 else Counter()
+        if layers_:
+            parts.append("往下：" + "、".join(f"含 {k} 个词的 {layers_[k]} 个" for k in sorted(layers_, reverse=True))
+                         + ("，其余只沾到一个词或意思相近" if any(k < 2 for k in rest) else "") + "；再 evoke 就接着往下")
+        elif len(rest) <= MORE_CAP:
+            parts.append(f"还有 {len(rest)} 个{unit if n < 2 else '只沾到一个词的'}：再 evoke 就接着往下")
+        else:
+            parts.append("再 evoke 就是接着往下" + ("：往下只沾到一个词" if n >= 2 else ""))
+    return f"（{'；'.join(parts)}）" if parts else ""
+
+
+def _evoke_head(ts, cover, big, missing, unit):
+    """evoke 的页头（v0.32，用户 2026-11-01）：几个词时说同时含全部词的有几个；一个也没有，就说去掉哪个词有几个同时含其余的
+    （查得太严时给读的人一个松开的方向）；没命中的词、太常见不拿来查的词也说一声。只有一个词、什么都没有时不写。"""
+    n, out = len(ts), []
+    live = [i for i in range(n) if ts[i] not in big]
+    if len(live) >= 2 and cover:
+        full = sum(1 for h in cover.values() if set(live) <= h)
+        if full:
+            out.append(f"同时含全部 {len(live)} 个词的{unit} {full} 个")
+        else:
+            drops = sorted(((sum(1 for h in cover.values() if set(live) - {i} <= h), i) for i in live), key=lambda x: -x[0])
+            drops = [f"去掉「{ts[i]}」有 {c} 个" for c, i in drops if c][:3]
+            top = max(map(len, cover.values()))
+            out.append(f"没有同时含全部 {len(live)} 个词的{unit}" + (f"：{'，'.join(drops)}" if drops else f"，最多同时含 {top} 个"))
+    if missing:
+        out.append("字面没有命中：" + "、".join(f"「{w}」" for w in missing))
+    if big:
+        out.append("几乎处处都有、只按名字和索引词认：" + "、".join(f"「{w}」" for w in big))
+    return f"（{'；'.join(out)}）" if out else ""
+
+
+def _rrf(*orders, k=60, depth=200):
+    """几路排好的列表按名次合并（RRF，v0.33）：每路前 depth 名，分数 1 / (k + 名次) 相加。"""
+    score = Counter()
+    for o in orders:
+        for i, x in enumerate(o[:depth]):
+            score[x] += 1 / (k + i + 1)
+    rest = [x for o in orders for x in o[depth:] if x not in score]
+    return sorted(score, key=lambda x: -score[x]) + list(dict.fromkeys(rest))
 
 
 def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain=None, **_):
-    """按相关度排，一页 6–8 条（按字数定，_fit），按 _alloc 分给话题和线、陈述。同一轮前面 evoke 给过的不再列（seen_this_round），
-    所以同一轮再 evoke 同样的词就是接着往下看，不用翻页（v0.17，用户 2026-10-27：减少模型理解成本；v0.14 的 limit、page 去掉）。
-    略去的里面，不去重时本该出现在这一页的，页脚附上句柄。
-    grain：最小给到哪一层（v0.14，2026-10-22）：L 只给线和骨架，T 给到话题，S（默认）给到陈述。"""
+    """按词找（v0.32，用户 2026-11-01：多词要有“且”）：查词按空白切成词，每个词单独认（英文按整词）。
+    话题按“同一处同时含几个词”分层，含得多的在前；同层先比含的词有多稀有，再比陈述的 BM25（话题取它最高的那条陈述）。
+    陈述自己同时含两个词以上（只有一个词时含这个词）、而且这样的不超过一页，才列陈述，后面接话题；否则只列话题（结果多时
+    只给话题，用户 2026-11-01）。页头说同时含全部词的有几个，一个没有就说去掉哪个词有几个（_evoke_head）；页脚按层报往下还有的（_tail）。
+    一页 6–8 条按字数定（_fit）；同一轮前面 evoke 给过的不再列（seen_this_round），再 evoke 同样的词就是接着往下（v0.17）；
+    略去的里面，不去重时本该出现在这一页的，页脚附上句柄。每行标被〖〗引用过几次（_cited）。末尾提醒用到就标〖〗（v0.31）。
+    v0.33 加向量一路（vector.topics，算在向量服务上）：查词拼成一句找最像的陈述和话题，和字面的话题顺序按 RRF 合并；只有向量认得出的
+    话题行写“意思相近”。分层、页头、列陈述照旧按字面。
+    grain：最小给到哪一层（v0.14）：L 只给线和骨架，T 只给话题，S（默认）给到陈述。"""
     g = str(grain or "S").strip().upper()[:1]
     g = g if g in GRAINS else "S"
+    kinds, unit = (("line", "node"), "线") if g == "L" else (("entry",), "话题")
     L = layers(conn)
     ws = query_workspace(conn, session, cwd)
-    big = [w for w in words if L.corpus.share(w, ws) >= retrieve.UBIQUITOUS]   # 几乎处处都有的词：BM25 几路不拿它查（v0.12）；
-    # 索引词那一路照旧拿全部查词，大词（两成以上）由它自己处理
-    text_q = " ".join(w for w in words if w not in big)
-    hits = {"node": [nid for nid, _ in retrieve.search(words, text_q, {k: v for k, v in L.nodes.items() if not v.get("retired")}, ws, L.corpus, deep=True)
-                     if L.nodes[nid]["kind"] in GRAINS[g]],
-            "stmt": [sid for sid, _ in L.stmt_index.top(text_q, None)] if g == "S" else []}
+    ts = retrieve.terms(words)
+    bi = {i for i, t in enumerate(ts) if L.corpus.share(t, ws) >= retrieve.UBIQUITOUS}   # 几乎处处都有的词（v0.12 起）：只在名字、索引词里认
+    big = [ts[i] for i in sorted(bi)]
+    live = ts
+    cover, sown = _cover(L, ts, kinds, bi)
+    n = len(ts)
+    sbm = dict(L.stmt_index.top(" ".join(t for t in ts if t not in big), None))
+    bm = Counter()
+    for sid, s in sbm.items():
+        for k in (L.stmts[sid]["entry"], L.nodes.get(L.stmts[sid]["entry"], {}).get("parent")):
+            if k:
+                bm[k] = max(bm[k], s)
+    df = Counter(i for h in sown.values() for i in h)
+    idf = {i: 0.0 if i in bi else math.log(1 + len(L.stmts) / (1 + df[i])) for i in range(n)}
+    weight = lambda h: sum(idf[i] for i in h)
+    order = sorted(cover, key=lambda x: (-len(cover[x]), -weight(cover[x]), -bm[x]))
+    dense = vector.topics(L, " ".join(words), kinds)                # v0.33：向量一路（检索面按 RAG）；用不了是 None，只用字面
+    if dense:
+        order = _rrf(order, dense)
+    items = []
+    if g == "S" and sown:
+        ks = max(map(len, sown.values()))
+        best = [sid for sid, h in sown.items() if len(h) == ks]
+        if ks >= min(2, n) and len(best) <= EVOKE_PAGE[1]:
+            items = [("stmt", sid) for sid in sorted(best, key=lambda s: (-weight(sown[s]), -sbm.get(s, 0)))]
+    near = {L.stmts[x]["entry"] for _, x in items}
+    items += [("node", x) for x in order if x not in near]
+    cited = _cited(conn, L)
+    k_of = lambda it: len(sown[it[1]]) if it[0] == "stmt" else len(cover.get(it[1], ()))
+    key = lambda it: f"{'s' if it[0] == 'stmt' else 'n'}:{it[1]}"
     seen = seen_this_round(conn, session)
-    key = {"node": lambda x: f"n:{x}", "stmt": lambda x: f"s:{x}"}
-    rem = {k: [x for x in xs if key[k](x) not in seen] for k, xs in hits.items()}
-    skipped = sum(map(len, hits.values())) - sum(map(len, rem.values()))
-    line = lambda k, x: f"- {_node_line(L, x)}" if k == "node" else f"- {L.stmts[x]['h']} {L.stmts[x]['text']}"
+    rem = [it for it in items if key(it) not in seen]
+    skipped = len(items) - len(rem)
+
+    def line(it):
+        kind, x = it
+        c = cited.get(x, 0)
+        mark = f"引用过 {c} 次" if c else ""
+        if kind == "stmt":
+            return f"- {L.stmts[x]['h']} {L.stmts[x]['text']}" + (f"（{mark}）" if mark else "")
+        nd = L.nodes[x]
+        has = ("含 " + "、".join(live[i] for i in sorted(cover[x])) if n >= 2 else "") if x in cover else "意思相近"
+        extra = "；".join(filter(None, [has, mark]))
+        if nd["kind"] == "entry":
+            return f"- {L.where(x)} {nd['name']}（{_day(nd['date'])}，{len(nd.get('items', []))} 条陈述" + \
+                   (f"；{extra}" if extra else "") + f"）：{nd['topic']}"
+        return f"- {x} {nd['name']}（{_size(L, x) if nd['kind'] == 'line' else '骨架'}" + (f"；{extra}" if extra else "") + "）"
     take = _fit(rem, line)
-    top = _fit(hits, line) if skipped else {}           # 不去重时这一页会给的：其中前面给过的就是这次也相关的，附句柄（用户 2026-10-27）
-    again = [(L.stmts[x]["h"] if k == "stmt" else L.where(x) if L.nodes[x]["kind"] == "entry" else x) for k in top for x in hits[k][:top[k]] if key[k](x) in seen]
-    shown = {k: rem[k][:take[k]] for k in rem}
-    left = sum(len(rem[k]) - take[k] for k in rem)
+    shown, rest = rem[:take], rem[take:]
+    again = []
+    if skipped:                                         # 不去重时这一页会给的：其中前面给过的就是这次也相关的，附句柄（用户 2026-10-27）
+        top = items[:_fit(items, line)]
+        again = [(L.stmts[x]["h"] if k == "stmt" else L.where(x) if L.nodes[x]["kind"] == "entry" else x) for k, x in top if key((k, x)) in seen]
     out, ins = [], defaultdict(list)
-    for nid in shown["node"]:
-        out.append(line("node", nid))
-        nd = L.nodes[nid]
-        ins[INPUT_KIND[nd["kind"]]].append(nd.get("row", nid))
-    for x in shown["stmt"]:
-        out.append(line("stmt", x))
-        ins["form_record"].append(x)
-    if out and (left or skipped):
-        out.append("（" + "；".join(([f"这一轮前面给过的 {skipped} 条不再列" + (f"，其中这次也排在前面的：{'、'.join(again)}" if again else "")]
-                                     if skipped else []) +
-                                    ([f"还有 {left} 条：再 evoke 就接着往下"] if left else [])) + "）")
-    text = "\n".join(out) or (f"没有命中（查词都是几乎每段会话都有的词：{'、'.join(big)}；换个更具体的说法）。" if big and len(big) == len(words)
-                               else f"这一轮前面已经都给过了（{skipped} 条" + (f"，排在前面的：{'、'.join(again)}" if again else "") + "），往下没有了。" if skipped else "没有命中。")
+    head = _evoke_head(live, cover, big, [t for i, t in enumerate(live) if not any(i in h for h in cover.values())
+                                   and not any(i in h for h in sown.values())], unit) if live else ""
+    for it in shown:
+        out.append(line(it))
+        if it[0] == "stmt":
+            ins["form_record"].append(it[1])
+        else:
+            nd = L.nodes[it[1]]
+            ins[INPUT_KIND[nd["kind"]]].append(nd.get("row", it[1]))
+    if out:
+        out = ([head] if head else []) + out + [CITE]
+        tail = _tail(skipped, again, [k_of(it) for it in rest], n, unit)
+        if tail:
+            out.append(tail)
+    elif big and len(big) == n:
+        out = [f"没有命中（查词都是几乎每段会话都有的词：{'、'.join(big)}；换个更具体的说法）。"]
+    elif skipped:
+        out = [f"这一轮前面已经都给过了（{skipped} 条" + (f"，排在前面的：{'、'.join(again)}" if again else "") + "），往下没有了。"]
+    else:
+        out = ["没有命中。"]
+    text = "\n".join(out)
     query = {"words": list(words), **({"big": big} if big else {}), **({"skipped": skipped} if skipped else {}),
-             **({"grain": g} if g != "S" else {})}
-    evoked = [key[k](x) for k in shown for x in shown[k]]
+             **({"grain": g} if g != "S" else {}), **({"vector": "off"} if dense is None and vector.ENABLED else {})}
+    evoked = [key(it) for it in shown]
     text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note,
                          meta={"evoked": evoked} if evoked else None)
     return text

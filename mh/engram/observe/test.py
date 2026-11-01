@@ -84,6 +84,13 @@ def assert_live(test, conn):
     test.assertEqual(pending - cover, set(), "待观测却没有办法前进的轮")
 
 
+def peer_text(body="把包挪到 mh/engram。", name="迁移"):
+    """另一个会话发来的消息，形状照 Claude Code 2.1.29x 的会话文件。"""
+    return ("Another Claude session sent a message:\n"
+            f'<cross-session-message from="uds:/x" from-name="{name}" from-mode="prompting">{body}</cross-session-message>\n\n'
+            "This came from another Claude session — not typed by your user.")
+
+
 class FakeSource:
     def __init__(self, path, session, turns):
         self.path, self.session, self.turns = path, session, turns
@@ -328,6 +335,62 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual((n["turns"], n["fixed"]), (0, 2))
         self.assertEqual(self.conn.execute("SELECT closed, ending FROM turn_detail WHERE ordinal=2").fetchone()[:], (1, "aborted:user"))
         self.assertEqual(self.conn.execute("SELECT text FROM turn_detail WHERE ordinal=0").fetchone()[0], Turn("你好", "回答").id)
+
+    def test_peer(self):
+        """别的会话发来的消息（2026-11-01）：不是用户的话，也不成轮。解析时认出来记在 asides：夹在一轮中间的记这一轮，
+        落在两轮之间的记前一轮、连同“我”接着的回答；采集存进库、只往后添，读的时候只读库（原文件不保证一直在）；
+        观察时排在 U 后面、写明是谁，轮后的回答排在 A 最后。"""
+        from .sources import claude
+        from . import deep_rough_read as drr, label, participants
+        self.assertTrue(participants.is_peer(peer_text()))
+        self.assertEqual((participants.name(peer_text()), participants.body(peer_text())), ("迁移", "把包挪到 mh/engram。"))
+        meta = lambda uuid, text, **kw: {"type": "user", "uuid": uuid, "isMeta": True, "message": {"role": "user", "content": text}, **kw}
+        say = lambda uuid, mid, text, **kw: {"type": "assistant", "uuid": uuid, "message": {
+            "id": mid, "role": "assistant", "content": [{"type": "text", "text": text}], **kw}}
+        lines = [
+            {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "先停一下"}},
+            meta("p1", peer_text("中间插一句"), origin={"kind": "peer", "name": "迁移"}),
+            say("a1", "m1", "好的", stop_reason="end_turn"),
+            {"type": "system", "subtype": "turn_duration", "uuid": "d1"},
+            meta("p2", peer_text()),
+            say("a2", "m2", "挪好了"),
+            meta("x1", "（别的宿主注入，不算输入）"),
+            {"type": "user", "uuid": "p3", "message": {"role": "user", "content": peer_text("没写 isMeta")}},   # 宿主版本不同也认
+            {"type": "user", "uuid": "u2", "parentUuid": "d1", "message": {"role": "user", "content": "拉回来"}},
+            say("a3", "m3", "回来了", stop_reason="end_turn"),
+            {"type": "system", "subtype": "turn_duration", "uuid": "d2"},
+            say("a4", "m4", "没有归属的一句"),                    # 结束之后、没有会话消息：不出错，也不记
+        ]
+        path = self.dir / "peer.jsonl"
+        path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        _, turns = claude.parse(path)
+        self.assertEqual([(t.user, t.assistant) for t in turns], [("先停一下", "好的"), ("拉回来", "回来了")])
+        who = "另一个会话「迁移」"
+        self.assertEqual(turns[0].asides, [{"who": who, "text": "中间插一句"},
+                                           {"who": who, "text": "把包挪到 mh/engram。", "after": True, "reply": "挪好了"},
+                                           {"who": who, "text": "没写 isMeta", "after": True, "reply": ""}])
+        self.assertEqual(turns[1].asides, [])
+        self.assertEqual(turns[0].id, Turn("先停一下", "好的").id)          # 不进哈希
+        # 采集：2026-11-01 前入库的行没有 asides，再收一次补上；只往后添，已有的不改
+        sess = Session("claude", "p", str(path), started="2026-01-01T00:00:00Z", cwd="/w")
+        run = lambda ts: collect.run(self.conn, sources=("claude",), force=True, log=io.StringIO(),
+                                     modules={"claude": FakeSource(path, sess, ts)})["claude"]["fixed"]
+        run([Turn("先停一下", "好的", closed=True)])
+        self.assertEqual(run([Turn("先停一下", "好的", closed=True, asides=turns[0].asides[:1])]), 1)
+        self.assertEqual(run([turns[0]]), 1)
+        self.assertEqual(run([Turn("先停一下", "好的", closed=True, asides=[{"who": "别的", "text": "改了"}] * 4)]), 0)
+        path.unlink()
+        row = self.conn.execute("SELECT d.*, x.user, x.assistant, x.commentary, x.tools FROM turn_detail d "
+                                "JOIN turn_text x ON x.id=d.text WHERE d.session='p'").fetchone()
+        self.assertEqual(label.asides(row), turns[0].asides)
+        _, block = drr.turn_blocks(row)
+        self.assertIn(f"这一轮中间夹着{who}发来的 1 条消息，排在 U2，不是{U}的话", block)
+        self.assertIn(f"这一轮结束之后，{who}又发来 2 条消息，排在 U3、U4，不是{U}的话；“我”对它们的回答排在 A2", block)
+        self.assertIn(f"[1:U2] （{who}发来消息，不是用户的话）中间插一句", block)
+        self.assertIn(f"[1:A2] （这一轮结束之后“我”对{who}的回答）挪好了", block)
+        line = preview.turn_line(row)
+        self.assertIn(f"（这一轮中间夹着{who}发来的 1 条消息", line)
+        self.assertIn(f"（这一轮结束之后又有{who}发来的 2 条消息，不是{U}的话，我回了 3 字", line)
 
     def _fakes(self, preview, deep=(), rough=()):
         return {"preview": FakeModel(preview, usage={"input_tokens": 5, "output_tokens": 6}),

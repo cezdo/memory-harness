@@ -34,8 +34,10 @@ WINDOW = {      # relive、roam 的翻页：一页固定 8 条，没有 limit（
 
 TOOLS = [
     {"name": "evoke",
-     "description": "按词找记忆，按相关度排，命中给全文：线 L、话题 L:T、骨架 k- 在前，陈述 L:T:S 在后。"
-                    "几个词一起给，不必同时出现，带上换个说法的词。一次给 6–8 条；同一轮里给过的不再给，再查就是接着往下。",
+     "description": "按词找记忆：给话题 L:T，少而准时先给陈述 L:T:S 全文（grain=L 给线 L 和骨架 k-）。"
+                    "查词按空格切成词，每个词单独认；同时含的词越多越靠前，不必全都含，换个说法的词也可以一起给。"
+                    "结果多时只给话题；页头会说去掉哪个词能多命中。结果一页 6–8 条，同一轮里给过的不再给，再查就是接着往下。"
+                    "用到了其中的内容，就在正文里用〖〗标出那半句（引用回填靠它连回是哪条）。",
      "inputSchema": {"type": "object", "properties": {
          "words": {"type": "array", "items": {"type": "string"}, "description": "要查的词"},
          "grain": {"type": "string", "enum": ["L", "T", "S"], "description": "最小给到哪一层：L 线和骨架，T 话题，S 陈述（默认）"},

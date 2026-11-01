@@ -38,6 +38,7 @@ WAKE_SETTLE = 5         # 被叫醒后再等几秒：宿主的 Stop 可能在这
 
 
 def _status(conn, log):
+    """项目现状：编手记里的近况（目录、提交、没提交的改动、服务、检查）。"""
     from ..synapse.push import status
     for ws in status.workspaces():
         status.write(ws)
@@ -45,6 +46,7 @@ def _status(conn, log):
 
 
 def _check(conn, log):
+    """检查：跑写了检查命令的工作区的检查（mh check --brief），结果进项目现状。"""
     from ..synapse.push import status
     for ws in status.workspaces():
         status.run_check(ws)
@@ -52,16 +54,17 @@ def _check(conn, log):
 
 
 def _backfill(conn, log):
+    """补足迹：form 内部的拉取补成 use。"""
     from ..synapse import track
     inner = track.backfill_internal(conn)
     return f"补足迹：form 内部 {inner}" if inner else ""
 
 
 def _cite(conn, log):
-    """〖〗回填（Synapse 设计足迹一节）：回复里用〖〗标出的转述 → 认出是哪一条记忆，写成 use。要调 Jev（TypeSafe 官方 API）。"""
+    """引用回填：回复里用〖〗标出的转述，认出是哪一条记忆，写成 use（Synapse 设计足迹一节；11-01 前叫“〖〗回填”）。要调 Jev。"""
     from ..synapse.track import cite
     wrote, failed = cite.backfill(conn)
-    return f"〖〗回填 {wrote} 轮" + (f"，出错 {failed} 轮（下次再试）" if failed else "") if wrote or failed else ""
+    return f"引用回填 {wrote} 轮" + (f"，出错 {failed} 轮（下次再试）" if failed else "") if wrote or failed else ""
 
 
 def _runbook(conn, log):
@@ -79,12 +82,23 @@ def _runbook_model():
     return invoke.whole(invoke.Codex("gpt-6.1-sol", "low", isolation="codex-home-v1-low", no_tools=True))
 
 
+def _vector(conn, log):
+    """检索面的向量一路（Synapse v0.33）：把新写的陈述、改了名的话题补进向量服务，报在场名单。
+    联想的钩子每轮只查不同步，靠这里跟上；没配 [vector] 就什么也不做。"""
+    from ..synapse.pull import layers, vector
+    if not vector.ENABLED:
+        return ""
+    done, left = vector.sync(layers(conn), limit=2000, timeout=60)
+    return f"向量补了 {done} 条" + (f"，还缺 {left} 条" if left else "") if done or left else ""
+
+
 # 整理循环的任务（2026-10-20）：维护工作集，让手记推送这一侧跟上项目和记忆的实际状态。周期跟着成本走：
 # 程序任务分钟到小时级，模型任务按轻重几个小时到一周。一个任务：(名字, 程序 | 模型, 周期秒数, 做什么)。
 TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面：第一次醒来编的现状就带上检查
         ("项目现状", "程序", 300, _status),
-        ("补 form 内部足迹", "程序", 86400, _backfill),
-        ("〖〗回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
+        ("补足迹", "程序", 86400, _backfill),        # form 内部的拉取补成 use；11-01 前叫“补 form 内部足迹”
+        ("向量同步", "程序", 600, _vector),          # 检索面的向量一路跟上新陈述（2026-11-02）
+        ("引用回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
         ("runbook 更新稿", "模型", 86400, _runbook)]  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）
 
 

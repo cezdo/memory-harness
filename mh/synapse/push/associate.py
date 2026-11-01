@@ -233,7 +233,7 @@ def terms(text):
 
 # ---- 新库上的联想（E1a）----
 
-CACHE_V = 7                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名）
+CACHE_V = 8                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名；8：加上会话，向量一路排除同一段会话的陈述）
 NAMES_FILE = HOME / "names.json"   # 名单变体：旧记忆系统迁来的节点名（用户整理过），换库时从旧库冻结下来；是用户的数据，放数据目录（重构 H）
 
 
@@ -247,7 +247,7 @@ class Docs:
             e = L.nodes[s["entry"]]
             self.k[("s", sid)] = {"text": s["text"], "anchor": e["date"], "holder": "", "workspace": e["ws"],
                                   "topic": L.nodes[e["parent"]]["name"] if e["parent"] else e["name"], "h": s["h"],
-                                  "entry": s["entry"], "line": e["parent"], "name": e["name"]}
+                                  "entry": s["entry"], "line": e["parent"], "name": e["name"], "session": str(e.get("session") or "")}
         self.post, self.len = defaultdict(dict), {}
         for key, d in self.k.items():
             tf = terms(d["text"])
@@ -671,12 +671,17 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     named = listed(data, text)
     if named:
         variants["名单"] = (named, {"terms": sorted(named), "df": {n: len(d) for n, d in named.items()}})
-    if not hits and not variants:
-        return done("没有词段")
     seen = _seen(conn, session)
-    score = idx.match(text)
     nc = _norm(ctx)
     grams = {nc[i:i + COVER_N] for i in range(len(nc) - COVER_N + 1)} if nc else set()
+    if not hits and not variants:      # 字面没有词段：向量一路照样查一次、只记（2026-11-02：带“来着”的回想，字面常常抓不住）
+        try:
+            dn = dense(conn, idx, text, session, seen, grams, subject(conn, session, ctx))
+            rec["dense"] = {"off": True} if dn is None else {"top": [[idx.k[k]["h"], round(s_, 3)] for k, s_ in dn[:10]]}
+        except Exception as e:
+            rec["dense"] = {"error": repr(e)}
+        return done("没有词段")
+    score = idx.match(text)
     here = workspace(cwd) if cwd else None
 
     def same(cand):
@@ -726,6 +731,19 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
         rec["hop"] = hop(data, sorted(set().union(*use.values()), key=lambda k: (-score.get(k, 0), k)), score, seen | set(there))
     except Exception as e:
         rec["hop"] = {"error": repr(e)}
+    try:      # 向量一路（2026-11-02）：送不送照旧由字面的档定（向量的分数分不开平常话和真要的，见案例 11-02），
+        subj = subject(conn, session, ctx)                     # 送什么两路交替；两路认出同一个话题的记作双轨一致，先只记
+        dn = dense(conn, idx, text, session, seen, grams, subj)
+        if dn is None:
+            rec["dense"] = {"off": True}
+        else:
+            dk = [k for k, _ in dn]
+            lex_t = {idx.k[k]["entry"] for k in cand[:AGREE_TOP]}
+            agree = list(dict.fromkeys(L_where(idx, k) for k in dk[:AGREE_TOP] if idx.k[k]["entry"] in lex_t))
+            rec["dense"] = {"subject": subj, "top": [[idx.k[k]["h"], round(s_, 3)] for k, s_ in dn[:10]], "agree": agree}
+            cand = alternate(cand, dk)
+    except Exception as e:
+        rec["dense"] = {"error": repr(e)}
     if not cand:
         return done("都已出现过")
     keep = width if delivered else None                   # 送达时按 yorimichi 截；只记录的照旧列出来对照
@@ -740,6 +758,56 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     msg = shown_text(rows, delivered, yorimichi.label(width))
     ctx = "\n\n".join(x for x in (note, out if delivered else None) if x) or None
     return ctx, msg + (f"\n{shown_line}" if shown_line else "")
+
+
+DENSE_K, AGREE_TOP = 50, 20     # 向量一路（2026-11-02）：取多少条；两路各看前几条认“双轨一致”
+_PATH = re.compile(r"(?<![\w/])((?:~|\.{0,2})?/?(?:[\w.\-]+/)+[\w.\-]+\.(?:py|md|js|ts|tsx|json|jsonl|yml|yaml|toml|sh|conf|txt))")
+
+
+def subject(conn, session, ctx):
+    """程序补主语（检索面按 RAG，2026-11-01 实验：和模型改写打平或更好）：会话标题、上下文里最近碰到的文件名。"""
+    t = conn.execute("SELECT title FROM session_detail WHERE session=?", (session or "",)).fetchone()
+    title = t[0] if t and t[0] and not str(t[0]).startswith("?") else ""
+    files = list(dict.fromkeys(os.path.basename(p) for p in reversed(_PATH.findall((ctx or "")[-20000:]))))[:6]
+    return "｜".join(x for x in (title, " ".join(files)) if x)
+
+
+def dense(conn, idx, text, session, seen, grams, subj=""):
+    """向量一路的候选（2026-11-02，用户：联想也要双轨）：原话加程序补的主语去查，只要现在的陈述；去掉这段对话里出现过的、
+    已经在上下文里的、同一段会话自己写出的（它们本来就在上下文里）。返回 (候选键, 分数)；用不了返回 None。"""
+    from ..pull import vector
+    q = "｜".join(x for x in (subj, text) if x)[-480:]
+    hits = vector.search(conn, q, DENSE_K)
+    if hits is None:
+        return None
+    out = []
+    for k, score in hits:
+        key = ("s", int(k[2:])) if k[2:].isdigit() else None
+        d = idx.k.get(key)
+        if not d or key in seen or (session and session in d.get("session", "")) or (grams and in_context(grams, d["text"])):
+            continue
+        out.append((key, score))
+    return out
+
+
+def L_where(idx, k):
+    """候选键 → 它所在的话题句柄（L3:T5）。"""
+    return idx.k[k]["h"].rsplit(":", 1)[0]
+
+
+def alternate(a, b):
+    """两路轮流各取一条、去重（交替合并，2026-11-01 实验：程序发起的查询用它，RRF 会压下只有一路认得出的）。"""
+    out, seen = [], set()
+    for pair in zip(a, b):
+        for k in pair:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+    for k in a[len(b):] + b[len(a):]:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 def hook(stdin=sys.stdin, stdout=sys.stdout):

@@ -4,9 +4,10 @@
 各宿主的解析器在 sources/（claude、codex、dsh，加上钩子和 MCP 工具写的开关记录 switch），这里写进库：
 - 每一轮在采集时就定好来源：开头是用户的话（human）、宿主注入（host：通知、打断、命令、压缩）、脚本发起（script），
   还是主会话自己的表达（main：开关记录里的 yorimichi）；
-- 结束标记、分叉点、非正常结束记在 turn_detail；之后的更正只从无到有，位置对上、内容不同的不写（原文只追加）；
+- 结束标记、分叉点、非正常结束、别的会话发来的消息（asides，不成轮）记在 turn_detail；之后的更正只从无到有，位置对上、内容不同的不写（原文只追加）；
 - 新会话开始不满 FRESH 不收，也不标记文件，下一轮再看（测试、误开的会话在窗口内删掉就不会进来）。
 """
+import json
 import sys
 from datetime import datetime, timezone
 
@@ -18,7 +19,8 @@ from ..store.delete import deleted
 
 SCRIPT_PREFIX = "（定时任务"          # 脚本、定时任务发起的轮次（见 synapse.hosts.HOST）
 HOST_KINDS = {"通知": "notification", "打断": "interrupt", "命令": "command", "压缩": "compaction"}
-COLLECTOR = "observe/collect-v3"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main
+COLLECTOR = "observe/collect-v4"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main；
+                                         # v4（2026-11-01）：别的会话发来的消息记在 turn_detail.asides
 
 
 def origin(user):
@@ -83,8 +85,10 @@ def save(conn, op, session, turns, log=None):
         if old is None:
             oid = occurrence(conn, "turn", op, started=iso(t.started), scale="turn", cause=NA, parent=sid)
             org, kind = switch.origin(s) if s.source == switch.SOURCE else origin(t.user)     # 开关记录：用户的命令或“我”的 yorimichi
-            conn.execute("INSERT INTO turn_detail VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                         (oid, t.id, s.source, s.session, i, int(t.closed), ending, prev, st.dumps(t.address), org, kind))
+            conn.execute("INSERT INTO turn_detail(occurrence,text,source,session,ordinal,closed,ending,prev,address,"
+                         "origin,host_kind,asides) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (oid, t.id, s.source, s.session, i, int(t.closed), ending, prev, st.dumps(t.address), org, kind,
+                          st.dumps(t.asides)))
             new += 1
             continue
         if old["text"] != t.id:
@@ -98,6 +102,9 @@ def save(conn, op, session, turns, log=None):
             fixed += conn.execute("UPDATE turn_detail SET prev=? WHERE occurrence=?", (t.prev, oid)).rowcount
         if t.ending and old["ending"] in (UNKNOWN, "normal"):
             fixed += conn.execute("UPDATE turn_detail SET ending=? WHERE occurrence=?", (t.ending, oid)).rowcount
+        had = json.loads(old["asides"])                  # 别的会话发来的消息：2026-11-01 前入库的行没记；只往后添，已有的不改
+        if len(t.asides) > len(had) and t.asides[:len(had)] == had:
+            fixed += conn.execute("UPDATE turn_detail SET asides=? WHERE occurrence=?", (st.dumps(t.asides), oid)).rowcount
     return new, texts, fixed
 
 

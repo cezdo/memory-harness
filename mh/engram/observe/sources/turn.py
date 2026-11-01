@@ -28,6 +28,7 @@ class Turn:
     closed: bool = False                             # 来源已标记本轮结束
     prev: int = None                                 # 接在第几轮（序号）之后；空 = 上一轮。回退改写时指回分叉点，-1 = 回到开头
     ending: str = ""                                 # 来源记下的非正常结束：aborted:user、error:<消息>、interrupted；空 = 正常或来源不记（目前只有 dsh 记）
+    asides: list = field(default_factory=list)       # 别的会话发来的消息 [{"who", "text"}，轮后的加 "after", "reply"]：不成轮、不进哈希（2026-11-01）
 
     @property
     def id(self):

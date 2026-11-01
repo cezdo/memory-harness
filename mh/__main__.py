@@ -98,6 +98,7 @@ def main():
                                        "--form 是形成循环（form 跑一批 → 休眠），memory-harness-form.service 跑它")
     rh.add_argument("--form", action="store_true", help="跑形成循环，不跑观察循环")
     rh.add_argument("--tidy", action="store_true", help="跑整理循环（维护手记推送的项目现状、检查……），memory-harness-tidy.service 跑它")
+    rh.add_argument("--show", action="store_true", help="展示自己的窗口：只读网页“此刻的我”，打开时现编，memory-harness-show.service 跑它")
     rh.add_argument("--once", action="store_true", help="只跑一轮就退出")
     rh.add_argument("--register", nargs="*", metavar="服务", help="常驻服务按这个平台（systemd / launchd）生成，看和装着的差在哪；"
                                                                   "不点名是三个循环，远端调用的服务端要点名 memory-harness-invoke")
@@ -292,7 +293,7 @@ def main():
         from .synapse import track
         from .synapse.track import cite
         conn = estore.connect(estore.DEFAULT_DB)
-        print(f"补成 use：form 内部的拉取 {track.backfill_internal(conn)} 条；〖〗回填 {'，出错 '.join(map(str, cite.backfill(conn)))} 轮")
+        print(f"补成 use：form 内部的拉取 {track.backfill_internal(conn)} 条；引用回填 {'，出错 '.join(map(str, cite.backfill(conn)))} 轮")
     elif args.cmd == "quota":
         from .rhythm import quota
         qs = quota.read(args.names or None)
@@ -313,7 +314,10 @@ def main():
             return
         register.stamp()
         log = sys.stderr                    # stamp 换过 stderr，循环的默认参数还是旧的，显式传
-        if args.tidy:
+        if args.show:
+            from .rhythm.show import serve
+            serve.serve(log=log)
+        elif args.tidy:
             got = rhythm.tidy_loop(args.engram_db, once=args.once, log=log)
             if args.once:
                 print(f"整理：{'、'.join(got or []) or '没有到周期的任务'}")
