@@ -8,7 +8,7 @@ class Session:
     source: str            # codex | dsh | claude
     session: str           # 来源内的会话 ID
     file: str              # 原始文件路径
-    kind: str = "user"     # user | subagent | review
+    kind: str = "user"     # user | subagent | review | title（宿主起标题的调用）
     parent: str = ""       # 父会话 / 根会话
     cwd: str = ""
     model: str = ""

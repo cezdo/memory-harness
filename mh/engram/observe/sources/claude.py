@@ -13,6 +13,10 @@ from .. import participants
 
 ROOT = Path.home() / ".claude/projects"
 
+# Zeron 给会话起标题时另起的一次 Claude Code 调用（2026-11-07）：cwd 是 /tmp/.tmpXXXX，唯一一轮是起标题的提示词，
+# 用户第一句话作为材料嵌在里面。不是对话，记成 kind = title（采集只收 user），免得那句话被当成另一段会话再记一次。
+_TITLE_PROMPT = "You generate session titles."
+
 
 def files():
     yield from sorted(ROOT.glob("*/*.jsonl"))
@@ -126,4 +130,6 @@ def parse(path):
             if cur is not None:
                 cur.address["line"][1] = lineno
     close(stop == "end_turn")
+    if turns and turns[0].user.startswith(_TITLE_PROMPT):
+        session.kind = "title"
     return session, turns
