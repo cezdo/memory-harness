@@ -82,6 +82,13 @@ def _runbook_model():
     return invoke.whole(invoke.Codex("gpt-6.1-sol", "low", isolation="codex-home-v1-low", no_tools=True))
 
 
+def _clean(conn, log):
+    """清理空会话：宿主里打开了却没开口的会话，删掉宿主的原文件（engram/observe/clean，用户 11-06）。"""
+    from ..engram.observe import clean
+    got = clean.clean(conn, apply=True)
+    return f"清理空会话 {len(got)} 个：" + "、".join(f"{src}:{sid[:12]}" for src, sid, _ in got) if got else ""
+
+
 def _vector(conn, log):
     """检索面的向量一路（Synapse v0.33）：把新写的陈述、改了名的话题补进向量服务，报在场名单。
     联想的钩子每轮只查不同步，靠这里跟上；没配 [vector] 就什么也不做。"""
@@ -98,8 +105,9 @@ TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面
         ("项目现状", "程序", 300, _status),
         ("补足迹", "程序", 86400, _backfill),        # form 内部的拉取补成 use；11-01 前叫“补 form 内部足迹”
         ("向量同步", "程序", 600, _vector),          # 检索面的向量一路跟上新陈述（2026-11-02）
+        ("清理空会话", "程序", 3600, _clean),         # 打开了却没开口的会话（2026-11-06）；最近 6 小时动过的不动
         ("引用回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
-        ("runbook 更新稿", "模型", 86400, _runbook)]  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）
+        ("runbook 更新稿", "模型", 86400, _runbook)]  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）；照看 11-05 起自己一个服务（memory-harness-tend）
 
 
 def lock(name, home=None):

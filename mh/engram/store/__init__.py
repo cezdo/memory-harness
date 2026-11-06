@@ -25,7 +25,7 @@ DEFAULT_DB = HOME / "engram.db"
 # 两种都沾的（超时的字样加上额度、限流）按环境错误算。
 ENVIRONMENTAL = re.compile(r"quota|insufficient|balance|rate.?limit|usage limit|too many requests|\b40[23]\b|\b429\b|\b50[23]\b"
                            r"|overloaded|\bmodel is at capacity\b|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
-                           r"|waiting for service|did not activate|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
+                           r"|waiting for service|did not activate|can.t find source path|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
 # 内容过滤：服务商按内容拦下（如 ark 的 finish_reason: content_filter）。重试不会变，这一份就不要了（2026-10-17）
 FILTERED = re.compile(r"content_filter|content.?(policy|moderation)|内容过滤|内容安全|敏感内容", re.I)
 
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS turn_detail(
   ordinal INTEGER NOT NULL, closed INTEGER NOT NULL, ending TEXT NOT NULL, prev INTEGER NOT NULL,
   address TEXT NOT NULL,
   origin TEXT NOT NULL,           -- human | host | script | main（主会话，开关记录里的 yorimichi）：这一轮开头是谁
-  host_kind TEXT NOT NULL,        -- notification | interrupt | command | compaction（origin = host 时）
+  host_kind TEXT NOT NULL,        -- notification | interrupt | command | compaction | restart（origin = host 时）
   asides TEXT NOT NULL DEFAULT '[]',   -- 别的会话发来、不成轮的消息 [{"who", "text"}，轮后的加 "after", "reply"]（2026-11-01）
   UNIQUE(source, session, ordinal));
 CREATE INDEX IF NOT EXISTS turn_detail_text ON turn_detail(text);
@@ -465,6 +465,18 @@ def outcome(error):
     if _TIMEOUT.search(error):
         return "timeout", error
     return "content_error", error
+
+
+def usage_rows(u):
+    """各家调用返回的 usage → cost 认的列表（dsh 的 inputTokens 那种）。input 记没命中缓存的那部分：
+    claude -p 的 input_tokens 本来就不含缓存；codex 的 input_tokens 含命中的 cached_input_tokens，要减掉（2026-11-04 前 form 全丢、observe 记成含缓存的总数）。"""
+    if not isinstance(u, dict):
+        return u if isinstance(u, list) else None
+    if "cached_input_tokens" in u:                               # codex exec --json 的 turn.completed
+        return [{"inputTokens": (u.get("input_tokens") or 0) - (u.get("cached_input_tokens") or 0),
+                 "outputTokens": u.get("output_tokens"), "cacheReadTokens": u.get("cached_input_tokens")}]
+    return [{"inputTokens": u.get("input_tokens"), "outputTokens": u.get("output_tokens"),          # claude -p
+             "cacheReadTokens": u.get("cache_read_input_tokens"), "cacheWriteTokens": u.get("cache_creation_input_tokens")}]
 
 
 def cost(seconds, usage):

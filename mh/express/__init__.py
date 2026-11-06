@@ -30,11 +30,12 @@ def prompt(template, user_name):
     return template.strip().replace("{{用户}}", user_name) + "\n\n## 表达规范\n" + RULES
 
 
-def present(text, ctx, *, raw=False, use=None):
-    """给模型读的记忆包进 <memory-harness>（use：这次送达的编号；raw：原话），正文逐字保留；给内部过程、给人看的原样返回。"""
+def present(text, ctx, *, raw=False):
+    """给模型读的记忆包进 <memory-harness>（raw：原话），正文逐字保留；给内部过程、给人看的原样返回。
+    送达编号（use）2026-11-02 起不进标签：反馈入口撤了，模型用不上，只占上下文；编号照旧记在库里。"""
     if not text or ctx["reader"] != "model" or ctx["purpose"] not in ("memory", "standing"):
         return text
-    attrs = (f' use="{use}"' if use is not None else "") + (' source="原话"' if raw else "")
+    attrs = ' source="原话"' if raw else ""
     return f"<{TAG}{attrs}>\n{text}\n</{TAG}>"
 
 

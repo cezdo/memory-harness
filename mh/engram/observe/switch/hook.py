@@ -47,7 +47,7 @@ def main(argv):
         f.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "source": host,
                             "session": d.get("session_id") or "", "file": d.get("transcript_path") or "",
                             "state": state, "prompt": d.get("prompt")}, ensure_ascii=False) + "\n")
-    if state == "on":                       # /do-observe：把尾巴现在读掉
+    if state == "on":                       # /do-observe：恢复观察，循环早点醒来记 restore（读掉尾巴 11-06 随快道撤了）
         wake(log.parent / WAKE.name)
     if host == "codex":                     # codex 里恢复命令写作 $do-observe（skill）
         print(SAID[state].replace("/do-observe", "$do-observe"), file=sys.stderr)

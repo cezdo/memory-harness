@@ -7,7 +7,8 @@
 - 在场：客户端每次读视图重建时报一次现在的条目，只在这些里面找（被取代的陈述、清空的线都不在场，向量留着）；
 - 接口（POST JSON，带 `Authorization: Bearer <key>`，key 和本机 llama 服务同一个）：
   /missing {items: {编号: 哈希}} → {missing: [没有或哈希变了的]}；/upsert {items: [{id, hash, text}]} → {n}；
-  /active {ids: [...]} → {active, unknown}；/search {text, k, prefix?} → {hits: [[编号, 分数], ...]}；GET /health。
+  /active {ids: [...]} → {active, unknown}；/search {text, k, prefix?} → {hits: [[编号, 分数], ...]}；GET /health；
+  /align {clauses: [分句…], items: [事件正文…]} → {best: [每个事件最像的分句序号…]}（不存，现算；relive 把来源对到分句，2026-11-05）。
 用法：python vector_serve.py <数据目录> <端口> <key 文件> [向量服务地址]"""
 import hashlib, json, os, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,11 @@ class Store:
             self.active = np.asarray(sorted(rows), np.int64)
             return len(rows), len(ids) - len(rows)
 
+    def align(self, clauses, items):
+        v = self.embed(list(clauses) + list(items))
+        sim = v[len(clauses):] @ v[:len(clauses)].T
+        return [int(i) for i in sim.argmax(axis=1)] if len(items) and len(clauses) else []
+
     def search(self, text, k, prefix=None):
         q = self.embed([text])[0]
         with self.lock:
@@ -121,6 +127,8 @@ def handler(store, key):
                 elif self.path == "/active":
                     a, u = store.set_active(d["ids"])
                     out = {"active": a, "unknown": u}
+                elif self.path == "/align":
+                    out = {"best": store.align(d["clauses"], d["items"])}
                 elif self.path == "/search":
                     out = {"hits": store.search(d["text"], int(d.get("k", 200)), d.get("prefix"))}
                 else:

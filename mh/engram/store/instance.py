@@ -41,10 +41,11 @@ SESSIONS = {(s["source"], s["session"]): s["workspace"] for s in _ws.get("sessio
 QUIET = frozenset(w.lower() for w in _D.get("synapse", {}).get("quiet", ()))   # Synapse 不当“查不到的词”送的词（手动名单）
 
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
-DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # dsh 更新测试实例（精读、粗读用）
+DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # mh 专用的 dsh 实例（精读用；不要指到 dsh 升级的测试环境，它会被 teardown）
 INVOKE = _D.get("invoke", {})                            # 远端调用：listen、token、remote（invoke/serve.py）
 LISTEN = _D.get("listen", {})                            # 监听 QQ 协议端：ssh、remote、local、token_file（observe/listen.py）
 SHOW = _D.get("show", {})                                # 展示自己的窗口：listen、allow、local_model、入口、机器、路径（rhythm/show）
+REVIEW_URL = _D.get("review", {}).get("url", "")             # 给用户看的预览站入口：发布的页面链接不进记录（form 去掉，2026-11-04）
 VECTOR = _D.get("vector", {})                            # 检索面的向量一路：url、key_file（synapse/pull/vector.py）；没配就只有字面
 
 

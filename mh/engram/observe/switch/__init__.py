@@ -18,7 +18,6 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..sources import switch as _source
 from ..sources.switch import SOURCE
 
 HERE = Path(__file__).parent
@@ -50,24 +49,6 @@ def states(conn):
 def latest(conn):
     """{(来源, 会话): (状态, 开关那一轮的 turn 编号)}：每个出现过开关的会话，按时间最后一次开关（同一时间按出现的先后）。"""
     return {k: max(v)[2:] for k, v in history(conn).items()}
-
-
-def logged(session, log=None):
-    """钩子记下的这段会话最后一次开关（observe-switch.jsonl，还没采集进库的也算）："on" | "off" | None。observe-now 判权限用：
-    用户刚关、库里还没有的那一下也要拦住。"""
-    got = None
-    try:
-        with open(log or _source.LOG, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                if d.get("session") == session and d.get("state") in ("on", "off"):
-                    got = d["state"]
-    except OSError:
-        pass
-    return got
 
 
 def history(conn):

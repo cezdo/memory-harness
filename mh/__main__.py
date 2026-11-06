@@ -65,7 +65,8 @@ def main():
                                        "skeleton --workspace … --root … --file … --section … --placements …：按文件申请骨架（--dry-run 预览）；"
                                        "feedback T<入口> --name …|--topic … --reason … --model …：主会话直写的反馈（会话入口）；"
                                        "serve：远端调用的服务端，代跑只能在这台机器上跑的模型定义（实例配置 [invoke]）；"
-                                       "listen：监听 QQ 协议端，事件原样追加进数据目录（实例配置 [listen]）")
+                                       "listen：监听 QQ 协议端，事件原样追加进数据目录（实例配置 [listen]）；"
+                                       "listen --backfill：补录断线期间缺的消息（默认只统计，--write 才写）")
     eg.add_argument("action", choices=ENGRAM)
     eg.add_argument("--workspace", help="skeleton：骨架所属的工作区")
     eg.add_argument("--root", type=Path, help="skeleton：工作区根目录")
@@ -76,6 +77,10 @@ def main():
     eg.add_argument("--name", help="feedback：改好的名字")
     eg.add_argument("--topic", help="feedback：改好的主题")
     eg.add_argument("--holder", default="我", help="feedback：谁说的（默认“我”）")
+    eg.add_argument("--backfill", action="store_true", help="listen：补录断线期间缺的消息，不常驻")
+    eg.add_argument("--write", action="store_true", help="listen --backfill：真的写进文件（默认只统计）")
+    eg.add_argument("--days", type=int, default=3, help="listen --backfill：往回看几天（默认 3）")
+    eg.add_argument("--count", type=int, default=2000, help="listen --backfill：向协议端要多少条（默认 2000）")
     eg.add_argument("--since", help="reobserve：会话开始时间的下界（ISO，UTC）")
     eg.add_argument("--until", help="reobserve：会话开始时间的上界（不含）")
     eg.add_argument("--dry-run", action="store_true", help="reobserve：只列出会挑中哪些会话，不写申请")
@@ -99,6 +104,7 @@ def main():
     rh.add_argument("--form", action="store_true", help="跑形成循环，不跑观察循环")
     rh.add_argument("--tidy", action="store_true", help="跑整理循环（维护手记推送的项目现状、检查……），memory-harness-tidy.service 跑它")
     rh.add_argument("--show", action="store_true", help="展示自己的窗口：只读网页“此刻的我”，打开时现编，memory-harness-show.service 跑它")
+    rh.add_argument("--tend", action="store_true", help="照看：值班的主体管看板上的警告，memory-harness-tend.service 跑它；--once 只醒一次（强制给主体送心跳）")
     rh.add_argument("--once", action="store_true", help="只跑一轮就退出")
     rh.add_argument("--register", nargs="*", metavar="服务", help="常驻服务按这个平台（systemd / launchd）生成，看和装着的差在哪；"
                                                                   "不点名是三个循环，远端调用的服务端要点名 memory-harness-invoke")
@@ -109,11 +115,12 @@ def main():
     sub.add_parser("inject", help="Claude Code SessionStart hook：从标准输入读宿主 JSON，输出手记推送")
     se = sub.add_parser("evoke", help="按词找记忆（同 MCP 工具 evoke）")
     se.add_argument("words", nargs="*")
-    se.add_argument("--grain", default=None, choices=["L", "T", "S"], help="最小给到哪一层：L 线和骨架、T 话题、S 陈述（默认）")
+    se.add_argument("--grain", default=None, choices=["L", "T", "S"], help=argparse.SUPPRESS)   # 不给主会话看（2026-11-02），照旧能用
     gt = sub.add_parser("relive", help="按句柄读记忆（同 MCP 工具 relive）")
     gt.add_argument("ks", nargs="*", metavar="句柄")
     gt.add_argument("--source", action="store_true", help="来源：陈述依据的 E，J 的旧会话记录和同一段会话现在的话题")
     gt.add_argument("--said", action="store_true", help="原话：陈述、E 沿出处走到原话")
+    gt.add_argument("--near", action="store_true", help="陈述：连同所在话题里前后各 3 条")
     gt.add_argument("--recall", nargs="?", const="all", default=None, metavar="N|all",
                     help="历史：all 或数字 N")
     for x in (se, gt):
@@ -148,6 +155,10 @@ def main():
         return
     if args.cmd == "engram" and args.action == "listen":      # 常驻，不开库
         from .engram.observe import listen
+        if args.backfill:
+            from .engram.observe import backfill
+            backfill.sync(write=args.write, days=args.days, count=args.count)
+            return
         listen.serve()
         return
     if args.cmd == "engram":
@@ -282,7 +293,7 @@ def main():
             hs, recall = list(args.ks), args.recall
             if recall is not None and recall != "all" and not recall.isdigit():
                 hs, recall = [recall] + hs, "all"          # --recall 后面紧跟的是句柄，不是窗口
-            print(pull.relive(conn, hs, said=args.said, source=args.source, recall=recall, page=args.page, **kw))
+            print(pull.relive(conn, hs, said=args.said, source=args.source, recall=recall, page=args.page, near=args.near, **kw))
         else:
             print(pull.roam(conn, args.node, page=args.page, **kw))
     elif args.cmd in ("boot", "standing"):
@@ -317,6 +328,13 @@ def main():
         if args.show:
             from .rhythm.show import serve
             serve.serve(log=log)
+        elif args.tend:
+            from .rhythm import tend
+            if args.once:
+                from .rhythm.show.collect import collect
+                print(tend.tick(collect(), force=True) or "没事")
+            else:
+                tend.serve(log=log)
         elif args.tidy:
             got = rhythm.tidy_loop(args.engram_db, once=args.once, log=log)
             if args.once:

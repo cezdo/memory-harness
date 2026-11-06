@@ -10,6 +10,9 @@
   一次最多读 ROUGH_CAP 字的回复（写窗口：一次读得越多写得越粗），超出的组按轮切开分几次读（切开的各段都带这组的计划）；
   提示词给一个条数范围（有内容的段落数 × ROUGH_RHO，上下浮动 ROUGH_FLOAT），不给字数；
   每一轮开头附上这一轮“我”读过、写过的文件和提交（程序从工具调用里认，written_files），复述文件的说明只写一条指路的。
+2026-11-02 起（tmp/observe-terra/，用户：terra 比 luna 好不少）：
+- 粗读 terra-codex-rough：codex exec 上的 gpt-6.1-terra，low，其余同 Luna；同一份输入条数、长度和 Luna 几乎一样，
+  更守“有名字的东西和说法用「」”，少写“记录在本轮总结里”这类没指到地方的话。以前的 E 不重读（只管以后的和以后的再观察）。
 - 精读不变：Luna 写得省、跟提示词走，DeepSeek 写得细、几乎不翻转说话人，细的放在分量重的少数轮上。
 补丁在 patches/：极简层（关掉记忆工具等，dsh-minimal）、模型与推理档位（dsh-web）、粗读的 bare 预设（dsh-rough）。
 补丁的内容进隔离标记，改了就是新的 Operator。
@@ -38,7 +41,8 @@ MODELS = {
     "deepseek-ark-web-rough": lambda: remote("deepseek-ark-web-rough", DshWeb(
         MODEL, "dsh web 常驻（测试实例，opencode-go，bare 预设无工具，low）", port=3086, box=HOME / "dsh-web-rough", preset="bare",
         patches=(MINIMAL_PATCH, WEB_PATCH, ROUGH_PATCH))),
-    "luna-codex-rough": lambda: Codex("gpt-6-luna", "low", isolation="codex-home-v1-low", no_tools=True),
+    "luna-codex-rough": lambda: Codex("gpt-6-luna", "low", isolation="codex-home-v1-low", no_tools=True),       # 到 2026-11-02
+    "terra-codex-rough": lambda: Codex("gpt-6.1-terra", "low", isolation="codex-home-v1-low", no_tools=True),
 }
 # 粗读的写窗口（2026-10-19，tmp/window/：Luna 4000 字在细和不丢之间，8000 起丢掉判断；数字没验证过，按使用调）
 ROUGH_CAP = 4000             # 一次粗读大约读这么多字的回复：超过 ROUGH_MAX 的组按它估段数、平均切（一轮超过的自己一段）
@@ -46,7 +50,7 @@ ROUGH_MIN, ROUGH_MAX = 3000, 5000   # 切开后每段平均落在这个范围（
 ROUGH_RHO = 1.0              # 条数范围的中心：每个有内容的段落大约一条（Luna 不给范围时约 0.7，给 1.2 时约 0.9–1.2 都放得开）
 ROUGH_FLOAT = 0.3            # 范围上下浮动三成（用户：只给一个数要求太高）
 CONTENT_MIN = 40             # 有内容的段落：至少这么多字
-LONG_CAP = 53                # 单轮自成一窗的条数中心上限（临时兜底，2026-10-25）：ROUGH_MAX × 有内容段落 p90 密度 10.6/千字；runbook I7a 长轮预览上线后撤
+LONG_CAP = 53                # 单轮自成一窗的条数中心上限（临时兜底，2026-10-25）：ROUGH_MAX × 有内容段落 p90 密度 10.6/千字；长轮预览（observe shelved，未上线）上线后撤
 STEPS = {"精读": "deep", "粗读": "rough"}       # 读法 → 步骤；不读的不调用
 TOOLS = {"deep": f"\n环境里唯一能用的命令是 {guard.COUNT}（数字数：参数或 here-doc 给文字）；别的命令都会让这次观察作废。\n",
          "rough": "\n不要使用任何工具或命令：用了，这次观察就作废。\n"}

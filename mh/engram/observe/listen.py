@@ -10,6 +10,7 @@ listen-onebot.jsonl。只收不发；常驻，memory-harness-listen 服务跑它
 import base64
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -26,6 +27,42 @@ from ..store.instance import LISTEN, _dir
 LOG = HOME / "listen-onebot.jsonl"
 RETRY, RETRY_MAX = 5, 300
 READ_TIMEOUT = 90           # 协议端心跳 30 秒一次，这么久什么都没收到就当断了
+
+LINK = re.compile(r"https?://([^/\s]+)\S*")
+SHORT = 4                   # 名字尽可能短：留前几个字
+PLACE = {"image": "[图片]", "face": "[表情]", "mface": "[表情]", "record": "[语音]",
+         "video": "[视频]", "file": "[文件]", "forward": "[聊天记录]"}
+
+
+def text_of(message, names=None, links=True, quote=None):
+    """OneBot 的消息段数组 → 一行文字。@ 写成 @名字（names 认不出写号），图片写 [图片]、表情包写它带的描述；
+    links：链接只留网站名（回复的模型用，省字；采集留全文）；quote：{被回复的消息 id: 那一行的文字}，给了就把回复
+    写成“[回复 某人：喵喵]”。回复和采集共用这一份。"""
+    if isinstance(message, str):
+        return message
+    names, out = names or {}, []
+    for seg in message or ():
+        t, d = seg.get("type"), seg.get("data") or {}
+        if t == "text":
+            text = d.get("text") or ""
+            out.append(LINK.sub(r"[链接 \1]", text) if links else text)
+        elif t == "at":
+            q = str(d.get("qq"))
+            out.append("@全体成员" if q == "all" else f"@{names.get(q, q)}")
+        elif t == "reply":
+            q = (quote or {}).get(str(d.get("id")))
+            out.append(f"[回复 {q}]" if q else "[回复]")
+        elif t in ("image", "mface") and d.get("summary", "").strip("[]") not in ("", "图片", "动画表情"):
+            out.append(f"[表情：{d['summary'].strip('[]')}]")      # 表情包带一句描述，扫一眼就能看到
+        else:
+            out.append(PLACE.get(t, f"[{t}]"))
+    return "".join(out).strip()
+
+
+def short(name, n=SHORT):
+    """名字尽可能短：去掉符号和装饰，留前 n 个字。"""
+    s = re.sub(r"[^\w一-鿿぀-ヿ]", "", name or "")
+    return s[:n] or (name or "?")[:n]
 
 
 def log(*a):

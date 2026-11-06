@@ -26,7 +26,10 @@ SERVICES = {
 EXTRA = {"memory-harness-invoke": (["engram", "serve"], "mh engram serve：远端调用，代跑精读的 dsh web"),
          "memory-harness-listen": (["engram", "listen"], "mh engram listen：监听 QQ 协议端，事件原样追加进数据目录（G7）"),
          "memory-harness-reply": (["reply"], "mh reply：在一个群里被叫到时回几句（G7）"),
-         "memory-harness-show": (["rhythm", "--show"], "mh rhythm --show：展示自己的窗口，只读网页（N3）")}
+         "memory-harness-show": (["rhythm", "--show"], "mh rhythm --show：展示自己的窗口，只读网页（N3）"),
+         "memory-harness-tend": (["rhythm", "--tend"], "mh rhythm --tend：照看，值班的主体管看板上的警告（G11）")}
+# 照看还没进公开包（release 的 frozen.txt）：模块不在就不登记它的服务
+EXTRA = {k: v for k, v in EXTRA.items() if k != "memory-harness-tend" or (Path(__file__).parent / "tend").is_dir()}
 ALL = {**SERVICES, **EXTRA}
 # 循环要调的外部程序：服务的 PATH 由它们此刻所在的目录拼成（dsh 要 Node 24，系统自带的 node 可能太旧）
 TOOLS = ("node", "claude", "codex")

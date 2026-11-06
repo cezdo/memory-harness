@@ -8,6 +8,8 @@ import re
 
 HOST = (("<task-notification", "后台任务"), ("<command-", "命令"), ("<local-command", "命令输出"), ("<bash-", "shell"),
         ("This session is being continued", "压缩总结"), ("[Request interrupted", "打断"), ("Caveat:", "命令输出"),
+        # Orca 重启后自动发来的固定续接提示（2026-11-06）：宿主记成用户消息，不是用户在说话
+        ("Orca restarted, which stopped what you were doing", "Orca 重启续接"),
         # 外部脚本/定时任务发起的轮次（2026-10-16）：走 `claude -p` 或 dsh headless 时既没有 isMeta、
         # 也没有 scheduled_task_fire，source.kind 也是 user，只能靠 prompt 自己的约定 —— 开头写「（定时任务」。
         # 这类轮次不是用户在说话，不联想（也不算“同一段对话里给过”），只按宿主事件留一条足迹。

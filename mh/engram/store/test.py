@@ -39,6 +39,15 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(iso("2026-10-02 00:00:05", 5), "2026-10-02T00:00:00Z")
         self.assertEqual(iso(""), UNKNOWN)
 
+    def test_usage_rows(self):
+        from . import cost, usage_rows
+        codex = {"input_tokens": 19150, "cached_input_tokens": 12032, "cache_write_input_tokens": 0, "output_tokens": 2345}
+        self.assertEqual(cost(54, usage_rows(codex))["tokens"], {"input": 7118, "output": 2345, "cache_read": 12032})
+        claude = {"input_tokens": 2, "cache_creation_input_tokens": 310, "cache_read_input_tokens": 20035, "output_tokens": 6044}
+        self.assertEqual(cost(30, usage_rows(claude))["tokens"], {"input": 2, "output": 6044, "cache_read": 20035, "cache_write": 310})
+        self.assertEqual(usage_rows([{"inputTokens": 5}]), [{"inputTokens": 5}])
+        self.assertEqual(cost(1, usage_rows(None))["tokens"], UNKNOWN)
+
     def test_workspace(self):
         """工作区：按目录的映射（最长前缀）优先，其余取 cwd 最后一节；旧名字读的时候换成映射后的（2026-10-21）。"""
         h = "/h"
@@ -165,6 +174,8 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(outcome("RuntimeError('dsh web 没有正常结束：{\\'kind\\': \\'error\\', \\'error\\': {\\'message\\': "
                                  "\\'429: {\"code\":\"AccountQuotaExceeded\",\"message\":\"You have exceeded the weekly usage quota.\"}"
                                  "\\', \\'code\\': \\'RATE_LIMIT\\'}}')")[0], "env_error")
+        # 2026-11-06：dsh 实例目录被删，bwrap 找不到程序目录，是环境不是内容
+        self.assertEqual(outcome("RuntimeError(\"dsh web 没有起来：bwrap: Can't find source path /x/env-next: No such file or directory\\n\")")[0], "env_error")
         self.assertEqual(outcome("finish_reason: content_filter")[0], "filtered")
         self.assertEqual(outcome("解析失败")[0], "content_error")
         self.assertEqual(st.restyle("合并成一句「引用：三个风险」，写进「文件：docs/a.md」，名字「dsh」不动"),

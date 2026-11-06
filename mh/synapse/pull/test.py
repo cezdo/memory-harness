@@ -112,10 +112,13 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         both = pull.relive(self.conn, ["T1:S1-S9"], **self.kw)               # 线只是位置，不写也认
         self.assertIn("[L1:T1:S2]", both)
         self.assertIn("L1:T1:S3：没有这一条", both)
-        self.assertIn("▶ L1:T1:S2", pull.relive(self.conn, ["L?:T1:S2"], **self.kw))
-        self.assertIn("▶ L1:T1:S1", pull.relive(self.conn, ["L1:S1"], **self.kw))   # v0.10 按线编的旧句柄照认
-        # 一条陈述给它在话题里的前后几条（v0.13）；source 给依据的 E，不再重复正文；said 一路到原话
-        r = pull.relive(self.conn, [rid], **self.kw)
+        self.assertIn("▶ L1:T1:S2", pull.relive(self.conn, ["L?:T1:S2"], near=True, **self.kw))
+        self.assertIn("▶ L1:T1:S1", pull.relive(self.conn, ["L1:S1"], near=True, **self.kw))   # v0.10 按线编的旧句柄照认
+        # 一条陈述默认只给它自己（v0.39）；near 给它在话题里的前后几条（v0.13）；source 给依据的 E，不再重复正文；said 一路到原话
+        alone = pull.relive(self.conn, [rid], **self.kw)
+        self.assertIn(f"[L1:T1:S1] {U}想把「甲服务」升到新版本", alone)
+        self.assertNotIn("L1:T1:S2", alone)
+        r = pull.relive(self.conn, [rid], near=True, **self.kw)
         self.assertIn(f"▶ L1:T1:S1 {U}想把「甲服务」升到新版本", r)
         self.assertIn("- L1:T1:S2 ", r)
         self.assertNotIn("上一级", r)
@@ -140,7 +143,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn(f"[L1:T2:S1] {U}想把「甲服务」升到新版本", text)
         self.assertIn(f"[L1:T2:S3] {U}要加「回退」。", text)
         self.assertEqual(body(pull.relive(self.conn, ["L1:T1:S1"], **self.kw)), body(pull.relive(self.conn, ["T2:S1"], **self.kw)))
-        self.assertIn("▶ L1:T2:S3", pull.relive(self.conn, ["L1:S3"], **self.kw))           # 按线编的旧句柄
+        self.assertIn("▶ L1:T2:S3", pull.relive(self.conn, ["L1:S3"], near=True, **self.kw))           # 按线编的旧句柄
         self.assertIn(f"- L1:T2:S3 {U}要加「回退」。", pull.relive(self.conn, ["T2"], **self.kw))
         old = pull.relive(self.conn, ["T1"], **self.kw)
         self.assertTrue(body(old).startswith("T1：这段会话以前的话题，现在是 L1:T2\n[L1:T2]"))
@@ -235,6 +238,17 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual(shown, [e for e in evs if e in {r[0] for r in rows}][:len(shown)])
         self.assertEqual(shown, got["event"])
 
+    def test_source_by_clause(self):
+        """来源按分句排（2026-11-05）：每条 E 挂到最像的分句，按分句先后给；向量一路用不了照旧（返回 None）。"""
+        from unittest import mock
+        rs = [{"id": 1, "text": "a"}, {"id": 2, "text": "b"}, {"id": 3, "text": "c"}]
+        with mock.patch.object(pull.vector, "align", return_value=[2, 0, 0]):
+            got = pull._by_clause(self.conn, "甲。乙；丙。", rs)
+        self.assertEqual([(c, [r["id"] for r in m]) for c, m in got], [("甲。", [2, 3]), ("丙。", [1])])
+        with mock.patch.object(pull.vector, "align", return_value=None):
+            self.assertIsNone(pull._by_clause(self.conn, "甲。乙。", rs))
+        self.assertIsNone(pull._by_clause(self.conn, "甲。乙。", rs[:1]))
+
     def test_topic_sections(self):
         """v0.19：话题超窗时先给目录，按 observe 预览的分组归节、节名用“类型”，同一轮以最近一次预览为准；接着读照旧；said 在陈述上只给位置和开头。"""
         L = pull.layers(self.conn)
@@ -252,8 +266,12 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (occ, "observe", "preview", "{}", "", "", json.dumps(meta)))
             self.conn.commit()
             text = pull.show_node(L, nid, None, self.conn)[0]
-            self.assertIn("先给目录", text)
-            self.assertIn("第 1–2 轮 升级方案确认：", text)
+            self.assertIn("先给这段对话的结构", text)                  # 有 form 写的结构：结构在前（v0.38）
+            self.assertIn("J1 判断（我；S1）先迁配置再升", text)
+            self.assertIn("第 1–2 轮 升级方案确认：", text)             # 目录跟在后面
+            from unittest import mock
+            with mock.patch.object(pull.structure, "latest", return_value=None):
+                self.assertIn("先给目录", pull.show_node(L, nid, None, self.conn)[0])   # 没有结构（或对不上现在的主列）照旧给目录
         finally:
             pull._WIN.reset(tok)
         t, _ = pull.show_stmt(self.conn, L, items[0]["id"], "S1", said=True)
@@ -336,6 +354,14 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertTrue(retrieve.finder("外接键盘")(retrieve.plain("接上 外接 键盘")))
         self.assertTrue(retrieve.finder("ds·")(retrieve.plain("例如「ds·Deepseek」")))
 
+    def test_stmt_day(self):
+        """v0.40：陈述的日期取它的 E 出自的轮次里最晚的那天；读视图里缓存。"""
+        L = pull.layers(self.conn)
+        for sid in list(L.stmts)[:3]:
+            d = pull._stmt_day(L, sid)
+            self.assertTrue(d == "日期未知" or (len(d) == 10 and d[4] == "-"), d)
+            self.assertIs(pull._stmt_day(L, sid), d)
+
     def test_evoke_head(self):
         """v0.32：页头说同时含全部词的有几个；一个没有就说去掉哪个词有几个（查得太严时给个松开的方向）；没命中、太常见的也说。"""
         ts = ["QQ", "主动", "接话"]
@@ -415,7 +441,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("\n#### 工具\n", text)
         self.assertIn("roam w", text)                                # 常用入口 2026-10-24 并进“最近停下的几件事”，这里只留 roam 的提示
         self.assertNotIn("- L1 X 升级", text)
-        self.assertTrue(text.startswith('<memory-harness use="') and text.endswith("</memory-harness>"))
+        self.assertTrue(text.startswith('<memory-harness>\n') and text.endswith("</memory-harness>"))      # 送达编号不进标签（2026-11-02）
         self.assertIn("## 环境\n", text)
         u = self._uses()[-1]
         self.assertEqual((u["channel"], u["mode"]), ("push", "assist"))
@@ -489,6 +515,15 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual((q["skip"], q["host"]["kind"]), ("宿主注入", "宿主自动记忆任务"))
         self.assertNotIn("missing", q)
 
+    def test_associate_skips_orca_restart(self):
+        """Orca 重启后的固定续接提示（2026-11-06）宿主记成用户消息，不是用户在说话：不联想，只记宿主事件。"""
+        from ..push import associate
+        got = associate.associate(self.conn, "Orca restarted, which stopped what you were doing: a reply in progress. Then carry on.",
+                                  session="t", cwd="/w", host="codex")
+        self.assertIsNone(got)
+        q = json.loads(self._uses()[-1]["query"])["associate"]
+        self.assertEqual((q["skip"], q["host"]["kind"]), ("宿主注入", "Orca 重启续接"))
+
     def test_associate_follows_yorimichi(self):
         """yorimichi：0 不送达；1–3 送达，按条数截。"""
         from unittest.mock import patch
@@ -519,7 +554,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         head = pull._head(L, "T2")
         self.assertEqual(head.count("\n"), 1)
         self.assertIn("挂线待审视：晚到的 E", head)
-        self.assertIn("feedback", head)
+        self.assertNotIn("feedback", head)                      # v0.36：feedback 工具撤了，不再指过去
 
     def test_status_kernel(self):
         """内核在这个仓库里时，近况列近几天的内核日志 warn；旧的、不到 warn 的不列。"""
@@ -619,15 +654,13 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_mcp(self):
         names = [t["name"] for t in mcp.handle(self.conn, {"id": 1, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["evoke", "relive", "roam", "feedback", "yorimichi", "observe-now"])
+        self.assertEqual(names, ["evoke", "relive", "roam", "yorimichi"])      # v0.36 撤了 feedback，v0.41 撤了 observe-now
         r = mcp.handle(self.conn, {"id": 2, "method": "tools/call",
                                    "params": {"name": "relive", "arguments": {"handles": ["s-1"], "session": "t"}}})["result"]
         self.assertFalse(r["isError"])
-        uid = self.conn.execute('SELECT max(occurrence) FROM use_detail').fetchone()[0]
-        feedback = mcp.handle(self.conn, {"id": 3, "method": "tools/call", "params": {"name": "feedback", "arguments":
-                   {"scope": "presentation", "use": uid, "reason": "保留原说话人", "session": "t"}}})["result"]
-        self.assertFalse(feedback["isError"])
-        self.assertIn(f"use {uid}", feedback["content"][0]["text"])
+        gone = mcp.handle(self.conn, {"id": 3, "method": "tools/call", "params": {"name": "feedback", "arguments":
+               {"handle": "T1", "reason": "x", "session": "t"}}})["result"]
+        self.assertTrue(gone["isError"])
         self.assertIn("[L1:T1]", r["content"][0]["text"])       # 旧写法 s-1 也认，写 L1:T1
         bad = mcp.handle(self.conn, {"id": 4, "method": "tools/call",
                                      "params": {"name": "relive", "arguments": {"handle": "L1"}}})["result"]
@@ -635,6 +668,13 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertIn("没有参数 handle", bad["content"][0]["text"])
         self.assertIn("缺 handles", bad["content"][0]["text"])
         self.assertNotIn("Traceback", bad["content"][0]["text"])
+        props = next(t for t in mcp.handle(self.conn, {"id": 5, "method": "tools/list"})["result"]["tools"]
+                     if t["name"] == "evoke")["inputSchema"]["properties"]
+        self.assertNotIn("grain", props)                            # v0.35：主会话看不到这个参数
+        hidden = mcp.handle(self.conn, {"id": 6, "method": "tools/call",
+                                        "params": {"name": "evoke", "arguments": {"words": ["X 升级"], "grain": "L", "session": "t"}}})["result"]
+        self.assertTrue(hidden["isError"])                          # 真带了照常报参数不对
+        self.assertIn("没有参数 grain", hidden["content"][0]["text"])
 
 
 for _name in [n for n in dir(ft.FormTest) if n.startswith("test_")]:

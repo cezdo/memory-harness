@@ -35,7 +35,7 @@ export function apply(ctx) {
         description: c.description,
         handler: ({ rawInput }) => {
           if (rawInput.trim()) return { kind: "error", text: `用法：/${c.name}（不带参数）` };
-          if (c.name === "do-observe") wake();            // 把尾巴现在读掉
+          if (c.name === "do-observe") wake();            // 恢复观察，循环早点醒（读掉尾巴 11-06 随快道撤了）
           return { kind: "success", text: c.text };
         },
       });

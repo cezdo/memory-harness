@@ -1,7 +1,9 @@
 """form 的测试：单位怎么挑（告一段落、门槛、只认新做法的 E）、三步的解析与写入、挂线（有骨架、没骨架）、失败计数与不挡后面、
 程序补词与线的索引词。模型换成假的，不调模型。python3 -m unittest mh.engram.form.test
 """
+from unittest import mock
 import io
+import re
 import subprocess
 import json
 import tempfile
@@ -15,7 +17,7 @@ from .. import store as st
 from ..observe import collect
 from ..observe.sources.turn import Session, Turn
 from ..observe.test import FakeModel, FakeSource
-from . import attach, label, pack, skeleton
+from . import attach, label, pack, skeleton, structure
 from ..store.instance import USER_NAME as U
 
 PLAN = "### 第 1–2 轮\n类型：讨论\n读法：精读\n"
@@ -40,10 +42,18 @@ LABEL = """名字：X 升级
 """
 
 
+STRUCT = '{"nodes":[{"id":"Q1","type":"问题","text":"甲服务怎么升级","asked":[],"by":"共同","from":[1]},'\
+         '{"id":"J1","type":"判断","text":"先迁配置再升","because":"新版去掉了旧配置","by":"我","from":[1,9]}],'\
+         '"edges":[{"from":"J1","to":"Q1","type":"回应"},{"from":"J1","to":"Q9","type":"支持"}],"objects":[]}'
+
+
 class FormTest(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.conn = st.connect(self.dir / "engram.db")
+        p = patch.object(structure, "PAGE", 0)          # 测试的会话只有几条陈述：照样做结构（正式的超过一页才做）
+        p.start()
+        self.addCleanup(p.stop)
         self.now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
 
     def _session(self, sid, start, cwd="/w"):
@@ -331,25 +341,62 @@ class FormTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             form.feedback(self.conn, me, "K12", "旧认识")                    # 现在只接会话入口
 
-    def _fakes(self, packs=(), labels=(), attaches=(), induces=()):
+    def _fakes(self, packs=(), labels=(), attaches=(), induces=(), structures=()):
         return {"pack": FakeModel(list(packs)), "induce": FakeModel(list(induces) or ["无"] * 20), "label": FakeModel(list(labels)),
-                "attach": FakeModel(list(attaches)), "attach_lines": FakeModel(list(attaches))}
+                "attach": FakeModel(list(attaches)), "attach_lines": FakeModel(list(attaches)),
+                "structure": FakeModel(list(structures) or [STRUCT] * 20)}
 
     def _run(self, fakes, **kw):
         return form.run(self.conn, workers=1, models=fakes, log=io.StringIO(), now=self.now, **kw)
 
+    def test_structure(self):
+        """会话结构（D4，2026-11-05）：挂完线以后做；越界的陈述编号、指向不存在节点的边去掉；陈述没变不重做。"""
+        a = self._session("s1", "2026-10-17T08:00:00Z")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
+        got = form.structures(self.conn)
+        self.assertEqual(len(got), 1)
+        act, items = next(iter(got.values()))
+        self.assertTrue(items)
+        d = json.loads(self.conn.execute("SELECT output FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0])
+        self.assertEqual(d["nodes"][1]["from"], [1])                                    # 9 越界
+        self.assertEqual([e["to"] for e in d["edges"]], ["Q1"])                          # 指向 Q9 的边去掉
+        self.assertIn("陈述1：", self.conn.execute("SELECT input FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0])
+        self._run(self._fakes())
+        self.assertEqual(form.structures(self.conn), got)                               # 陈述没变：不重做
+        self.assertEqual(structure.parse("不是 JSON", 3), (None, "没有 JSON"))
+
+    def test_pack_env_aliases(self):
+        """事件里出现用户的别的称呼时，环境里说明是同一个人；没出现就不加（2026-11-04）。"""
+        s = {"source": "dsh", "cwd": "/w", "model": "m", "begin": "2026-11-04T00:00", "end": "2026-11-04T01:00"}
+        with mock.patch.object(pack, "USER_NAME", "甲"), mock.patch.object(pack, "USER_ALIASES", ("甲", "乙", "丙")):
+            got = pack.env(s, "x", [{"text": "乙让我连接机器"}])
+            self.assertIn("「乙」是甲的别的称呼", got)
+            self.assertNotIn("丙", got)
+            self.assertNotIn("称呼：", pack.env(s, "x", [{"text": "甲让我连接机器"}]))
+
+    def test_pack_unlink(self):
+        """预览站的页面链接连同引子去掉，Markdown 链接留文字；不带页面号的（说预览站本身）不动（2026-11-04）。"""
+        u = "https://p.example/"
+        self.assertEqual(pack.unlink("原件在 a.md，预览为 https://p.example/#0123456789abcdef，提交为 x。", u), "原件在 a.md，提交为 x。")
+        self.assertEqual(pack.unlink("发布了[对照页](https://p.example/#0123456789abcdef)。", u), "发布了对照页。")
+        self.assertEqual(pack.unlink("结果在 a.md（预览：https://p.example/#0123456789abcdef）。", u), "结果在 a.md。")
+        self.assertEqual(pack.unlink("入口改成 https://p.example/#...", u), "入口改成 https://p.example/#...")
+        self.assertEqual(pack.unlink("预览为 https://p.example/#0123456789abcdef", ""), "预览为 https://p.example/#0123456789abcdef")
+
     def test_pack_check(self):
-        """pack-v0.4 的检查（2026-10-27）：范围、不在输入里、超过两页、两页跨了预览的组。"""
+        """pack 的检查 v3（2026-11-04）：范围、不在输入里、正文太长（软的）；来源多少不再管（v2 的页对齐去掉了）。"""
         evs = [{"id": i, "turn": 100 + i // 10, "ordinal": i // 10} for i in range(1, 30)]
         groups = {100: ("p", 1, 1, "a"), 101: ("p", 2, 2, "b"), 102: ("p", 3, 3, "c")}
         it = lambda n, basis, **kw: {"n": n, "text": "", "basis": basis, "quotes": [], "files": [], **kw}
         got = dict(pack.check([it(1, [1, 2], ranges=True), it(2, [1, 99]), it(3, list(range(1, 20))),
-                               it(4, list(range(1, 11))), it(5, list(range(10, 20))), it(6, [1, 2, 3])], evs, groups))
+                               it(4, [1], text="字" * (pack.LONG + 1)), it(6, [1, 2, 3]),
+                               it(7, [1], text="字" * (pack.LONG - 20) + "『文件：" + "a/" * 40 + "x.py』")], evs, groups))
         self.assertIn("范围", got[1])
         self.assertIn("E99", got[2])
-        self.assertIn("拆成几条", got[3])
-        self.assertIn("跨了第 1 轮、第 2 轮", got[4])                                       # 9–16 条跨了两组
-        self.assertNotIn(5, got)                                                           # 9–16 条在同一组（第 2 轮）
+        self.assertNotIn(3, got)                                                           # 19 条来源：不再拆
+        self.assertIn("是不是都必要", got[4])
+        self.assertNotIn(7, got)                                                           # 文件路径不算字数
+        self.assertTrue(pack.soft(got[4]) and not pack.soft(got[1]))
         self.assertNotIn(6, got)
         few = [dict(e, speaker=U if e["id"] == 2 else "我") for e in evs[:3]]                  # 覆盖（检查 v2）
         cov = pack.check([it(1, [1])], few, groups)
@@ -358,6 +405,47 @@ class FormTest(unittest.TestCase):
         self.assertEqual(pack.check([it(1, [1, 2, 3])], few, groups), [])
         _, _, items, _, _ = pack.parse("名字：x\n主题：y\n### 陈述1\nz\n来源：E1-E3\n", evs)
         self.assertTrue(items[0].get("ranges"))
+
+    def test_pack_splice(self):
+        """下一轮只交回改过的：按原编号换掉，N.1 接在第 N 条后面，重编号；回“保持”就是原样。"""
+        prev = "名字：x\n主题：y\n### 陈述1\na\n来源：E1\n### 陈述2\nb\n来源：E2\n### 陈述3\nc\n来源：E3\n"
+        got = pack.splice(prev, "### 陈述2\nb1\n来源：E2\n### 陈述2.1\nb2\n来源：E2\n")
+        self.assertEqual(re.findall(r"### 陈述(\d+)\n(\w+)", got), [("1", "a"), ("2", "b1"), ("3", "b2"), ("4", "c")])
+        self.assertTrue(got.startswith("名字：x\n主题：y"))
+        self.assertEqual(pack.splice(prev, "保持"), prev)
+
+    def test_pack_follow(self):
+        """模型能接着同一会话问（codex）：第一轮留会话，重写走下一轮、只交回改过的，程序拼回；用量合起来；会话最后删掉。"""
+        e = self._session("s1", "2026-10-17T08:00:00Z")
+        long = PACK.format(a=e[0], b=e[1]).replace("想把「甲服务」升到新版本", "想把「甲服务」升到新版本" + "很" * pack.LONG, 1)
+
+        class Follow:
+            model, platform, isolation = "fake-model", "fake", "fake-iso"
+
+            def __init__(self):
+                self.calls, self.closed = [], []
+
+            def __call__(self, prompt, keep=False):
+                self.calls.append(("first", keep))
+                return long, {"usage": {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": 10}, "thread": "t1"}
+
+            def follow(self, thread, prompt):
+                self.calls.append(("follow", thread, "是不是都必要" in prompt))
+                return "### 陈述1\n短了\n来源：E%d\n" % e[0], {"usage": {"input_tokens": 120, "cached_input_tokens": 110, "output_tokens": 5}}
+
+            def close(self, thread):
+                self.closed.append(thread)
+
+        m = Follow()
+        evs = [{"id": i, "turn": 0, "ordinal": 0, "speaker": "我"} for i in e]
+        out, meta, err = form.pack_call(m, "原输入", evs, {})
+        self.assertIsNone(err)
+        self.assertEqual(m.calls, [("first", True), ("follow", "t1", True)])
+        self.assertEqual(m.closed, ["t1"])
+        self.assertIn("短了", out)
+        self.assertEqual(meta["rewrite"][0]["via"], "follow")
+        self.assertEqual(st.cost(1, meta["usage"])["tokens"], {"input": 50, "output": 15, "cache_read": 170})
+        self.assertNotIn("violations", meta)
 
     def test_pack_rewrite(self):
         """检查出不合规的陈述，带着问题当场重写一次；重写后的入库，第一次的输出和问题留在 meta。"""
@@ -525,6 +613,7 @@ class FormTest(unittest.TestCase):
         self.assertEqual((n, stops, lists), ("X 升级", [("定下按 b 做法升级", [1, 2])], [["X 升级", "升级 X"], ["docs/x.md"]]))
         self.assertEqual(label.parse("名字：a\nkey：\n- b｜c\n")[2], [["b", "c"]])          # 旧写法 key 也认
         self.assertEqual(attach.parse("挂到：新线 Y（父：L3）｜为什么：w", False)[1:3], ("新线 Y", "L3"))
+        self.assertEqual(attach.parse("节点：global｜挂到：新线 Y｜为什么：w", True)[:2], ("global", "新线 Y"))   # 节点写成路径也认，由 form 换成编号
         self.assertEqual([form.handle_of(x) for x in ("l-3", "s-5", "t5", "L3", "k-engram")], ["L3", "T5", "T5", "L3", "k-engram"])
         self.assertEqual(label.dedup("x 升级", ["X 升级"], "2026-10-17T08:00:00Z"), ("x 升级（10-17）", "X 升级"))
         self.assertEqual(label.dedup("X 升级", ["X 升级", "X 升级（10-17）"], "2026-10-17T08:00:00Z"),
@@ -542,7 +631,7 @@ class FormTest(unittest.TestCase):
                             ["挂到：新线 X 升级｜为什么：新的目标", "挂到：L1｜为什么：同一个目标"])
         self._run(fakes)
         steps = [r[0] for r in self.conn.execute("SELECT a.step FROM act_detail a WHERE a.process='form' ORDER BY a.occurrence")]
-        self.assertEqual(steps, ["pack", "pack", "induce", "induce", "label", "label", "attach", "attach"])
+        self.assertEqual(steps, ["pack", "pack", "induce", "induce", "label", "label", "attach", "attach", "structure", "structure"])
         import hashlib
         for r in self.conn.execute("SELECT input,meta FROM act_detail WHERE process='form'"):
             ex = json.loads(r['meta'])['expression']
@@ -615,7 +704,7 @@ class FormTest(unittest.TestCase):
         ind = "### 归纳1\n升级排查：查明是数据目录变了。\n来源：陈述2、陈述3\n转折：陈述3\n"
         self._run(self._fakes([pk], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"], [ind]))
         steps = [r[0] for r in self.conn.execute("SELECT step FROM act_detail WHERE process='form' ORDER BY occurrence")]
-        self.assertEqual(steps, ["pack", "induce", "label", "attach"])
+        self.assertEqual(steps, ["pack", "induce", "label", "attach", "structure"])
         rows = self.conn.execute("SELECT id, text, refs, labels FROM form_record WHERE kind='session' ORDER BY id").fetchall()
         self.assertEqual(len(rows), 4)
         up = rows[-1]

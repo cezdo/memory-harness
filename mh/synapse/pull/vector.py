@@ -92,6 +92,18 @@ def _down(e):
     print(f"[mh] 向量一路不可用，只用字面：{e!r}"[:300], file=sys.stderr)
 
 
+def align(conn, clauses, items, timeout=TIMEOUT):
+    """每个事件对到最像的分句（relive 的来源按分句排，2026-11-05）。→ [分句序号…]，用不了返回 None（照旧按 form 写下的顺序）。"""
+    if not ENABLED or len(clauses) < 2 or not items or time.time() < _STATE["down_until"] or not _main_db(conn):
+        return None
+    try:
+        best = _post("/align", {"clauses": clauses, "items": items}, timeout)["best"]
+        return best if len(best) == len(items) else None
+    except Exception as e:                                          # noqa: BLE001
+        _down(e)
+        return None
+
+
 def search(conn, text, k=50, prefix="s:", timeout=1.5):
     """只查、不同步（联想的钩子用：每一轮都要等它，同步交给整理循环）。返回 [(编号, 分数)…]，用不了返回 None。"""
     if not ENABLED or not text.strip() or time.time() < _STATE["down_until"] or not _main_db(conn):

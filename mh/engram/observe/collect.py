@@ -18,7 +18,7 @@ from ..store import NA, UNKNOWN, iso, occurrence, operator
 from ..store.delete import deleted
 
 SCRIPT_PREFIX = "（定时任务"          # 脚本、定时任务发起的轮次（见 synapse.hosts.HOST）
-HOST_KINDS = {"通知": "notification", "打断": "interrupt", "命令": "command", "压缩": "compaction"}
+HOST_KINDS = {"通知": "notification", "打断": "interrupt", "命令": "command", "压缩": "compaction", "重启": "restart"}
 COLLECTOR = "observe/collect-v4"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main；
                                          # v4（2026-11-01）：别的会话发来的消息记在 turn_detail.asides
 
@@ -60,6 +60,8 @@ def save(conn, op, session, turns, log=None):
     if turns and not turns[-1].closed:
         turns = turns[:-1]
     s = session
+    if s.kind != "user":            # 只采人直接参与的主会话（用户 11-06）：子代理、codex 的自动审查没有读的一方，宿主原文件还在
+        return 0, 0, 0
     if (s.source, s.session) in deleted(conn)[0]:          # 按要求删掉的会话不采回来（store.delete）
         return 0, 0, 0
     row = conn.execute("SELECT occurrence FROM session_detail WHERE source=? AND session=?", (s.source, s.session)).fetchone()
@@ -102,6 +104,9 @@ def save(conn, op, session, turns, log=None):
             fixed += conn.execute("UPDATE turn_detail SET prev=? WHERE occurrence=?", (t.prev, oid)).rowcount
         if t.ending and old["ending"] in (UNKNOWN, "normal"):
             fixed += conn.execute("UPDATE turn_detail SET ending=? WHERE occurrence=?", (t.ending, oid)).rowcount
+        org, kind = origin(t.user) if s.source != switch.SOURCE else (old["origin"], old["host_kind"])
+        if old["origin"] == "human" and org != "human":   # 程序新认得的宿主注入、脚本（如 2026-11-06 的 Orca 重启提示）：只从 human 改出去
+            fixed += conn.execute("UPDATE turn_detail SET origin=?, host_kind=? WHERE occurrence=?", (org, kind, oid)).rowcount
         had = json.loads(old["asides"])                  # 别的会话发来的消息：2026-11-01 前入库的行没记；只往后添，已有的不改
         if len(t.asides) > len(had) and t.asides[:len(had)] == had:
             fixed += conn.execute("UPDATE turn_detail SET asides=? WHERE occurrence=?", (st.dumps(t.asides), oid)).rowcount

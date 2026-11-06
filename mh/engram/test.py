@@ -102,6 +102,19 @@ class EngramTest(unittest.TestCase):
         self.conn.execute("UPDATE event SET text='改过' WHERE id=?", (self.e1,))
         self.assertIn("覆盖：event 里上次有的行被改过", check.check(self.conn, self.db))
 
+    def test_check_after_delete(self):
+        """按要求删掉的（2026-11-06，删子代理和审查时）：快照之后有了新的删除记录，删掉的行所在的块单列，不算静默丢了；
+        完整的 check 换了快照就不再报。"""
+        from .store.delete import delete_sessions
+        check.check(self.conn, self.db)                                                    # 存下快照
+        src, ses = self.conn.execute("SELECT source, session FROM session_detail LIMIT 1").fetchone()
+        delete_sessions(self.conn, [(src, ses)], "测试")
+        report = check.check(self.conn, self.db, brief=True)
+        self.assertNotIn("上次有的行被改过", report)
+        self.assertIn("按删除记录删掉的", report)
+        check.check(self.conn, self.db)                                                    # 完整的 check 换快照
+        self.assertNotIn("按删除记录删掉的", check.check(self.conn, self.db))
+
     def test_check_relations(self):
         j1, = self._form([self.e1])
         j2, = self._form([self.e2], [("判断二", [{"kind": "supersedes", "to": j1}])])

@@ -154,13 +154,16 @@ class Codex:
         # 两样都会改模型看到的东西，用的一方要换 isolation 标签（回复，2026-10-31）
         self.model, self.effort, self.platform, self.no_tools, self.allow = model, effort, platform, no_tools, frozenset(allow)
         self.config, self.instructions = [a for kv in config for a in ("-c", kv)], instructions
+        self._threads = {}             # keep 留下的会话 id → 到目前为止的累计用量（resume 的 turn.completed 报的是整个会话的累计）
         if isolation:
             self.isolation = isolation
         if no_tools:
             self.isolation += "-notools" + "".join(f"+{a}" for a in sorted(self.allow))
 
-    def __call__(self, prompt, images=()):
+    def __call__(self, prompt, images=(), keep=False):
         # images：附在提示词上的图片文件（回复看清时的图，2026-10-31）；--image=路径 逐张写，免得 -i 把后面的 "-" 也当成图
+        # keep：留下会话（不加 --ephemeral），meta["thread"] 是会话 id，之后 follow 接着问、close 删掉（pack 的重写，2026-11-04）。
+        # 会话文件在隔离的 CODEX_HOME 里，采集只读 ~/.codex，不会采回来
         env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
         cat = catalog(self.model)
         own = self.config + (["-c", f'model_instructions_file="{self.instructions}"'] if self.instructions else [])
@@ -173,7 +176,7 @@ class Codex:
                 extra = ["-c", f"model_catalog_json={cat}"] if cat else []
                 return subprocess.run(
                     ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, *NO_UPDATE, *own, *extra,
-                     "--strict-config", "--ephemeral", "--skip-git-repo-check",
+                     "--strict-config", *([] if keep else ["--ephemeral"]), "--skip-git-repo-check",
                      "-s", "read-only", "-C", tmp, "-o", str(out), "--json", *(f"--image={i}" for i in images), "-"],
                     input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env)
 
@@ -202,13 +205,58 @@ class Codex:
             for e in events:                        # 每次请求的 token：输入、其中命中缓存的、输出（2026-10-31 起记）
                 for k, v in (e.get("usage") or {}).items() if e.get("type") == "turn.completed" else ():
                     usage[k] = usage.get(k, 0) + v
+            meta = {"model": self.model, "tool_events": len(tools), "isolation": self.isolation,
+                    "usage": usage, "seconds": round(time.monotonic() - began, 1)}
+            if keep:
+                meta["thread"] = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
+                if meta["thread"]:
+                    self._seen()[meta["thread"]] = usage
+            return out.read_text(), meta
+
+    def _seen(self):
+        return self._threads
+
+    def follow(self, thread, prompt):
+        """接着 keep 留下的会话问下一轮（codex exec resume）：前面的输入命中缓存。返回 (文本, 调用信息)，用量是这一轮自己的。"""
+        env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
+        cat = catalog(self.model)
+        own = self.config + (["-c", f'model_instructions_file="{self.instructions}"'] if self.instructions else [])
+        began = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="mh-codex-") as tmp:
+            out = Path(tmp) / "last.txt"
+            p = subprocess.run(
+                ["codex", "exec", "resume", thread, "-c", f"model_reasoning_effort={self.effort}", *OFFLINE_FEATURES, *NO_UPDATE, *own,
+                 *(["-c", f"model_catalog_json={cat}"] if cat else []), "--strict-config", "--skip-git-repo-check",
+                 "-o", str(out), "--json", "-"],
+                input=prompt, capture_output=True, text=True, timeout=self.timeout, env=env, cwd=tmp)
+            events = [json.loads(l) for l in p.stdout.splitlines() if l.startswith("{")]
+            if p.returncode != 0 or not out.exists():
+                said = [e.get("message") or e.get("error", {}).get("message", "") for e in events if e.get("type") in ("error", "turn.failed")]
+                raise RuntimeError(f"codex exec resume 失败（{p.returncode}）：{p.stderr[-500:]}{' '.join(said)[-500:]}")
+            tools = {(e.get("item") or {}).get("id") for e in events
+                     if (e.get("item") or {}).get("type") not in (None, "agent_message", "reasoning", "error", *self.allow)}
+            if self.no_tools and tools:
+                raise RuntimeError(f"观察者调用了工具（{len(tools)} 次），结果作废")
+            total = {}
+            for e in events:
+                for k, v in (e.get("usage") or {}).items() if e.get("type") == "turn.completed" else ():
+                    total[k] = v                        # 累计值，取最后一次
+            before = self._seen().get(thread, {})
+            usage = {k: v - before.get(k, 0) for k, v in total.items()}
+            self._seen()[thread] = total
             return out.read_text(), {"model": self.model, "tool_events": len(tools), "isolation": self.isolation,
                                      "usage": usage, "seconds": round(time.monotonic() - began, 1)}
 
+    def close(self, thread):
+        """删掉 keep 留下的会话文件。"""
+        self._seen().pop(thread, None)
+        for f in (self.home / "sessions").glob(f"**/*{thread}*.jsonl"):
+            f.unlink(missing_ok=True)
+
 
 class Dsh:
-    """DeepSeek，经 dsh 更新测试实例的 headless 模式。模型与密钥由该实例的配置决定，换 key 不用动这里。
-    会话写在测试实例自己的 home 里，不进 ~/.dsh，不会被采回。"""
+    """DeepSeek，经 mh 专用的 dsh 实例（[tools].dsh_test，2026-11-06 起 /usr/local/mh-tools/dsh-observe；以前借 dsh 更新测试实例，随它的 teardown 删掉过）的 headless 模式。模型与密钥由该实例的配置决定，换 key 不用动这里。
+    platform 里的“测试实例”是 Operator 身份的一部分，沿用不改。会话写在实例自己的 home 里，不进 ~/.dsh，不会被采回。"""
     timeout = TURN_TIMEOUT
     root = DSH_TEST or Path.home() / "dsh-test"    # 测试实例的位置：实例配置
 
@@ -225,7 +273,7 @@ class Dsh:
             # 叠加某个 profile 的 patch，借用它的 provider 配置（如 web 里 llm-pi-ai 声明的 opencode-go）
             patch = ["--patch", str(self.root / f"home/profiles/{self.profile}/cordis.patch.yml")] if self.profile else []
             patch += [a for p in self.extra for a in ("--patch", str(p))]
-            p = subprocess.run(["node", str(self.root / "env-next/lib/bin.js"), "headless", *patch, "--json", "-"],
+            p = subprocess.run(["node", str(self.root / "env/lib/bin.js"), "headless", *patch, "--json", "-"],
                                input=prompt, capture_output=True, text=True, timeout=self.timeout, cwd=tmp, env=env)
         events = [json.loads(l) for l in p.stdout.splitlines() if l.startswith("{")]
         final = next((e["text"] for e in reversed(events) if e.get("type") == "final"), None)
@@ -315,7 +363,7 @@ class DshWeb(Dsh):
                 "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve",
                 "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
                 "--symlink", "usr/sbin", "/sbin", "--proc", "/proc", "--dev", "/dev", "--ro-bind", "/sys", "/sys", "--tmpfs", "/tmp",
-                "--ro-bind", str(self.NODE), str(self.NODE), "--ro-bind", str(self.root / "env-next"), str(self.root / "env-next"),
+                "--ro-bind", str(self.NODE), str(self.NODE), "--ro-bind", str(self.root / "env"), str(self.root / "env"),
                 "--bind", str(home), str(home), "--bind", str(box / "sessions"), str(home / "sessions"),
                 "--bind", str(box / "cwd"), str(box / "cwd"), "--ro-bind", str(box / "patches"), str(box / "patches")]
         for m in self.mask:
@@ -336,7 +384,7 @@ class DshWeb(Dsh):
         for p in self.extra:
             (self.box / "patches" / p.name).write_bytes(p.read_bytes())
             patch += ["--patch", str(self.box / "patches" / p.name)]
-        argv = [str(self.NODE / "bin/node"), str(self.root / "env-next/lib/bin.js"), "web", *patch,
+        argv = [str(self.NODE / "bin/node"), str(self.root / "env/lib/bin.js"), "web", *patch,
                 "--port", str(self.port), "--host", "127.0.0.1", "--no-open"]
         sv["proc"] = _launcher.submit(
             subprocess.Popen, self._box(argv), stdout=open(log, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -486,8 +534,11 @@ class Claude:
 
     def __call__(self, prompt):
         self.home.mkdir(parents=True, exist_ok=True)
-        if not (self.home / ".credentials.json").exists():
-            (self.home / ".credentials.json").symlink_to(Path.home() / ".claude/.credentials.json")
+        cred = self.home / ".credentials.json"
+        if cred.exists() and not cred.is_symlink():          # claude 刷新令牌时会把链接改写成普通文件，副本就停在旧令牌上（11-03 起 OAuth 过期）
+            cred.rename(cred.with_name(f".credentials.json.stale-{int(time.time())}"))
+        if not cred.is_symlink():
+            cred.symlink_to(Path.home() / ".claude/.credentials.json")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.home))
         with tempfile.TemporaryDirectory(prefix="mh-claude-") as tmp:
             p = subprocess.run(

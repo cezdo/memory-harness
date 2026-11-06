@@ -154,8 +154,71 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(trail["calls"][0]["usage"]["cached_input_tokens"], 8)
         sysp = (self.dir / "system.md").read_text()                # 人设和规则进系统提示，不进用户消息
         self.assertTrue(sysp.startswith("我是测试人设。"))
-        self.assertIn("不超过 5 字", sysp)
+        self.assertIn("多数时候在 5 字以内", sysp)
         self.assertNotIn("我是测试人设", calls[0])
+
+    def notice(self, mid, uid=2, kind="group_recall", **k):
+        return {"post_type": "notice", "notice_type": kind, "group_id": 5, "user_id": uid,
+                "message_id": mid, "operator_id": uid, **k}
+
+    def test_recall(self):
+        r, calls = self.make([])
+        r.note(self.msg(1, 2, "assistant 在吗"))
+        self.assertIn(("group", "5"), r.pending)
+        r.note(self.notice(1))                                  # 叫我的那句撤回：不回了，记录里也没有
+        self.assertEqual(list(r.history[("group", "5")]), [])
+        self.assertEqual(r.pending, {})
+
+    def test_recall_keeps_others(self):
+        r, _ = self.make([])
+        r.note(self.msg(1, 2, "assistant 在吗"))
+        r.note(self.msg(2, 3, "闲聊"))
+        r.note(self.notice(2))
+        self.assertEqual([m["id"] for m in r.segment()], ["1"])
+        self.assertIn(("group", "5"), r.pending)                # 还有叫我的那句，照回
+        self.assertEqual(view(r.segment(), 9, r.who), "1 阿明：assistant 在吗")
+
+    def test_recall_renumbers_and_skips_proactive(self):
+        r, _ = self.make(["（不回）"], hourly_max=10)
+        r.note(self.msg(1, 3, "a"))
+        r.note(self.msg(2, 4, "b"))
+        r.note(self.notice(1))
+        self.assertEqual(view(r.segment(), 9, r.who), "1 u4：b")   # 编号顺延
+        r.note(self.msg(3, 3, "c"))
+        self.assertNotIn(("group", "5"), r.pending)              # 撤回后只有 2 条人话，不够 3 条
+        r.note(self.msg(4, 3, "d"))
+        self.assertIn(("group", "5"), r.pending)
+
+    def test_recall_out_of_order_and_private(self):
+        r, _ = self.make([])
+        r.note(self.notice(9))                                   # 先到撤回
+        r.note(self.msg(9, 2, "assistant 在吗"))
+        self.assertEqual(list(r.history.get(("group", "5"), [])), [])
+        self.assertEqual(r.pending, {})
+        dm = {"post_type": "message", "message_type": "private", "message_id": 10, "user_id": 2,
+              "time": time.time(), "sender": {"nickname": "x"},
+              "message": [{"type": "text", "data": {"text": "在吗"}}]}
+        r.note(dm)
+        r.note({"post_type": "notice", "notice_type": "friend_recall", "user_id": 2, "message_id": 10})
+        self.assertEqual(list(r.history[("private", "2")]), [])
+        self.assertEqual(r.pending, {})
+
+    def test_active_window(self):
+        r, calls = self.make(["在", "嗯"], proactive_hourly=0)
+        r.note(self.msg(1, 2, "assistant 在吗"))
+        self.assertIn(("group", "5"), r.pending)
+        r.pending.clear()                                   # 模拟这一句已经回完
+        r.said[("group", "5")] = time.time()
+        r.note(self.msg(2, 3, "接着聊啊"))                    # 没 @、没名字
+        self.assertIn(("group", "5"), r.pending)
+        self.assertTrue(r.pending[("group", "5")]["active"])
+        r.pending.clear()
+        r.note(self.msg(3, 7, "bot 也说话"))                  # bot 的话不开窗口
+        self.assertNotIn(("group", "5"), r.pending)
+        r.said[("group", "5")] = time.time() - r.active - 1  # 窗口过了
+        r.pending.clear()
+        r.note(self.msg(4, 3, "还在吗"))
+        self.assertNotIn(("group", "5"), r.pending)
 
     def test_look_marks_reply(self):
         r, calls = self.make(["（看 2）", "好的"])

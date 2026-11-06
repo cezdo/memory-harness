@@ -4,6 +4,7 @@
 """
 import io
 import json
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 import unittest
@@ -61,6 +62,13 @@ READ = f"""### 事件1
 """
 
 
+def peer_text(body="把包挪到 mh/engram。", name="迁移"):
+    """另一个会话发来的消息，形状照 Claude Code 2.1.29x 的会话文件。"""
+    return ("Another Claude session sent a message:\n"
+            f'<cross-session-message from="uds:/x" from-name="{name}" from-mode="prompting">{body}</cross-session-message>\n\n'
+            "This came from another Claude session — not typed by your user.")
+
+
 def states(conn):
     """progress → {轮次: state}。"""
     return {p["turn"]: p["state"] for p in observe.progress(conn)}
@@ -82,13 +90,6 @@ def assert_live(test, conn):
     for _, group, _ in observe.to_read(conn):
         cover |= set(group["turns"])
     test.assertEqual(pending - cover, set(), "待观测却没有办法前进的轮")
-
-
-def peer_text(body="把包挪到 mh/engram。", name="迁移"):
-    """另一个会话发来的消息，形状照 Claude Code 2.1.29x 的会话文件。"""
-    return ("Another Claude session sent a message:\n"
-            f'<cross-session-message from="uds:/x" from-name="{name}" from-mode="prompting">{body}</cross-session-message>\n\n'
-            "This came from another Claude session — not typed by your user.")
 
 
 class FakeSource:
@@ -182,6 +183,9 @@ class ObserveTest(unittest.TestCase):
                  row(3, label.COMPACTION + " 总结……", "host", "compaction", long), row(4, "好的"),
                  row(5, note, "host", "notification", "还在跑")]
         self.assertEqual(preview.folds(turns), {2: 1, 3: 1, 4: 1, 6: 5})
+        restart = [row(0, "改一下", reply=""), row(1, label.RESTART + ": …", "host", "restart", long)]   # Orca 重启续接（2026-11-06）
+        self.assertEqual(preview.folds(restart), {2: 1})
+        self.assertIn(f"（第 2 轮：宿主转来{label.RESTART_MARK}；我接着回复 150 字", preview.build("提示词", "## 环境", restart, 0))
         self.assertEqual(preview.hidden(turns), {6})
         text = preview.build("提示词", "## 环境", turns, 0)
         self.assertIn("## 第 1 轮（连同第 2–4 轮）", text)
@@ -283,10 +287,18 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(waiting(self.conn), [])
 
     def test_label(self):
+        from . import label
         from .label import kind, relayed, strip_ide
         self.assertEqual(kind("<task-notification>x"), "通知")
         self.assertEqual(kind("[Request interrupted by user]"), "打断")
         self.assertIsNone(kind("帮我看看"))
+        restart = ("Orca restarted, which stopped what you were doing: a reply in progress, any subagents or background commands "
+                   "you had running, and any request waiting on the user. Before continuing, check what finished before the restart "
+                   "and don't repeat it. Restart anything still needed, ask again for anything still waiting on the user, then carry on.")
+        self.assertEqual(kind(restart), "重启")
+        self.assertEqual(label.user_text(restart)[0], label.RESTART_MARK)      # 正文不给，原文一段、标记一段
+        self.assertIn("Orca 重启后自动发来的续接提示", label.notes(restart, "好", True)[0])
+        self.assertTrue(label.notes("改一下", "", False, nxt=restart)[0].endswith("Orca 重启了，下一轮是重启后的续接。"))
         self.assertEqual(strip_ide("<ide_opened_file>The user opened the file /a/b.py in the IDE.</ide_opened_file>改一下")[0], "改一下")
         pasted = "看看这个：\n# 方案\n## 一\n" + "- 要点\n" * 10 + "正文" * 600
         self.assertEqual(relayed(pasted), "看看这个：")
@@ -335,6 +347,85 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual((n["turns"], n["fixed"]), (0, 2))
         self.assertEqual(self.conn.execute("SELECT closed, ending FROM turn_detail WHERE ordinal=2").fetchone()[:], (1, "aborted:user"))
         self.assertEqual(self.conn.execute("SELECT text FROM turn_detail WHERE ordinal=0").fetchone()[0], Turn("你好", "回答").id)
+
+    def test_clean_empty_sessions(self):
+        """清理空会话（2026-11-06）：没有用户的话、也没有回答的主会话删掉原文件；用户说了话没等到回答的、
+        末尾那轮还没入库的、原文里有回答的（解析器漏认了用户的话）、最近动过的都不删；codex 压成 .zst 的照样认；宿主开着的照删（用户 11-06）；删掉的记一笔。"""
+        from unittest.mock import patch
+        from . import clean
+        files, parsed = {}, {}
+        def add(sid, turns, kind="user"):
+            f = self.dir / f"{sid}.jsonl"
+            f.write_text("x")
+            files[sid] = f
+            sess = Session("codex", sid, str(f), kind=kind, started="2026-01-01T00:00:00Z", cwd="/w")
+            parsed[str(f)] = (sess, turns)
+            collect.run(self.conn, sources=("codex",), force=True, log=io.StringIO(), modules={"codex": FakeSource(f, sess, turns)})
+        add("empty", [])
+        add("command", [Turn("<command-name>/model</command-name>", "", closed=True)])
+        add("asked", [Turn("帮我看看", "", closed=True)])                        # 说了话、没等到回答
+        add("pending", [Turn("<command-name>/model</command-name>", "", closed=True), Turn("刚说", "")])   # 末尾一轮没入库
+        add("sub", [], kind="subagent")
+        add("open", [])
+        add("goal", [])                                                           # 解析器没认出用户的话，原文里却有回答
+        files["goal"].write_text('{"payload": {"type": "message", "role": "assistant"}}')
+        add("zipped", [])                                                         # codex 后来压成了 .zst，库里记的是压缩前的路径
+        subprocess.run(["zstd", "-q", "--rm", str(files["zipped"])], check=True)
+        fake = type("M", (), {"parse": staticmethod(lambda path: parsed.get(str(path), (None, [])))})
+        now = max(f.stat().st_mtime for f in self.dir.glob("*.jsonl*")) + clean.AGE + 1
+        record = self.dir / "cleaned.jsonl"
+        with patch.dict(clean.SOURCES, {"codex": fake}):
+            self.assertEqual(clean.clean(self.conn, now=files["empty"].stat().st_mtime + 60, record=record), [])   # 最近动过
+            got = clean.clean(self.conn, apply=True, now=now, record=record)
+        self.assertEqual(sorted(s for _, s, _ in got), ["command", "empty", "open", "zipped"])
+        self.assertEqual(sorted(f.name for f in self.dir.glob("*.jsonl")), ["asked.jsonl", "cleaned.jsonl", "goal.jsonl", "pending.jsonl", "s.jsonl", "sub.jsonl"])
+        self.assertEqual(len(record.read_text().splitlines()), 4)
+        self.assertFalse(list(self.dir.glob("*.zst")))
+
+    def test_collect_restart(self):
+        """Orca 重启后的固定续接提示（2026-11-06）是宿主注入；程序新认得以前当成 human 的轮，再采时改过来（只从 human 改出去）。"""
+        from . import label
+        turns = [Turn("改一下", "好", closed=True), Turn(label.RESTART + ": a reply in progress… then carry on.", "接着改完了", closed=True)]
+        self._collect(turns)
+        get = lambda: [tuple(r) for r in self.conn.execute("SELECT origin, host_kind FROM turn_detail ORDER BY ordinal")]
+        self.assertEqual(get(), [("human", NA), ("host", "restart")])
+        self.conn.execute("UPDATE turn_detail SET origin='human', host_kind=? WHERE ordinal=1", (NA,))
+        self.assertEqual(self._collect(turns)["dsh"]["fixed"], 1)
+        self.assertEqual(get(), [("human", NA), ("host", "restart")])
+        self.assertEqual(self._collect(turns)["dsh"]["fixed"], 0)
+
+    def test_collect_main_only(self):
+        """只采主会话（用户 2026-11-06）：子代理、自动审查不入库，文件照样记下处理过，下一轮不再解析。"""
+        f = self.dir / "sub.jsonl"
+        f.write_text("x")
+        sess = Session("codex", "sub", str(f), kind="subagent", started="2026-01-01T00:00:00Z", cwd="/w")
+        got = collect.run(self.conn, sources=("codex",), force=True, log=io.StringIO(),
+                          modules={"codex": FakeSource(f, sess, [Turn("做", "做完了", closed=True)])})
+        self.assertEqual((got["codex"]["files"], got["codex"]["turns"]), (1, 0))
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM session_detail").fetchone()[0], 0)
+
+    def test_codex_goal(self):
+        """codex 的 goal 模式（2026-11-06）：用户的话是 thread_goal_updated 里的目标，包在 <codex_internal_context source="goal"> 里的
+        开工提示不是用户写的；目标设下后第一次开工起一轮，之后的“继续朝目标做”接在原来那一轮里，不起新的一轮；改了目标再起一轮。"""
+        from .sources import codex
+        block = {"type": "input_text", "text": '<codex_internal_context source="goal">\nContinue working toward the active thread goal.\n'
+                                                '<objective>\nx\n</objective>\n</codex_internal_context>'}
+        ev = lambda typ, **kw: {"type": "event_msg", "payload": {"type": typ, **kw}}
+        user = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [block]}}
+        say = lambda text: {"type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": "final_answer",
+                                                                 "content": [{"type": "output_text", "text": text}]}}
+        lines = [{"type": "session_meta", "payload": {"id": "g1", "timestamp": "2026-09-15T19:48:44Z", "cwd": "/w"}},
+                 ev("thread_goal_updated", goal={"objective": "修正设计", "status": "active"}),
+                 user, say("先读报告"), ev("task_complete"),
+                 user, say("改好了"), ev("task_complete"),
+                 ev("thread_goal_updated", goal={"objective": "修正设计", "status": "complete"}),     # 只改状态：不算新目标
+                 ev("thread_goal_updated", goal={"objective": "再写测试", "status": "active"}),
+                 user, say("写好了"), ev("task_complete")]
+        path = self.dir / "goal.jsonl"
+        path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        _, turns = codex.parse(path)
+        self.assertEqual([(t.user, t.assistant) for t in turns], [("修正设计", "改好了"), ("再写测试", "写好了")])
+        self.assertEqual(turns[0].commentary, ["先读报告"])
 
     def test_peer(self):
         """别的会话发来的消息（2026-11-01）：不是用户的话，也不成轮。解析时认出来记在 asides：夹在一轮中间的记这一轮，
@@ -464,27 +555,28 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
 
     def test_fast(self):
-        """快道（runbook I7，2026-10-25）：没告一段落的会话按写窗口封窗粗读，尾巴等；之后照常预览：判粗读的不再读、快道 E 是终稿，
-        判精读的读完后快道 E 退场，判不读的收回。"""
+        """快道（runbook I7，2026-10-25 上线，11-06 撤）：没告一段落的会话不再读；库里已有的快道读照样接住：之后照常预览，
+        判粗读的不再读、快道 E 是终稿，判精读的读完后快道 E 退场，判不读的收回。"""
+        from unittest.mock import patch
         t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
         at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._collect([Turn("一", "回" * 3000, closed=True, started=at(0)), Turn("二", "回" * 1500, closed=True, started=at(5)),
                        Turn("三", "回" * 4100, closed=True, started=at(10)), Turn("四", "回" * 300, closed=True, started=at(15))],
                       started=at(0))
         turns = [r[0] for r in self.conn.execute("SELECT occurrence FROM turn_detail ORDER BY ordinal")]
-        self.assertEqual([[r["ordinal"] for r in w] for w in observe.fast_ready(self.conn, now=t0 + timedelta(minutes=20))], [[0, 1], [2]])
-        fakes = self._fakes([], [], [f"### 事件1\n{U}说了一。\n来源：1:U1\n\n### 事件2\n{U}说了二。\n来源：2:U1",
-                                     f"### 事件1\n{U}说了三。\n来源：3:U1"])
-        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO(), now=t0 + timedelta(minutes=20))
-        fast = [a for a in self._acts() if json.loads(a["window"]).get("fast")]
-        self.assertEqual([json.loads(a["window"])["turns"] for a in fast], [turns[:2], [turns[2]]])        # 尾巴（第 4 轮）等
-        self.assertIn("还没有预览", fast[0]["input"])
-        self.assertNotEqual(fast[0]["operator"], observe.operator(self.conn, "rough")[0])                  # 快道是另一个 Operator
+        observe.run(self.conn, workers=1, models=self._fakes([], [], []), log=io.StringIO(), now=t0 + timedelta(minutes=20))
+        self.assertEqual(self._acts(), [])                                                                 # 没告一段落：不读
+        op = observe.operator(self.conn, "rough")[0]
+        for ts, out in ((turns[:2], f"### 事件1\n{U}说了一。\n来源：1:U1\n\n### 事件2\n{U}说了二。\n来源：2:U1"),
+                        ([turns[2]], f"### 事件1\n{U}说了三。\n来源：3:U1")):                   # 撤之前快道读下的
+            rows = self.conn.execute(observe.TURNS + f" WHERE d.occurrence IN ({','.join('?' * len(ts))}) ORDER BY d.ordinal", ts).fetchall()
+            group = {"turns": ts, "from": rows[0]["ordinal"] + 1, "to": rows[-1]["ordinal"] + 1, "how": "粗读", "plan": "计划"}
+            tables, mask, text = observe.build_read(self.conn, group, "rough", FakeModel([]))
+            real = observe._act
+            with patch.object(observe, "_act", lambda conn, op_id, step, window, *a, **k: real(conn, op_id, step, {**window, "fast": True}, *a, **k)):
+                observe.store_read(self.conn, op, None, group, "rough", tables, mask, text, out, {}, None, {})
         self.assertEqual(len(observe.frame(self.conn)["events"]), 3)
         self.assertEqual(set(states(self.conn).values()), {"not_previewed"})                               # form 照样等预览
-        assert_live(self, self.conn)
-        observe.run(self.conn, workers=1, models=self._fakes([], [], []), log=io.StringIO(), now=t0 + timedelta(minutes=30))
-        self.assertEqual(len([a for a in self._acts() if json.loads(a["window"]).get("fast")]), 2)          # 读过的不再排
         # 告一段落：照常预览。第 1 轮精读、第 2 轮粗读（快道读过，不再读）、第 3 轮不读、第 4 轮粗读
         plan = "### 第 1 轮\n类型：讨论\n读法：精读\n\n### 第 2 轮\n类型：执行\n读法：粗读\n\n### 第 3 轮\n类型：执行\n读法：不读\n\n" \
                "### 第 4 轮\n类型：执行\n读法：粗读\n\n### 精读顺序\n第 1 轮\n"
@@ -498,59 +590,6 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(states(self.conn), dict(zip(turns, ["read", "read", "not_read", "read"])))
         self.assertEqual(waiting(self.conn), [])
         assert_live(self, self.conn)
-
-    def test_fast_do_observe(self):
-        """/do-observe 把尾巴现在读掉（observe 设计“叫醒”）：不够一窗的尾巴也封上；之后的轮次照常攒。"""
-        t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
-        at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        before = [Turn("一", "回" * 3000, closed=True, started=at(0)), Turn("二", "回" * 300, closed=True, started=at(5))]
-        self._collect(before, started=at(0))
-        self.assertEqual(observe.fast_ready(self.conn, now=t0 + timedelta(minutes=8)), [])          # 不够一窗：等
-        self._collect(before + [Turn("/do-observe", "", closed=True, started=at(8)),
-                                Turn("三", "回" * 300, closed=True, started=at(9))], started=at(0))
-        now = t0 + timedelta(minutes=10)
-        self.assertEqual([[r["ordinal"] for r in w] for w in observe.fast_ready(self.conn, now=now)], [[0, 1]])   # 第 3 轮的尾巴等
-        self.assertEqual([[r["ordinal"] for r in w] for w, _ in observe.seal_at(
-            [{"started": at(m), "ordinal": m, "assistant": "回" * 3000, "commentary": "[]"} for m in (0, 1, 2)], [(t0 + timedelta(minutes=1), None)])],
-            [[0], [1]])                                                                               # 切点之后照常封窗，尾巴（2）等
-
-    def test_observe_now(self):
-        """“我”的 observe-now（10-30，用户：区分用户行为和模型行为）：写成主会话给 observe 的申请，不是开关；切点之前还有没结束的轮次
-        先等；读的 act 认领它；不当再观察；用户关了的（钩子刚记下、还没采进库的也算）拒绝；没采进库的另报。"""
-        from unittest.mock import patch
-        t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
-        at = lambda m: (t0 + timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        one = Turn("一", "回" * 300, closed=True, started=at(0))
-        self._collect([one, Turn("二", "回" * 300, closed=False, started=at(5))], started=at(0))
-        log, op, now = Path(tempfile.mkdtemp()) / "switch.jsonl", st.main_operator(self.conn, "fake-main"), t0 + timedelta(minutes=10)
-        with patch.object(observe.switch._source, "LOG", log):
-            rid = observe.request_now(self.conn, "s1", "做完一件事", op)
-            self.assertEqual(observe.fast_ready(self.conn, now=now), [])                              # 申请时所在的第 2 轮还没进库：等它
-            self._collect([one, Turn("二", "回" * 300, closed=True, started=at(5))], started=at(0))
-            got = observe.fast_ready(self.conn, now=now, requests=True)
-            self.assertEqual([([r["ordinal"] for r in w], x) for w, x in got], [([0, 1], rid)])      # 不够一窗也读
-            self.assertEqual(observe.reobserve_requests(self.conn), [])                               # 不是再观察
-            self.assertEqual(observe.switch.states(self.conn), {})                                    # 不是开关
-            observe.run(self.conn, workers=1, models=self._fakes([], [], [f"### 事件1\n{U}说了一。\n来源：1:U1"]),
-                        log=io.StringIO(), now=now)
-            self.assertEqual([x for _, x in st.claimed(self.conn, rid)], ["ok"])
-            log.write_text(json.dumps({"session": "s1", "state": "off"}) + "\n")                    # 用户刚关，还没采进库
-            with self.assertRaises(PermissionError):
-                observe.request_now(self.conn, "s1", "再记一下", op)
-        with self.assertRaises(LookupError):
-            observe.request_now(self.conn, "没有这段", "x", op)
-
-    def test_seal(self):
-        rows = lambda sizes: [{"occurrence": i, "assistant": "x" * n, "commentary": "[]"} for i, n in enumerate(sizes)]
-        ids = lambda got: ([[r["occurrence"] for r in w] for w in got[0]], [r["occurrence"] for r in got[1]])
-        self.assertEqual(ids(observe.seal(rows([1500, 1500, 1500, 300]))), ([[0, 1, 2]], [3]))     # 满 4000 封，不够就等
-        self.assertEqual(ids(observe.seal(rows([2000, 1500, 2000]))), ([[0, 1]], [2]))             # 加进来超过 5000：先封
-        self.assertEqual(ids(observe.seal(rows([500, 6000, 100]))), ([[0], [1]], [2]))             # 一轮超长自成一窗
-        r = rows([1200, 900, 2500, 700, 4100, 300, 3000, 1800])
-        full = ids(observe.seal(r))[0]
-        for n in range(1, len(r) + 1):                                                              # 不看未来：每轮只读一次
-            part = ids(observe.seal(r[:n]))[0]
-            self.assertEqual(part, full[:len(part)])
 
     def test_preview_pool(self):
         """预览按给的先后用池里的模型（2026-10-20）：前一个环境错误就换下一个，同一窗口接着预览；各是一个 Operator。"""
@@ -1043,6 +1082,91 @@ class ListenTest(unittest.TestCase):
         srv.close()
         self.assertTrue(got["auth"])
         self.assertEqual(got["pong"], (0xA, 0x80, 2))
+
+
+class BackfillTest(unittest.TestCase):
+    """补录：按 message_id 对齐、floor 之后；行的格式和 listen 一致；用假协议端跑一次 sync（缺的补上、已有的不重写）。"""
+
+    def test_missing(self):
+        from . import backfill
+        msgs = [{"message_id": 1, "time": 100}, {"message_id": 2, "time": 200},
+                {"message_id": 3, "time": 50}, {"time": 300}]
+        self.assertEqual([m["message_id"] for m in backfill.missing(msgs, {2}, 60)], [1])
+
+    def test_row(self):
+        from . import backfill
+        msg = {"message_id": 1, "time": 1793474702}
+        self.assertEqual(json.loads(backfill.row(msg)),
+                         {"received": "2026-10-31T19:25:02.000+00:00", "event": msg})
+
+    def test_floor(self):
+        from . import backfill
+        now = datetime.now(timezone.utc).timestamp()
+        self.assertAlmostEqual(backfill.floor_of([now - 60]), now - 60, delta=3)
+        self.assertAlmostEqual(backfill.floor_of([now - 86400 * 10], days=3), now - 86400 * 3, delta=5)
+
+    def test_sync(self):
+        import socket
+        import struct
+        import threading
+        from unittest import mock
+        from . import backfill, listen
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        now = int(datetime.now(timezone.utc).timestamp())        # 时间要落在 floor 之后，不然 days 一改就不算缺
+        msgs = [{"message_id": 2, "time": now - 60, "raw_message": "旧的"},
+                {"message_id": 7, "time": now - 30, "raw_message": "缺的"}]
+
+        def frame(op, data):
+            n = len(data)
+            if n < 126:
+                head = struct.pack(">BB", 0x80 | op, n)
+            elif n < 1 << 16:
+                head = struct.pack(">BBH", 0x80 | op, 126, n)
+            else:
+                head = struct.pack(">BBQ", 0x80 | op, 127, n)
+            return head + data
+
+        def peer():
+            c, _ = srv.accept()
+            req = b""
+            while b"\r\n\r\n" not in req:
+                req += c.recv(4096)
+            c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            b0, b1 = c.recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", c.recv(2))[0]
+            mask = c.recv(4)
+            data = b""
+            while len(data) < n:
+                data += c.recv(n - len(data))
+            ask = json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+            reply = {"status": "ok", "retcode": 0, "data": {"messages": msgs}, "echo": ask["echo"]}
+            c.sendall(frame(0x1, json.dumps(reply).encode()))
+            c.recv(4096)
+            c.close()
+
+        t = threading.Thread(target=peer)
+        t.start()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "listen-onebot.jsonl"
+            path.write_text(json.dumps({"received": "x", "event": {"message_id": 2, "time": now - 60}}) + "\n",
+                            encoding="utf-8")
+            out = io.StringIO()
+            with mock.patch.object(listen, "LOG", path), \
+                    mock.patch.object(listen, "config", return_value=(None, f"127.0.0.1:{port}", port, "t0k")), \
+                    mock.patch.object(listen, "groups", return_value={100000001}), \
+                    mock.patch.object(listen, "private", return_value=()), \
+                    mock.patch.object(backfill, "free_port", return_value=port):
+                self.assertEqual(backfill.sync(write=True, days=3650, log=out.write), 1)
+            rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+        t.join(5)
+        srv.close()
+        self.assertEqual([r["event"]["message_id"] for r in rows], [2, 7])
+        self.assertIn("缺 1 条", out.getvalue())
 
 
 if __name__ == "__main__":

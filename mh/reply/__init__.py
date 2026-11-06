@@ -5,16 +5,18 @@
 （message_sent），监听照样记下，这里不另写聊天记录。每次回复的经过（提示词、模型原话、看了哪几条、token、耗时、
 重写、截断）追加进数据目录的 reply-log.jsonl，挑拿不准的回复给用户看时用，也给“看过什么”留底。
 
-模型看到的（用户 10-31）：系统提示是人设（工作区 AGENTS.md）+ 我怎么在这里说话（prompts/reply-v0.1.md），
+模型看到的（用户 10-31）：系统提示是人设（工作区 AGENTS.md）+ 我怎么在这里说话（prompts/reply-v0.3.md），
 换掉 codex 自带的写代码守则，关掉命令行等用不上的部分（LEAN）；用户消息是这一段聊天的完整记录，只往后追加
 （缓存按前缀命中），会变的（现在几点、我上次说到哪、为什么要回）放在最后。程序只做简化和打码：连发、复读合成一行
-标几条，图片写 [图片]、表情包写描述、链接只留网站名；“我”回话前看清过的，标在那句后面。
+标几条，图片写 [图片]、表情包写描述、链接只留网站名；“我”回话前看清过的，标在那句后面。撤回了的
+（`group_recall`/`friend_recall`）从记录里拿掉、编号顺延，像没说过：不算叫到、不接话（用户 11-01）。
 
 一次回复：被叫到（@ 我、回复我的消息、叫我的名字；私聊对方说了就算）→ 合批（安静 MERGE_QUIET 秒或最多等
 MERGE_MAX 秒）→ 模型 → 可以申请看清几条（details：全名、号、时刻、全文、回复的哪条、里面的图），看一次再回
 → 去掉漏出来的标记 → 限长（超了重写一次，还超就截）→ 按换行拆成几条，隔 SEND_GAP 秒发出。
 额度（用户 10-31）：用户叫我、私聊不计；只有 bot 叫我的，每小时最多 bot_hourly 次；其余（朋友叫我、跟复读、
 主动接话发出去的）和 bot 那份合起来每小时最多 hourly_max 次；到了只记日志。
+说完一句后的 active_minutes 分钟里，群里真人接着说话就算叫到（用户 11-01：活跃窗口）。
 主动接话：群里“我”上次说话后又有 proactive_after 条别人的话、离上次主动至少 proactive_gap_minutes 分钟，就问模型一次
 有没有想接的（可以不接）；按问的次数算 proactive_hourly 那份额度，省模型调用。
 """
@@ -37,18 +39,16 @@ from ..engram.store.instance import _D, _dir
 CFG = _D.get("reply", {})
 LOG = HOME / "reply-log.jsonl"
 SYSTEM = HOME / "reply-system.md"            # 拼好的系统提示（人设 + 规则），内容不变就不重写，codex 按路径读
-RULES = Path(__file__).parent / "prompts" / "reply-v0.2.md"   # 10-31 v0.2：加“记下”
+RULES = Path(__file__).parent / "prompts" / "reply-v0.3.md"   # 11-01 v0.3：长度和语气有起伏
 MERGE_QUIET, MERGE_MAX = 3, 8
 SEND_GAP = 1.2
 MAX_PARTS = 3
 HISTORY = 400                    # 内存里每个会话留多少条（只用这一段的）
-SHORT = 4                        # 没在 people 里的人，名字截到这么长
 IMAGES, IMAGE_MAX = 3, 10 << 20  # 看清时最多附几张图、一张最大多少字节
 SKIP = "（不回）"
 LOOK = re.compile(r"^（看\s*([\d\s,，、]+)）$")
 MEMO = re.compile(r"^\s*记下[：:]\s*(.+?)\s*$", re.M)          # 模型留给之后的自己的一行，不发出去
 LEAK = re.compile(r"<\\?/?\|[a-z_]{1,20}\|>")         # 模型漏出来的结束标记（10-31 私聊：“咋啦<\/|final|>”）
-URL = re.compile(r"https?://([^/\s]+)\S*")
 ENDS = "。！？!?…～~"
 ECHOABLE = {"text", "face", "image", "mface"}        # 复读时能原样跟的消息段
 # codex 里用不上的部分全关（10-31 实测 13.7K → 6.9K token）：权限说明、协作模式、环境、技能列表、命令行（关了就读不了本机文件）、
@@ -56,6 +56,7 @@ ECHOABLE = {"text", "face", "image", "mface"}        # 复读时能原样跟的�
 LEAN = ("include_permissions_instructions=false", "include_collaboration_mode_instructions=false",
         "include_environment_context=false", "skills.include_instructions=false",
         "features.shell_tool=false", "features.image_generation=false", "features.goals=false")
+text_of, short = listen.text_of, listen.short     # 消息段 → 一行文字、名字截短：和采集共用一份（listen.py，2026-11-01）
 
 
 def log(*a):
@@ -64,29 +65,6 @@ def log(*a):
 
 # ---- 纯函数：消息转文字、短名、切段、叫没叫到、记录、看清、复读、清理、限长、拆条 ----
 
-def text_of(message, names=None):
-    """OneBot 的消息段数组 → 一行文字。@ 写成 @名字（names 认不出写号），图片写 [图片]、表情包写描述，链接只留网站名。"""
-    if isinstance(message, str):
-        return message
-    names = names or {}
-    out = []
-    for seg in message or ():
-        t, d = seg.get("type"), seg.get("data") or {}
-        if t == "text":
-            out.append(URL.sub(r"[链接 \1]", d.get("text", "")))
-        elif t == "at":
-            q = str(d.get("qq"))
-            out.append("@全体成员" if q == "all" else f"@{names.get(q, q)}")
-        elif t == "reply":
-            out.append("[回复]")
-        elif t in ("image", "mface") and d.get("summary", "").strip("[]") not in ("", "图片", "动画表情"):
-            out.append(f"[表情：{d['summary'].strip('[]')}]")      # 表情包带一句描述，扫一眼就能看到
-        else:
-            out.append({"image": "[图片]", "face": "[表情]", "mface": "[表情]", "record": "[语音]",
-                        "video": "[视频]", "file": "[文件]", "forward": "[聊天记录]"}.get(t, f"[{t}]"))
-    return "".join(out).strip()
-
-
 def key_of(message):
     """判断两条是不是同一句（连发、复读）：文字按原文，图片、表情按文件，@ 和回复也算进去。"""
     parts = []
@@ -94,12 +72,6 @@ def key_of(message):
         d = seg.get("data") or {}
         parts.append((seg.get("type"), d.get("text") or d.get("file") or d.get("emoji_id") or d.get("id") or d.get("qq")))
     return json.dumps(parts, ensure_ascii=False)
-
-
-def short(name, n=SHORT):
-    """名字尽可能短：去掉符号和装饰，留前 n 个字。"""
-    s = re.sub(r"[^\w一-鿿぀-ヿ]", "", name or "")
-    return s[:n] or (name or "?")[:n]
 
 
 def segment_start(times, now, day_hour=7, gap=1800):
@@ -280,9 +252,9 @@ def split(text, max_parts=MAX_PARTS):
     return parts
 
 
-def system(persona, hint, rules=RULES):
+def system(persona, hint, limit, rules=RULES):
     """系统提示：人设 + 我怎么在这里说话。"""
-    return persona.strip() + "\n\n" + rules.read_text().format(hint=hint, parts=MAX_PARTS).strip() + "\n"
+    return persona.strip() + "\n\n" + rules.read_text().format(hint=hint, limit=limit, parts=MAX_PARTS).strip() + "\n"
 
 
 def prompt(seen, scene, cue, last_mine=None, memos=()):
@@ -309,7 +281,9 @@ class Reply:
                        "proactive": int(cfg.get("proactive_hourly", 4))}
         self.pro_gap = int(cfg.get("proactive_gap_minutes", 10)) * 60
         self.pro_after = int(cfg.get("proactive_after", 8))
+        self.active = int(cfg.get("active_minutes", 5)) * 60   # 说完一句后的活跃窗口（用户 11-01：5 分钟）
         self.last_pro = 0.0
+        self.said = {}               # 会话 → 最后一次发出话的时刻（活跃窗口从这里算）
         self.echo_after = int(cfg.get("echo_after", 2))             # 几个不同的人复读了就跟（0 不跟）
         self.hint, self.limit = int(cfg.get("hint_chars", 60)), int(cfg.get("max_chars", 100))
         self.day_hour, self.gap = int(cfg.get("day_hour", 7)), int(cfg.get("gap_minutes", 30)) * 60
@@ -322,6 +296,7 @@ class Reply:
         self.group_name = str(self.group)
         self.history = {}            # 会话 → 最近的消息；会话是 ("group", 群号) 或 ("private", 对方的号)
         self.by_id, self.mine, self.member = {}, set(), {}
+        self.recalled = set()        # 撤回过的消息号：先到撤回、后到消息时也不算（群和私聊都有）
         self.notes = {}              # “我”要发的那句 → 回话前看清过什么（等协议端回传那条时标上）
         self.echoed = {}             # 会话 → 最近跟过的那句（同一串复读只跟一次）
         self.memos = {}              # 会话 → “我”记下的 [{time, after: 当时记录到第几条, text}]
@@ -368,18 +343,24 @@ class Reply:
                 self.note(e, live=False)
 
     def note(self, e, live=True):
-        """记下一条消息；live 时判断要不要回：群里叫到我才回，私聊对方说了就回；群里有人复读就跟。"""
+        """记下一条消息；live 时判断要不要回：群里叫到我才回，私聊对方说了就回；群里有人复读就跟。
+        撤回的不当消息：从记录里拿掉，像没说过。"""
+        if e.get("post_type") == "notice":
+            if e.get("notice_type") in ("group_recall", "friend_recall"):
+                self.recall(e)
+            return
         chat = self.chat_of(e)
         if not chat:
             return
         mid = str(e.get("message_id"))
-        if mid in self.by_id:
+        if mid in self.by_id or mid in self.recalled:
             return
         sender = e.get("sender") or {}
         uid = str(e.get("user_id"))
         mine = e.get("post_type") == "message_sent" or uid == str(self.self_id)
         self.member[uid] = sender.get("card") or sender.get("nickname") or uid
-        m = {"id": mid, "time": e.get("time") or time.time(), "user_id": uid, "card": sender.get("card", ""),
+        m = {"id": mid, "chat": list(chat), "time": e.get("time") or time.time(), "user_id": uid,
+             "card": sender.get("card", ""),
              "nick": sender.get("nickname", ""), "message": e.get("message") or []}
         if mine:
             self.mine.add(mid)
@@ -400,9 +381,42 @@ class Reply:
                 p = self.pending.setdefault(chat, {"at": time.time(), "who": set()})
                 p["who"].discard("proactive")
                 p["who"].add(uid)
+            elif chat[0] == "group" and chat not in self.pending and self.live(chat, uid):
+                log(f"接着聊：{self.who(uid)}（{uid}）{text_of(m['message'])[:40]}")
+                p = self.pending.setdefault(chat, {"at": time.time(), "who": set()})
+                p["who"].add(uid)
+                p["active"] = True
             elif chat[0] == "group" and chat not in self.pending:
                 self.proactive(chat)
             self.cv.notify()
+
+    def recall(self, e):
+        """撤回了哪条：从记录里拿掉（编号顺延），像没说过；正在等的这次如果没有别的新消息就不回了。"""
+        mid = str(e.get("message_id"))
+        self.recalled.add(mid)
+        m = self.by_id.pop(mid, None)
+        if not m:
+            return
+        self.mine.discard(mid)
+        chat = tuple(m.get("chat") or ())
+        with self.cv:
+            h = self.history.get(chat)
+            if h:
+                try:
+                    h.remove(m)
+                except ValueError:
+                    pass
+            if self.pending.get(chat):
+                seg = self.segment(chat)
+                last = max((i for i, x in enumerate(seg) if x["user_id"] == str(self.self_id)), default=-1)
+                if not any(x["user_id"] != str(self.self_id) for x in seg[last + 1:]):
+                    self.pending.pop(chat, None)
+        log(f"撤回：{self.who(m['user_id'])} 的一句话不看了")
+
+    def live(self, chat, uid):
+        """刚说完一句后的活跃窗口：真人接着说话也算叫到（用户 11-01：说完的 5 分钟内保持活跃）。"""
+        return (self.active > 0 and uid not in self.bots
+                and time.time() - self.said.get(chat, 0) < self.active)
 
     def proactive(self, chat):
         """主动接话的时机（程序挑，模型定接不接）：“我”上次说话后又有 pro_after 条别人（不算 bot）的话，
@@ -434,6 +448,7 @@ class Reply:
         try:
             self.ws.send({"action": "send_group_msg", "echo": f"echo-{time.time():.3f}",
                           "params": {"group_id": int(chat[1]), "message": echo_segments(m["message"])}})
+            self.said[chat] = time.time()            # 跟复读也算说完一句
         except OSError as e:
             log(f"发送失败：{e}")
 
@@ -443,18 +458,19 @@ class Reply:
 
     def write_system(self):
         persona = self.persona_path.read_text() if self.persona_path.exists() else ""
-        text = system(persona, self.hint)
+        text = system(persona, self.hint, self.limit)
         if not self.system_path.exists() or self.system_path.read_text() != text:
             self.system_path.parent.mkdir(parents=True, exist_ok=True)
             self.system_path.write_text(text)
         return text
 
-    def compose(self, chat=None, proactive=False):
+    def compose(self, chat=None, proactive=False, active=False):
         """→ (要发的话，或 SKIP / 空), 这次的经过（进 reply-log）。"""
         chat = chat or ("group", str(self.group))
         sys_text = self.write_system()
         seg = self.segment(chat)
         cue = ("没人叫你。看看你上次说话之后的这些里，有没有你真想接的；有就短短接一句，没有就只输出（不回）。" if proactive else
+               "你刚说完话，群里还在接着聊。顺着刚才的话头接一句；真插不上才输出（不回）。" if active else
                "新消息里有人叫到了你。" if chat[0] == "group" else f"{self.who(chat[1])}在私聊你。")
         last_mine = max((i + 1 for i, m in enumerate(seg) if m["user_id"] == str(self.self_id)), default=None)
         since = seg[0]["time"] if seg else time.time()
@@ -580,7 +596,9 @@ class Reply:
                     if chat:
                         break
                     self.cv.wait(wait)
-                kind = self.kind_of(self.pending.pop(chat)["who"])
+                p = self.pending.pop(chat)
+                kind = self.kind_of(p["who"])
+                active = p.get("active", False)
             if not self.allow(kind):
                 log(f"{kind} 额度这一小时用完了（{self._used(kind)}/{self.limits[kind]}，总量 "
                     f"{self._used('total')}/{self.limits['total']}），这次不回")
@@ -591,7 +609,7 @@ class Reply:
             if kind == "proactive":
                 self.spend(kind, sent=False)        # 主动接话按问的次数算
             try:
-                text, trail = self.compose(chat, proactive=kind == "proactive")
+                text, trail = self.compose(chat, proactive=kind == "proactive", active=active)
                 trail["quota"] = kind
             except Exception as e:                  # 模型失败不拖垮进程，下次叫到再说
                 log(f"模型失败：{type(e).__name__} {str(e)[:300]}")
@@ -609,6 +627,7 @@ class Reply:
             self.record({**trail, "sent": parts})
             try:
                 self.send(chat, parts)
+                self.said[chat] = time.time()        # 说完一句，开活跃窗口
             except OSError as e:
                 log(f"发送失败：{e}")
 

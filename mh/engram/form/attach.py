@@ -103,7 +103,7 @@ def parse(output, skeleton_on):
     """→ (节点编号或 None, 挂到（线编号或“新线 名字”）, 父线编号或 None, 为什么)。认不出返回挂到 ""。"""
     out = output.strip()
     if skeleton_on:
-        m = re.search(r"节点[:：]\s*(k-[\w-]+)\s*[｜|]\s*挂到[:：]\s*(新线\s+.+?|[A-Za-z][\w-]*)\s*(?:[｜|]\s*为什么[:：]\s*(.+))?$", out, re.M)
+        m = re.search(r"节点[:：]\s*(k-[\w-]+|[^\s｜|]+)\s*[｜|]\s*挂到[:：]\s*(新线\s+.+?|[A-Za-z][\w-]*)\s*(?:[｜|]\s*为什么[:：]\s*(.+))?$", out, re.M)
         if not m:
             return None, "", None, ""
         return m.group(1), m.group(2).strip(), None, (m.group(3) or "").strip()

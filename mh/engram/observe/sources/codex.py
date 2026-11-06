@@ -12,6 +12,10 @@ KINDS = {"user": "user", "subagent": "subagent", "guardian_review": "review"}
 _WRAPPED = re.compile(r"^\s*<([A-Za-z_][\w-]*)[\s>].*</\1>\s*$", re.S)
 
 
+# goal 模式（2026-11-06）：用户设的目标记在 thread_goal_updated 事件里，每次开工宿主发一条包在这个标签里的“继续朝目标做”
+_GOAL = re.compile(r"^\s*<codex_internal_context source=\"goal\">.*</codex_internal_context>\s*$", re.S)
+
+
 def files():
     for root in ROOTS:
         yield from sorted(root.rglob("*.jsonl"))
@@ -37,6 +41,7 @@ def _out_text(content):
 def parse(path):
     session = Session("codex", path.stem, str(path))
     turns, cur = [], None
+    goal, said = None, None         # 用户设的目标；已经作为用户的话起过一轮的那个目标
 
     def close():
         if cur is None:
@@ -68,14 +73,19 @@ def parse(path):
                 session.model = p.get("model", "")
             elif t == "event_msg" and p.get("type") == "thread_settings_applied":
                 session.model = (p.get("thread_settings") or {}).get("model", session.model)
+            elif t == "event_msg" and p.get("type") == "thread_goal_updated":
+                goal = ((p.get("goal") or {}).get("objective") or "").strip() or goal
             elif t == "event_msg" and p.get("type") == "task_complete" and cur is not None:
                 cur["turn"].closed = True
             elif t == "response_item" and p.get("type") == "message":
                 role = p.get("role")
                 if role == "user":
                     text = _user_text(p.get("content"))
+                    if not text and goal and goal != said and any(
+                            _GOAL.match(b.get("text") or "") for b in p.get("content") or [] if isinstance(b, dict)):
+                        text, said = goal, goal          # 目标设下后的第一次开工：用户的话是那个目标
                     if not text:
-                        continue
+                        continue                         # 之后的“继续朝目标做”是宿主续接，不起新的一轮
                     if cur is not None:
                         cur["turn"].closed = True
                         close()

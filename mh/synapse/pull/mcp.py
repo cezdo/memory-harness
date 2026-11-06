@@ -7,10 +7,11 @@
 - 库：新库 engram.db，经 mh/synapse/pull 取（2026-10-19 换库，E1a；旧库 E4 归档）。环境变量 MH_DB 可以换（测试用拷贝，不在正式库上留足迹）。
 - 进程常驻于一段会话：pull 的读视图按库的变化缓存，get、map 不用每次重建。
 - 出错不让会话断：返回 isError 和错误文字，进程继续。
-- observe-now（2026-10-30）：“我”让观察现在把尾巴读掉；只读、不开观察，用户关了的对话拒绝（权限和用户的开关分开）；实现在 engram/observe 的 request_now。
-- yorimichi（2026-10-28）：“我”在对话阶段变了时记一次允许联想拐几次（0 深挖，1–3 发散），联想的钩子读它；实现在 push/yorimichi。
-- feedback（2026-10-19）：和拉取工具并列的反馈入口，写进新库 engram.db（Engram 的 form.feedback，Synapse 只是转交）；
-  主会话的模型由调用方填。现在只接话题（会话入口，T5）。
+- observe-now（2026-10-30 加，2026-11-06 撤，v0.41）：“我”让观察现在把尾巴读掉；用户 11-06：快不该放在 SSD 层，连同快道一起撤。
+  以后改成当场写进内存、调用即标记，另起名字（runbook I7）。
+- yorimichi（2026-10-28）：“我”在对话阶段变了时记一次允许联想拐几次（1 平常，0 只在一被打断就容易出错时，2–3 发散；2026-11-02 改成以 1 为常态），联想的钩子读它；实现在 push/yorimichi。
+- feedback（2026-10-19 加，2026-11-02 撤，v0.36）：现阶段反馈少、集中、用户在场，主会话没用过这个工具（130 次反馈都是开发中直接调
+  form 写的），撤出 MCP；form 的反馈函数和命令行 `mh engram feedback` 留着，以后阶段变了再接（Engram 设计“反馈”）。
 注册（用户级，所有工作区都能用；观察者的 claude -p 带 --strict-mcp-config 和独立配置目录，不会加载它）：
   claude mcp add --scope user mh -- env PYTHONPATH=<仓库目录> python3 -m mh.synapse.pull.mcp
 dsh（2026-10-15）：一个 dsh 进程里所有会话共用一个服务进程，环境变量也会被宿主清洗，拿不到会话编号；
@@ -34,23 +35,23 @@ WINDOW = {      # relive、roam 的翻页：一页固定 8 条，没有 limit（
 
 TOOLS = [
     {"name": "evoke",
-     "description": "按词找记忆：给话题 L:T，少而准时先给陈述 L:T:S 全文（grain=L 给线 L 和骨架 k-）。"
+     "description": "按词找记忆：给话题 L:T，少而准时先给陈述 L:T:S 全文。"
                     "查词按空格切成词，每个词单独认；同时含的词越多越靠前，不必全都含，换个说法的词也可以一起给。"
                     "结果多时只给话题；页头会说去掉哪个词能多命中。结果一页 6–8 条，同一轮里给过的不再给，再查就是接着往下。"
                     "用到了其中的内容，就在正文里用〖〗标出那半句（引用回填靠它连回是哪条）。",
      "inputSchema": {"type": "object", "properties": {
          "words": {"type": "array", "items": {"type": "string"}, "description": "要查的词"},
-         "grain": {"type": "string", "enum": ["L", "T", "S"], "description": "最小给到哪一层：L 线和骨架，T 话题，S 陈述（默认）"},
          **NOTE},
          "required": ["words"]}},
     {"name": "relive",
-     "description": "按句柄读记忆库（不是文件），不按相关度：陈述给它前后各 3 条（▶ 是要的那条），话题从头按顺序读，线、骨架给下一层，E、J 给正文。"
+     "description": "按句柄读记忆库（不是文件），不按相关度：陈述给它自己，话题从头按顺序读（超过一页先给这段对话的结构），线、骨架给下一层，E、J 给正文。"
                     "句柄：线 L3，话题 L3:T5 或 T5，陈述 L3:T5:S1 或 T5:S1（一段 L3:T5:S1-S8），骨架 k-，E5，J5；名字逐字唯一也认。",
      "inputSchema": {"type": "object", "properties": {
          "handles": {"type": "array", "items": {"type": "string"}, "description": "句柄，一个或几个"},
          "source": {"type": "boolean", "description": "来源：陈述依据的 E；J 的旧会话"},
          "said": {"type": "boolean", "description": "走到原话"},
          "files": {"type": "boolean", "description": "陈述里『文件：』指向的 E（默认不给，和来源分开）"},
+         "near": {"type": "boolean", "description": "陈述：连同所在话题里前后各 3 条（▶ 是要的那条）"},
          "recall": {"type": "string", "description": "历史：all 或 N（陈述何时写出、还在不在；话题的旧版；J 的关系链）"},
          **WINDOW},
          "required": ["handles"]}},
@@ -59,32 +60,12 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "node": {"type": "string", "description": "工作区名或句柄；不给就列出各工作区"},
          **WINDOW}}},
-    {"name": "feedback",
-     "description": "话题记录有误时改写或申请重做；scope=presentation 时给 use 编号与理由，只记录呈现反馈，保留来源记录。",
-     "inputSchema": {"type": "object", "properties": {
-         "handle": {"type": "string", "description": "scope=record 时必填，话题句柄，如 T5"},
-         "scope": {"type": "string", "enum": ["record", "presentation"], "description": "反馈对象，默认 record；presentation 指交付措辞"},
-         "use": {"type": "integer", "description": "scope=presentation 时必填，送达的 use 编号"},
-         "reason": {"type": "string", "description": "为什么不对"},
-         "name": {"type": "string", "description": "改好的名字"},
-         "topic": {"type": "string", "description": "改好的主题"},
-         "stops": {"type": "array", "items": {"type": "string"}, "description": "改好的停在，可以带“（陈述3、陈述4）”指出依据"},
-         "holder": {"type": "string", "description": f"谁说的：我（默认）或{USER_NAME}"},
-         "model": {"type": "string", "description": "你的模型名"}},
-         "required": ["reason"]}},
     {"name": "yorimichi",
-     "description": "寄り道：这段对话允许联想拐几次。阶段变了时调一次（没变不调）：在一个点上深挖给 0，在发散、轻松地聊给 1–3。",
+     "description": "寄り道：这段对话允许联想拐几次。平常是 1（没判过就是 1）；只有收窄到一被打断就容易出错的一件事（排查一个故障、逐行改一段代码）才给 0，在干活本身不算；聊开了、话题在散给 2–3。阶段变了时调一次（没变不调）。",
      "inputSchema": {"type": "object", "properties": {
-         "width": {"type": "integer", "description": "0 深挖不给联想，1–3 给几条"},
+         "width": {"type": "integer", "description": "0 不给联想，1 平常，2–3 发散"},
          "why": {"type": "string", "description": "一句话：为什么这么判"}},
          "required": ["width"]}},
-    {"name": "observe-now",
-     "description": f"把这段对话到现在还没读的尾巴现在交给观察读掉，不等攒够、不等告一段落。一件事做完、值得马上记下时调。"
-                    f"只读尾巴、不开观察：{USER_NAME}关了观察的对话会被拒绝，开关只有{USER_NAME}能动。",
-     "inputSchema": {"type": "object", "properties": {
-         "reason": {"type": "string", "description": "一句话：为什么现在要记"},
-         "model": {"type": "string", "description": "你的模型名"}},
-         "required": ["reason"]}},
 ]
 
 
@@ -131,50 +112,7 @@ def call(conn, name, args):
         from ..push import yorimichi
         return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "",
                            host="claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
-    if name == "observe-now":   # “我”的现在读掉（2026-10-30）：只读尾巴、不开观察，写成主会话给 observe 的申请
-        return _observe_now(kw["session"], args)
-    if name == "feedback":
-        scope = args.get("scope", "record")
-        if scope == "presentation":
-            from .. import track
-            from . import VERSION
-            return track.presentation_feedback(conn, VERSION, args.get("use"), str(args.get("reason") or ""), **{k: kw[k] for k in ("session", "cwd", "note")})
-        if scope != "record" or not args.get("handle") or not args.get("reason"):
-            raise ValueError("记录反馈需要 handle 与 reason；呈现反馈需要 scope=presentation、use 与 reason")
-        from ...engram import form, store as estore
-        econn = estore.connect(estore.DEFAULT_DB)
-        try:
-            stops = args.get("stops")
-            stops = [stops] if isinstance(stops, str) else stops
-            outward = lambda t: t.replace("会话入口（T 编号", "话题（T 编号")      # 对外会话入口叫话题
-            try:
-                return outward(form.feedback(econn, estore.main_operator(econn, args.get("model") or estore.UNKNOWN),
-                                             str(args.get("handle", "")),
-                                             args.get("reason") or "", name=args.get("name"), topic=args.get("topic"),
-                                             stops=stops, holder=args.get("holder") or "我"))
-            except ValueError as e:
-                raise ValueError(outward(str(e))) from None
-        finally:
-            econn.close()
     raise ValueError(f"没有工具 {name}")
-
-
-def _observe_now(session, args):
-    from ...engram import observe, store as estore
-    from ...engram.observe.switch.hook import wake
-    if not session:
-        raise ValueError("拿不到会话号，记不下")
-    econn = estore.connect(estore.DEFAULT_DB)
-    try:
-        rid = observe.request_now(econn, session, args.get("reason") or "", estore.main_operator(econn, args.get("model") or estore.UNKNOWN))
-    except LookupError:
-        wake()
-        return "这段对话还没采集进库（刚开不久），已经叫醒观察循环；过一会儿再调。"
-    except PermissionError as e:
-        return f"{e}。没有写申请。"
-    finally:
-        econn.close()
-    return f"记下了：申请 {rid}。这一轮结束时观察循环被叫醒，把到这一轮为止还没读的轮次读掉，读的那次认领这张申请。"
 
 
 def _call_new(conn, name, args, kw):
@@ -183,14 +121,14 @@ def _call_new(conn, name, args, kw):
     if name == "evoke":
         words = args.get("words") or []
         words = words.split() if isinstance(words, str) else [str(w) for w in words]
-        return pull.evoke(conn, words, grain=args.get("grain"), **kw)
+        return pull.evoke(conn, words, **kw)      # grain 只走内部，不进 MCP（2026-11-02：主会话不该知道）
     if name == "relive":
         hs = args.get("handles") or []
         hs = hs.split() if isinstance(hs, str) else [str(h) for h in hs]
         recall = args.get("recall")
         recall = None if recall in (None, "", False) else str(recall)
         return pull.relive(conn, hs, said=bool(args.get("said")), source=bool(args.get("source")), recall=recall,
-                           files=bool(args.get("files")), **win, **kw)
+                           files=bool(args.get("files")), near=bool(args.get("near")), **win, **kw)
     return pull.roam(conn, args.get("node") or None, **win, **kw)
 
 

@@ -6,6 +6,8 @@
   打断  [Request interrupted by user…]：用户按 Esc 后宿主写的标记
   命令  <command-name>…、<local-command-stdout>…、<bash-input>/<bash-stdout>…：斜杠命令、! 命令与它们的回显
   压缩  “This session is being continued from a previous conversation…”：上下文压缩后宿主插入的总结（写的人是之前的“我”）
+  重启  “Orca restarted, which stopped what you were doing…”：Orca 重启后自动发来的固定续接提示（2026-11-06），
+        宿主记成用户消息；只留一个标记，正文不给
 IDE 标签（<ide_opened_file>…、<ide_selection>…）加在用户的话前面，从用户的话里拿掉，写进环境。
 后台通知去掉格式，只留主要信息（2026-10-20：不要让模型看那么多没用的格式化内容）：摘要、状态、Monitor 的输出（截短），
 task-id、tool-use-id、output-file 和固定说明的 note 不给。预览、精读粗读、回溯的段落编号都经 user_text，切法一致。
@@ -27,6 +29,8 @@ _CMD = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
 _NOTICE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 COMPACTION = "This session is being continued from a previous conversation"
 COMPACTION_MARK = "（上下文压缩：宿主插入了之前的“我”写的总结，内容略）"
+RESTART = "Orca restarted, which stopped what you were doing"
+RESTART_MARK = "Orca 重启后自动发来的固定续接提示（内容略）"
 EVENT_CAP = 300         # 通知里 Monitor 输出（<event>）最多给几个字
 
 
@@ -40,8 +44,10 @@ def kind(user):
     if u.startswith(("<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>",
                      "<local-command-caveat>", "<bash-input>", "<bash-stdout>", "<bash-stderr>")):
         return "命令"
-    if u.startswith("This session is being continued from a previous conversation"):
+    if u.startswith(COMPACTION):
         return "压缩"
+    if u.startswith(RESTART):
+        return "重启"
     return None
 
 
@@ -64,9 +70,12 @@ def strip_ide(user):
 
 def condense(user, compaction=True):
     """后台通知只留主要信息：“后台任务通知（状态）：摘要”，有 Monitor 输出的接一句“输出：……”（截到 EVENT_CAP）；
-    整段不留空行，段落编号和原文一样是一段。compaction：压缩总结只留标记（COMPACTION_MARK）。其余原样返回。"""
+    整段不留空行，段落编号和原文一样是一段。compaction：压缩总结只留标记（COMPACTION_MARK）；Orca 的重启提示只留
+    标记（RESTART_MARK，原文是一段）。其余原样返回。"""
     if compaction and (user or "").lstrip().startswith(COMPACTION):
         return COMPACTION_MARK
+    if (user or "").lstrip().startswith(RESTART):
+        return RESTART_MARK
     def one(m):
         body = m.group(1)
         get = lambda tag: " ".join(re.findall(rf"<{tag}>(.*?)</{tag}>", body, re.S)).strip()
@@ -118,6 +127,8 @@ def notes(user, assistant, closed, nxt=None, rewound=False, ending=None):
         out.append(f"这一轮开头是{USER_NAME}执行的命令{(' ' + m.group(1)) if m else ''}，其余是宿主的输出，不是{USER_NAME}说的话。")
     elif k == "压缩":
         out.append(f"这一轮开头是宿主插入的上下文压缩总结，写的人是之前的“我”，不是{USER_NAME}。")
+    elif k == "重启":
+        out.append(f"这一轮开头是 Orca 重启后自动发来的续接提示，不是{USER_NAME}的话；“我”接着做重启前没做完的事。")
     out += strip_ide(user)[1]
     if ending:
         how, _, detail = ending.partition(":")
@@ -128,7 +139,8 @@ def notes(user, assistant, closed, nxt=None, rewound=False, ending=None):
         out.append(("这一轮没有正常结束。" if not closed else "") +
                    f"之后{USER_NAME}回退到这一轮之前重新输入，这一轮所在的分支没有再继续；另一条分支另有记录。")
     elif not closed:
-        out.append("这一轮没有正常结束，被下一次输入打断了" + (f"：是{USER_NAME}按 Esc 打断的。" if kind(nxt) == "打断" else "。"))
+        out.append("这一轮没有正常结束，被下一次输入打断了" + (f"：是{USER_NAME}按 Esc 打断的。" if kind(nxt) == "打断"
+                                               else "：Orca 重启了，下一轮是重启后的续接。" if kind(nxt) == "重启" else "。"))
     return out
 
 

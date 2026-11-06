@@ -89,6 +89,7 @@ def check(conn, db_path, brief=False):
             ev.hit("来源：event 指向的轮次不存在", eid)
 
     roles = {"turn", "session", "act", "use", "request", "deletion"}
+    NOT_REFS = {"level"}                                   # 给 form 的申请记着问题在哪一级（statement、entry……），是标记不是引用（2026-11-04）
     alias = {"reread": "act"}                              # 重读的输入指向旧的读 act（2026-10-26）
     gone = delete.deleted(conn)[1]                        # 按要求删掉的（store.delete）：留下的发生、记录指向它们不算事件，按条数列
     def is_gone(kind, t):
@@ -124,6 +125,8 @@ def check(conn, db_path, brief=False):
 
     for r in conn.execute("SELECT id, role, inputs, parent, predecessor FROM occurrence"):
         for kind, ids in json.loads(r["inputs"]).items():
+            if kind in NOT_REFS:
+                continue
             kind = alias.get(kind, kind)
             for t in ids:
                 if absent(t):
@@ -241,7 +244,16 @@ def check(conn, db_path, brief=False):
     # 与上次快照比对
     path = Path(db_path).parent / SNAPSHOT
     old = json.loads(path.read_text()) if path.exists() else {}
-    now = {}
+    seen = old.pop("_deletion", 0)                    # 存快照时最新的删除记录（2026-11-06 起记）
+    later = [json.loads(t) for d, t in conn.execute("SELECT occurrence, target FROM deletion_detail") if d > seen]
+    newest = conn.execute("SELECT MAX(occurrence) FROM deletion_detail").fetchone()[0] or 0
+    cut = {}                                          # 快照之后按要求删掉的：表 → 编号
+    for t in later:
+        for kind, ids in t.items():
+            if kind != "sessions":
+                cut.setdefault(kind, set()).update(ids)
+    by_table = {"occurrence": "occurrence", "act_detail": "occurrence", "event_relations": "event", "form_record_relations": "form_record"}
+    now = {"_deletion": newest}
     for table, (key, expr) in SNAPSHOT_TABLES.items():
         prev = old.get(table, {})
         full = collections.defaultdict(lambda: [0, -1, hashlib.sha256()])     # 这次的全部行
@@ -257,7 +269,12 @@ def check(conn, db_path, brief=False):
                 part[blk][1].update(data)
         for blk, (n, last, digest) in prev.items():
             if part[blk][0] != n or part[blk][1].hexdigest() != digest:
-                ev.hit(f"覆盖：{table} 里上次有的行被改过或不见了", f"第 {blk} 块")
+                ids = cut.get(by_table.get(table, table), set())
+                lo = int(blk) * BLOCK
+                if (table == "turn_text" and later) or any(lo <= i < lo + BLOCK for i in ids):   # turn_text 的删除记录没有行号：有新的删除就整体归给它
+                    ev.hit(f"覆盖：{table} 里按删除记录删掉的（块；跑一次完整的 check 换快照）", f"第 {blk} 块")
+                else:
+                    ev.hit(f"覆盖：{table} 里上次有的行被改过或不见了", f"第 {blk} 块")
         now[table] = {blk: [n, last, h.hexdigest()] for blk, (n, last, h) in full.items()}
     if not brief:
         path.write_text(json.dumps(now))
@@ -325,14 +342,13 @@ def coverage(conn):
         ev.n["observe：按申请被取代的 E（不再交出，留在那一轮上；条数，不是事件）"] += len(gone)
     if handed["withdrawn"]:
         ev.n["form：被 form 读过、又因开关撤下的 E（条数，不是事件）"] += len(handed["withdrawn"])
-    from .form import history                                    # 只算现在用着的那次 pack 写的（重做取代的旧陈述还留在库里）
+    from .form import history, pack                                    # 只算现在用着的那次 pack 写的（重做取代的旧陈述还留在库里）
     current = {a for (step, _), a in history(conn).ok.items() if step == "pack"}
     for act, meta in conn.execute("SELECT occurrence, meta FROM act_detail WHERE process='form' AND step='pack' AND meta LIKE '%\"violations\"%'"):
         if act not in current:
             continue                                             # 已经被重做取代的，问题不在了（2026-10-27）
         for n, why in json.loads(meta).get("violations", []):    # pack-v0.4 起：重写一次后还不合规的（2026-10-27）
+            if pack.soft(why):
+                continue                                         # 软的（正文长）：模型确认过就照样入库，不等主会话（2026-11-04）
             ev.hit("form：陈述的来源重写后仍不合 pack 的检查", f"act {act} {f'陈述{n}' if n else '整份'}：{why[:40]}")
-    big = sum(1 for born, r in conn.execute("SELECT born, refs FROM form_record") if born in current and len(json.loads(r).get("event", [])) > 16)
-    if big:
-        ev.n["form：现行陈述的来源超过两页（16 条；条数，不是事件，pack-v0.4 以前写的多）"] += big
     return ev.lines()

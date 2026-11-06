@@ -54,7 +54,7 @@ def _split(conn, got):
 
 
 def use(conn, version, mode, query, shown, got, session="", purpose="interactive", cwd="", note="", channel="pull",
-        meta=None, format_shown=None):
+        meta=None):
     """记一次拉取（或推送）。got：{"<种类>": [编号…]}，取到或送达的是哪些（会话入口、话题线、骨架也可以，见 _split）。
     写完就提交，不留写事务（观察、形成也在写这个库）。没带会话编号的交互调用记为 dev（开发调试，不算使用；照旧的足迹）。"""
     if purpose == "interactive" and not session:
@@ -65,7 +65,6 @@ def use(conn, version, mode, query, shown, got, session="", purpose="interactive
     t = st.now()
     oid = st.occurrence(conn, "use", operator(conn, version), started=t, ended=t, scale="turn", inputs=inputs,
                         cause=CAUSES.get(purpose, UNKNOWN), parent=parent, outcome="ok")
-    shown = format_shown(oid) if format_shown else shown
     meta["expression"] = express.evidence(meta.get("expression") or instance.expression(purpose), shown)
     conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                  (oid, channel, mode, purpose, host, session or UNKNOWN, cwd or UNKNOWN, NA, dumps(query), shown,
@@ -79,12 +78,8 @@ def deliver(conn, version, mode, query, text, got, *, session="", purpose="inter
     ctx = instance.expression("standing" if mode == "assist" else "memory" if purpose in ("interactive", "prefetch", "dev") else purpose)
     shown = express.present(text, ctx, raw=raw)
     info = dict(meta or {}, expression={**express.evidence(ctx, shown), "source_raw": raw})
-    final = []
-    def finish(oid):                     # 送达编号要等 use 写出来才有，包的时候带上
-        final.append(express.present(text, ctx, raw=raw, use=oid))
-        return final[0]
-    use(conn, version, mode, query, shown, got, session=session, purpose=purpose, cwd=cwd, note=note, channel=channel, meta=info, format_shown=finish)
-    return final[0]
+    use(conn, version, mode, query, shown, got, session=session, purpose=purpose, cwd=cwd, note=note, channel=channel, meta=info)
+    return shown                         # 送达编号只在库里，不进标签（用户 2026-11-02：不再推进上下文）
 
 
 def presentation_feedback(conn, version, target, reason, *, session="", cwd="", note=""):

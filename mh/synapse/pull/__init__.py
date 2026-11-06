@@ -28,9 +28,9 @@ from collections import Counter, defaultdict
 from ...engram import form, observe, show
 from ...engram.store import absent
 from .. import track
-from . import retrieve, vector
+from . import retrieve, structure, vector
 
-VERSION = "v0.34"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.41"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -58,6 +58,15 @@ VERSION = "v0.34"        # v0.8 换库：读新库，get 只给一层，一次�
                          # 页脚按层报往下还有的；每行标被〖〗引用过几次（用户 2026-11-01）
                          # v0.33 evoke 加向量一路（检索面按 RAG，用户 2026-11-02）：bge-m3 在向量服务上，和字面按 RRF 合并；连不上只用字面
                          # v0.34 联想也双轨（用户 2026-11-02）：送不送照旧由字面的档定，送什么字面、向量交替；双轨一致、没有词段时的向量只记
+                         # v0.35 grain 不进主会话（用户 2026-11-02：这不是主会话该知道的参数）：MCP 的 schema、说明里都没有，
+                         # 命令行也藏起来；内部照旧能用，真带了照常报“没有参数 grain”
+                         # v0.36 feedback 工具撤出 MCP（用户 2026-11-02：反馈不是开发功能，但现阶段少、集中、用户在场，这个工具没有价值）；
+                         # v0.37 陈述的来源按分句排：每条 E 挂到向量最像的分句（向量服务 /align），用不了照旧（用户 2026-11-05）
+                         # v0.38 话题超窗先给会话结构（form 的 structure），目录跟在后面（用户 2026-11-05）
+                         # v0.39 relive 一条陈述默认只给它自己，前后几条改成 near 选项（用户 2026-11-05：陈述写到能用以后，相邻是要时才看的）
+                         # v0.40 evoke 的陈述行带日期（用户 2026-11-05：现状题里新旧两条摆在一起分不出先后，F5）
+                         # v0.41 MCP 撤 observe-now（用户 2026-11-06：快不该放在 SSD 层，连同 observe 的快道一起撤）
+                         # 挂线待审视只标出来，不再叫主会话用 feedback 改挂（那个工具本来也改不了挂线）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
@@ -252,6 +261,16 @@ def _day(t):
     return t[:10] if t and not absent(t) else "日期未知"
 
 
+def _stmt_day(L, sid):
+    """陈述的日期（v0.40）：它的 E 出自的轮次里最晚的那天；归纳出的（没有直接的 E）用所在话题的日期。按读视图缓存。"""
+    cache = L.__dict__.setdefault("_sday", {})
+    if sid not in cache:
+        r = L.conn.execute("SELECT max(o.started) FROM form_record f, json_each(f.refs, '$.event') j "
+                           "JOIN event e ON e.id=j.value JOIN occurrence o ON o.id=e.turn WHERE f.id=?", (int(sid),)).fetchone()
+        cache[sid] = _day(r[0]) if r and r[0] else _day(L.nodes.get(L.stmts[sid]["entry"], {}).get("date"))
+    return cache[sid]
+
+
 def _who(j):
     return "、".join(h["who"] for h in j["holders"] if not absent(h.get("who", ""))) or "持有者未知"
 
@@ -328,7 +347,7 @@ def _head(L, nid):
     n = L.nodes[nid]
     head = f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n.get("review"):          # 中间插入留下的标记（v0.23）：这条挂线形成时没看到后来补进的内容，用到时由你带着新内容再看
-        head += f"\n挂线{n['review']}；线挂得不对就用 feedback 改挂（改挂到同一条线表示看过了）"
+        head += f"\n挂线{n['review']}"
     return head
 
 
@@ -341,6 +360,9 @@ def show_node(L, nid, recall=None, conn=None, start=0):
         size, p = _WIN.get()
         if len(items) > size and not start and p == 1 and recall is None and conn is not None:
             secs = _sections(conn, L, items)
+            got = structure.latest(conn, n["session"], [it["id"] for it in items]) if n.get("session") else None
+            if got:                                    # 超窗先给会话结构，目录跟在后面（v0.38，用户 2026-11-05）
+                return _show_structure(L, nid, items, got, secs)
             if secs:
                 return _show_sections(L, nid, secs)
         start = start or (p - 1) * size
@@ -477,6 +499,20 @@ def _show_sections(L, nid, secs):
     return "\n".join(out), {"session_entry": [L.nodes[nid]["row"]]}
 
 
+def _show_structure(L, nid, items, got, secs):
+    act, d = got
+    hs = [L.stmts[it["id"]]["h"] for it in items]
+    seq = lambda i: hs[i - 1].rsplit(":", 1)[-1] if 1 <= i <= len(hs) else f"?{i}"
+    out = [_head(L, nid) + "（陈述多，先给这段对话的结构：问题、方向、证据、判断、遗留；括号里是来自哪几条陈述）"]
+    out += structure.render(d, seq)
+    if secs:
+        toc, _ = _show_sections(L, nid, secs)
+        out += ["", "目录（relive 某一节的句柄读陈述）："] + toc.split("\n")[1:]
+    else:
+        out.append(f"接着读：{_span(hs[:_WIN.get()[0]])}")
+    return "\n".join(out), {"session_entry": [L.nodes[nid]["row"]], "act": [act]}
+
+
 def _recent(L, ids):
     return sorted(ids, key=lambda k: -_latest(L, k))
 
@@ -498,7 +534,7 @@ def _window(items, recall):
 
 
 def show_context(L, sid):
-    """relive 一条现在的陈述（v0.13）：它所在的话题里前后各 CONTEXT 条，按原来的顺序，要的那条标 ▶。"""
+    """relive 一条现在的陈述带 near（v0.13 起是默认，v0.39 改成选项）：它所在的话题里前后各 CONTEXT 条，按原来的顺序，要的那条标 ▶。"""
     nid = L.stmts[sid]["entry"]
     items = L.nodes[nid].get("items", [])
     i = next(k for k, it in enumerate(items) if it["id"] == sid)
@@ -539,8 +575,15 @@ def show_stmt(conn, L, sid, h, source=False, said=False, recall=None, section=0,
         lines = []     # 按 form 写下的顺序给（10-27：原来按编号排，相关的被挤出第一页，和足迹按顺序记的那页也对不上）
         seen = set()   # said 在陈述上只给原话的位置和开头，同一段只给一次；全文 relive 那条 E 带 said（v0.19）
         got = {r["id"]: r for r in conn.execute(f"SELECT * FROM event WHERE id IN ({','.join('?' * len(shown))})", shown)}
-        for r in (got[e] for e in shown if e in got):
-            lines.append(f"- E{r['id']}{_speaker(r)} {r['text']}" + ("".join(f"\n    {x}" for x in _said(conn, r, brief=seen)) if said else ""))
+        rs = [got[e] for e in shown if e in got]
+        line = lambda r: f"- E{r['id']}{_speaker(r)} {r['text']}" + ("".join(f"\n    {x}" for x in _said(conn, r, brief=seen)) if said else "")
+        by = None if files else _by_clause(conn, row["text"], rs)
+        if by:
+            for cl, members in by:
+                lines.append(f"▸ {cl}")
+                lines += [line(r) for r in members]
+        else:
+            lines += [line(r) for r in rs]
         if len(secs) > 1:      # 真的分了节才说（用户 2026-10-27：常态不提示）
             out += [f"{'文件指向' if files else '来源'}（第 {section + 1} 节，共 {len(secs)} 节" + (f"：{name}" if name else "") + "）："] + lines
             if section + 1 < len(secs):
@@ -550,6 +593,26 @@ def show_stmt(conn, L, sid, h, source=False, said=False, recall=None, section=0,
     if recall is not None:
         out += _stmt_history(conn, L, row)
     return "\n".join(out), {"form_record": [sid], "event": shown, **({"_sections": len(secs)} if len(secs) > 1 else {})}
+
+
+CLAUSE = re.compile(r"(?<=[。；！？])")
+CLAUSE_SHOW = 60
+
+
+def _by_clause(conn, text, rs):
+    """来源按分句排（2026-11-05，原型 tmp/expand-why/align.py）：陈述按句号、分号切成分句，每条 E 挂到向量最像的那句，
+    按分句的先后给、每条 E 只给一次；分句标头只给前 CLAUSE_SHOW 字。不到两句、不到两条 E、向量一路用不了，返回 None 照旧。"""
+    if len(rs) < 2:
+        return None
+    clauses = [c.strip() for c in CLAUSE.split(text) if c.strip()]
+    best = vector.align(conn, clauses, [r["text"] for r in rs])
+    if not best:
+        return None
+    out = {}
+    for r, i in zip(rs, best):
+        out.setdefault(i, []).append(r)
+    cut = lambda c: c if len(c) <= CLAUSE_SHOW else c[:CLAUSE_SHOW] + "…"
+    return [(cut(clauses[i]), out[i]) for i in sorted(out)]
 
 
 def _stmt_history(conn, L, row):
@@ -708,10 +771,10 @@ MISSING = ("没有这个句柄。话题线 L3、话题 L3:T5（T5）、陈述 L3
 
 
 def relive(conn, handles, said=False, recall=None, session="", purpose="interactive", cwd="", note="", source=False,
-           page=None, files=False, **_):
+           page=None, files=False, near=False, **_):
     tok = _WIN.set(paging(page))
     try:
-        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files)
+        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files, near)
     finally:
         _WIN.reset(tok)
 
@@ -722,8 +785,8 @@ def _window_query():
     return {"page": p} if p != 1 else {}
 
 
-def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False):
-    """按位置读（v0.13；v0.12 以前叫 get）：一条陈述给它前后几条，话题按顺序分页（接着读给范围句柄），线、骨架给下一层，E、J 给正文。
+def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False, near=False):
+    """按位置读（v0.13；v0.12 以前叫 get）：陈述只给它自己，near 时连同前后几条（v0.39），话题按顺序分页（接着读给范围句柄），线、骨架给下一层，E、J 给正文。
     source：来源（陈述的 E、J 的旧会话记录和同一段会话现在的话题）；said：E 走到原话；recall：历史。"""
     L = layers(conn)
     out, ins = [], defaultdict(list)
@@ -737,7 +800,7 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
         elif kind == "earlier":
             text, got = show_node(L, v[1], recall, conn)
             text = f"{v[0]}：这段会话以前的话题，现在是 {L.where(v[1])}\n" + text
-        elif kind == "stmts" and len(v) == 1 and v[0][1] in L.stmts and not attrs:
+        elif kind == "stmts" and len(v) == 1 and v[0][1] in L.stmts and not attrs and near:   # 相邻是选项，默认只给这一条（v0.39，用户 2026-11-05）
             text, got = show_context(L, v[0][1])
         elif kind == "stmts":
             parts, got = [], defaultdict(list)
@@ -748,6 +811,9 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
                 key = f"{sid}/{'s' if source else ''}{'d' if said else ''}{'f' if files else ''}"     # 内部按“陈述/第几节”记（v0.20）
                 k = sum(1 for m in round_metas if key in m.get("sections", {}))
                 t, g = show_stmt(conn, L, sid, hh, source, said, recall, section=k, files=files)
+                if not attrs and sid in L.stmts:            # 只给这一条时标出在哪个话题（v0.39）
+                    e = L.nodes[L.stmts[sid]["entry"]]
+                    t += f"\n  在 {L.where(L.stmts[sid]['entry'])}「{e['name']}」（{(e.get('date') or '')[:10]}）"
                 if g.pop("_sections", 0):
                     sections[key] = k
                 parts.append(t)
@@ -770,6 +836,7 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
     text = "\n\n".join(out)
     text = track.deliver(conn, VERSION, "recall" if recall is not None else "relive",
               {"relive": {"handles": list(handles), "said": said, "source": source, "recall": recall, **({"files": True} if files else {}),
+                          **({"near": True} if near else {}),
                           **_window_query()}},
               text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note, raw=said,
               meta={"sections": sections} if sections else None)
@@ -965,7 +1032,7 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
         c = cited.get(x, 0)
         mark = f"引用过 {c} 次" if c else ""
         if kind == "stmt":
-            return f"- {L.stmts[x]['h']} {L.stmts[x]['text']}" + (f"（{mark}）" if mark else "")
+            return f"- {L.stmts[x]['h']}（{_stmt_day(L, x)}）{L.stmts[x]['text']}" + (f"（{mark}）" if mark else "")
         nd = L.nodes[x]
         has = ("含 " + "、".join(live[i] for i in sorted(cover[x])) if n >= 2 else "") if x in cover else "意思相近"
         extra = "；".join(filter(None, [has, mark]))

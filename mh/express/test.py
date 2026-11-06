@@ -7,8 +7,8 @@ class ExpressTest(unittest.TestCase):
     def test_preserve_nested_viewpoints(self):
         text = '作者：青禾\n我的名字是青禾。\n『你是观察者。』\n代拟邮件：我已收到，明天给你答复。\n来源：E7 / 3:U1'
         ctx = context('青禾', ['松风'], purpose='memory')
-        shown = present(text, ctx, raw=True, use=7)
-        self.assertEqual(shown, '<memory-harness use="7" source="原话">\n' + text + '\n</memory-harness>')
+        shown = present(text, ctx, raw=True)
+        self.assertEqual(shown, '<memory-harness source="原话">\n' + text + '\n</memory-harness>')
         self.assertEqual(present(text, ctx), '<memory-harness>\n' + text + '\n</memory-harness>')
         self.assertEqual(present(text, dict(ctx, purpose='form')), text)
         self.assertEqual(present(text, dict(ctx, reader='human')), text)

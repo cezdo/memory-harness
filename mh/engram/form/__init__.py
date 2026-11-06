@@ -43,11 +43,15 @@ from ..store import NA, UNKNOWN, absent, cost, dumps, occurrence, operator as re
 from ..observe.label import USER_NAME
 from ...synapse import track
 from ...synapse.pull import retrieve
-from . import attach, glossary, induce, label, pack, restate as _restate, skeleton
+from . import attach, glossary, induce, label, pack, restate as _restate, skeleton, structure
 
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数
-CURRENT = {"pack": ("sol-low", "pack-v0.7"),   # v0.7：排查里被推翻的猜测也落在陈述上，下一步归纳（G6，2026-10-29）   # v0.3：结构标记写『引用：』『文件：』（2026-10-22，用户看过样本）；
+CURRENT = {"pack": ("sol-low", "pack-v0.9.4"), # v0.9.4：写进文件的细节合并掉，结论（选了什么、为什么、关键数值）留在陈述里（用户 11-04）
+                                               # v0.9.3：「」只括专名和照引的原话，概念、说法、讨论的主题不括（用户 11-04）
+                                               # v0.9.2：陈述写到能用、展开只为查证；一件事 = 读的人会一起用的东西，写细不拆；去掉来源上限（依据哪几条改由程序对）；
+                                               # 示例一轮一条写全；不给判断加“当时”，只有会话最后定下又没验证的结论才说明（G6，2026-11-04，tmp/expand-why/）
+                                               # v0.7：排查里被推翻的猜测也落在陈述上，下一步归纳（G6，2026-10-29）   # v0.3：结构标记写『引用：』『文件：』（2026-10-22，用户看过样本）；
                                                # v0.4：一条一事、来源一页以内、两页要同一段、不写范围，程序检查不合规的重写一次（2026-10-27）
                                                # v0.5：上限不是为了少记，装不下就多写一条，不因此略去（v0.4 离线重跑略去的 E 从 51 涨到 594）；
                                                # 检查 v2 加覆盖：用户的话不略去，略去超过一成的重写
@@ -55,7 +59,8 @@ CURRENT = {"pack": ("sol-low", "pack-v0.7"),   # v0.7：排查里被推翻的猜
            "label": ("sol-low", "label-v0.2"),
            "attach": ("sol-low", "attach-v0.3"),               # 有骨架的工作区（v0.3：判据是以后能不能找到，目标只是线索，2026-10-24 L44）
            "attach_lines": ("sol-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
-           "restate": ("sol-low", "restate-v0.1")}             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
+           "restate": ("sol-low", "restate-v0.1"),             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
+           "structure": ("sol-low", "structure-v0.1")}         # 会话结构：问题—决定（D4，用户 2026-11-05：跟着 form 做，relive 超窗先给它）
 STEP_OF = {"attach_lines": "attach"}                           # act 里记的 step
 MODELS = {"sol-low": lambda: invoke.whole(Codex("gpt-6.1-sol", "low"))}
 DESC = {"sol-low": "gpt-6.1-sol low（经 codex exec）"}          # 环境里“现在回看的我”
@@ -72,11 +77,14 @@ def window_params(step):
     """影响模型看到什么的程序参数：进 Operator 的名字（摘要）和登记的 params，改了任何一个就是新的 Operator。"""
     if step == "pack":
         return {"idle": IDLE, "max_chars": MAX_CHARS, "written": "observe.written", "redact": "store.SECRET",
-                "check": ["pack.check-v2", pack.LIMIT, pack.HARD, pack.DROP_SHARE, "observe.groups"], "rewrite": REWRITES,
+                "check": ["pack.check-v3", pack.LONG, pack.DROP_SHARE], "rewrite": [REWRITES, "follow-v1"],
                 "languages": ["observe.languages", observe.label.RECORD_LANGUAGE, "skeleton-v1", observe.label.SKELETON_MIN, observe.label.SKELETON_LEAD]}
     if step == "induce":
         return {"kind": "排查", "input": "pack 的陈述（现在的）+ 轮次", "check": ["induce.check-v1", induce.LIMIT, induce.HARD],
                 "measure": "induce.measure-v1", "redact": "store.SECRET"}
+    if step == "structure":
+        return {"input": "话题主列（form.topic_items）+ 名字、主题、停在 + glossary.text", "short": structure.SHORT, "page": structure.PAGE,
+                "trigger": "现行 pack 写的、交互 relive 过的", "redact": "store.SECRET"}
     if step == "restate":
         return {"changes": "observe.fate", "format": "pack-v0.3 的陈述格式"}
     if step == "label":
@@ -125,7 +133,7 @@ def redact(text):
 # ---- 形成史（只读 form 自己的 act）----
 
 ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, a.output FROM act_detail a
-          JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','induce','label','attach') ORDER BY o.id"""
+          JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','induce','label','attach','structure') ORDER BY o.id"""
 
 
 # 修订提示（observe 写来的：E 被取代、不成立、撤下、恢复）认领以后怎么做（2026-10-21：两个方案都留着做成选项，先用前者）：
@@ -553,8 +561,7 @@ def pool(conn):
 # ---- 调用与记录 ----
 
 def _usage(meta):
-    u = meta.pop("usage", None)
-    return u if isinstance(u, list) else None
+    return st.usage_rows(meta.pop("usage", None))
 
 
 def _call(model, text):
@@ -578,25 +585,57 @@ REWRITE = """
 {output}"""
 
 
+FOLLOW = """程序查出上面这份记录里下面几处要改。请按说明只改这几条：只输出改过的陈述，用原来的编号（“### 陈述N”，连同来源、引用、文件各行）；
+一条拆成两条、或要为没落下的事件补一条的，新的那条写成“### 陈述N.1”，接在第 N 条后面。其余陈述不要输出；都保持就只回“保持”。
+
+{problems}"""
+
+
 def pack_call(model, text, events, groups):
     """pack 调一次模型，程序检查（pack.check）；不合规的带着问题重写，最多 REWRITES 次。worker 线程里跑，不碰库。
-    → (输出, meta, 错误)；重写过的 meta["rewrite"] 留着每一次的问题和原来的输出，最后还剩的问题在 meta["violations"]。"""
-    output, meta, error = _call(model, text)
+    模型能接着同一会话问（follow，codex，2026-11-04）：第一轮留下会话，重写走下一轮、只交回改过的几条，程序拼回（pack.splice）；
+    前面的输入命中缓存，输出只有改的那几条。不能的（测试的假模型等）照旧把问题和上一次的输出接在原输入后面、交回整份记录。
+    → (输出, meta, 错误)；重写过的 meta["rewrite"] 留着每一次的问题和原来的输出，最后还剩的问题在 meta["violations"]；
+    meta["usage"] 是几次调用合起来的。"""
+    follow = callable(getattr(model, "follow", None))
+    if follow:
+        output, meta, error = _call(functools.partial(model, keep=True), text)
+    else:
+        output, meta, error = _call(model, text)
+    thread = meta.pop("thread", None)
+    rows = st.usage_rows(meta.get("usage")) or []
     tries = []
-    for _ in range(REWRITES):
-        if error is not None:
-            break
-        items = pack.parse(output, events)[2]
-        problems = pack.check(items, events, groups)
-        if not problems:
-            break
-        out2, meta2, err2 = _call(model, text + REWRITE.format(problems="\n".join(f"- {f'陈述{n}' if n else '整份记录'}：{why}" for n, why in problems),
-                                                                 output=output.strip()))
-        tries.append({"problems": problems, "output": output, "error": err2, "seconds": meta2.get("seconds")})
-        if err2 is not None or not pack.parse(out2, events)[2]:
-            break
-        meta = {**meta2, "seconds": (meta.get("seconds") or 0) + (meta2.get("seconds") or 0)}
-        output = out2
+    try:
+        for _ in range(REWRITES):
+            if error is not None:
+                break
+            items = pack.parse(output, events)[2]
+            problems = pack.check(items, events, groups)
+            if not problems:
+                break
+            listed = "\n".join(f"- {f'陈述{n}' if n else '整份记录'}：{why}" for n, why in problems)
+            if follow and thread:
+                out2, meta2, err2 = _call(functools.partial(model.follow, thread), FOLLOW.format(problems=listed))
+                tries.append({"problems": problems, "output": output, "reply": out2, "error": err2, "seconds": meta2.get("seconds"), "via": "follow"})
+                if err2 is None:
+                    rows += st.usage_rows(meta2.get("usage")) or []
+                    merged = pack.splice(output, out2) if out2.strip() != "保持" else output
+                    if pack.parse(merged, events)[2]:
+                        output = merged
+                        meta["seconds"] = (meta.get("seconds") or 0) + (meta2.get("seconds") or 0)
+                break
+            out2, meta2, err2 = _call(model, text + REWRITE.format(problems=listed, output=output.strip()))
+            tries.append({"problems": problems, "output": output, "error": err2, "seconds": meta2.get("seconds")})
+            if err2 is not None or not pack.parse(out2, events)[2]:
+                break
+            rows += st.usage_rows(meta2.get("usage")) or []
+            meta = {**meta2, "seconds": (meta.get("seconds") or 0) + (meta2.get("seconds") or 0)}
+            output = out2
+    finally:
+        if thread:
+            model.close(thread)
+    if rows:
+        meta["usage"] = rows
     if tries:
         meta["rewrite"] = tries
     if error is None:
@@ -627,7 +666,7 @@ def build_pack(conn, u, model_desc):
     got = observe.written(conn, info["source"], info["session"])
     written = {turn_ord[t]: lines for t, lines in got.items() if t in turn_ord and u["lo"] <= turn_ord[t] <= u["hi"]}
     langs = {turn_ord[t]: note for t, note in observe.languages(conn, info["source"], info["session"]).items() if t in turn_ord}
-    text = "\n\n".join([prompt("pack").replace("{{条数}}", str(len(evs))), pack.env(info, model_desc),
+    text = "\n\n".join([prompt("pack").replace("{{条数}}", str(len(evs))), pack.env(info, model_desc, evs),
                         "## 事件", pack.e_block(evs, written, langs)])
     return redact(text), written           # 写进的文件和 E 在同一份文本里一起打码
 
@@ -715,6 +754,93 @@ def induced(conn, pack_act, h=None):
             for r in conn.execute("SELECT id, text, refs FROM form_record WHERE born=? ORDER BY idx", (act,))]
 
 
+def topic_items(conn, key, h, swap=None):
+    """一段会话现在的话题和主列（同 entries 里的一项，只算这一段）：→ (会话入口行, [陈述编号…])；没有入口返回 (None, [])。"""
+    f = conn.execute("SELECT * FROM session_entry WHERE source=? AND session=? ORDER BY id DESC LIMIT 1", key).fetchone()
+    if f is None:
+        return None, []
+    swap = replacements(conn) if swap is None else swap
+    packs = [h.ok[("pack", u)] for u in sorted(u for (step, u) in h.ok if step == "pack" and u[:2] == key) if u not in h.empty] or [f["record"]]
+    items = []
+    for pa in packs:
+        items += [it["id"] for it in induce.column(record(conn, pa, swap)[2], induced(conn, pa, h))[0]]
+    return f, items
+
+
+def structures(conn):
+    """{会话: (act, [陈述编号…])}：每段会话最后一次成功的会话结构和它当时的输入。"""
+    out = {}
+    for oid, window, meta in conn.execute("SELECT o.id, a.window, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence "
+                                          "WHERE a.process='form' AND a.step='structure' AND o.outcome='ok' ORDER BY o.id"):
+        u = json.loads(window)["unit"]
+        out[(u[0], u[1])] = (oid, json.loads(meta).get("items", []))
+    return out
+
+
+RELIVED = re.compile(r"(?:^|:)T(\d+)$")
+
+
+def relived_sessions(conn):
+    """交互里 relive 过话题的会话（旧话题被读到才补结构，用户 11-05）。"""
+    ids = set()
+    for (q,) in conn.execute("SELECT query FROM use_detail WHERE channel='pull' AND purpose='interactive' AND mode IN ('relive','get')"):
+        for hd in (json.loads(q).get("relive") or json.loads(q).get("get") or {}).get("handles", []) or []:
+            m = RELIVED.search(str(hd))
+            if m:
+                ids.add(int(m.group(1)))
+    if not ids:
+        return set()
+    return {(r[0], r[1]) for r in conn.execute(f"SELECT source, session FROM session_entry WHERE id IN ({','.join('?' * len(ids))})", list(ids))}
+
+
+def structure_todo(conn, h, ops, session=None):
+    """要做结构的会话：最后一次 pack 是现行 Operator 写的，或交互里 relive 过；陈述和上次做结构时不一样；没失败满。
+    → [{"unit", "key", "entry", "items"}]，新的在前。"""
+    latest = {}
+    for (step, u), pa in h.ok.items():
+        if step == "pack" and u not in h.empty and (u[:2] not in latest or pa > latest[u[:2]][1]):
+            latest[u[:2]] = (u, pa)
+    cur = {k for k, (u, pa) in latest.items() if conn.execute("SELECT operator FROM occurrence WHERE id=?", (pa,)).fetchone()[0] == ops["pack"]}
+    keys = (cur | (relived_sessions(conn) & set(latest))) - {k for k, v in observe.switch.states(conn).items() if v == "off"}
+    done = structures(conn)
+    swap = replacements(conn)
+    out = []
+    for k in sorted(keys, key=lambda k: -latest[k][1]):
+        if session and not k[1].startswith(session):
+            continue
+        unit = latest[k][0]
+        if _failed(h, "structure", unit, ops["structure"]):
+            continue
+        f, items = topic_items(conn, k, h, swap)
+        if f is None or len(items) <= structure.PAGE or done.get(k, (0, None))[1] == items:
+            continue
+        out.append({"unit": unit, "key": k, "entry": f, "items": items})
+    return out
+
+
+def build_structure(conn, job):
+    f, ids = job["entry"], job["items"]
+    texts = {r[0]: st.restyle(r[1]) for r in conn.execute(f"SELECT id, text FROM form_record WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    items = [{"text": texts[i]} for i in ids if i in texts]
+    mine = record(conn, f["record"])[2]
+    nums = {**{it["was"]: it["n"] for it in mine}, **{it["id"]: it["n"] for it in mine}}
+    stops = [_stop_text(s, nums) for s in json.loads(f["stops"])]
+    body = structure.block({"name": f["name"], "topic": f["topic"], "stops": stops}, items,
+                           glossary.text("\n".join(x["text"] for x in items) + f["name"] + f["topic"]))
+    return redact(prompt("structure") + "\n\n---\n\n" + body)
+
+
+def store_structure(conn, op_id, job, text, output, meta, error, h, cause):
+    data, why = structure.parse(output, len(job["items"])) if error is None else (None, "")
+    if error is None and data is None:
+        error = f"content_error: {why}"
+    meta.update(items=job["items"], entry=job["entry"]["id"], **({"nodes": len(data["nodes"])} if data else {}))
+    act, result, err = _act(conn, op_id, "structure", job["unit"], {"entry": job["entry"]["id"]},
+                            {"form_record": job["items"]}, text, json.dumps(data, ensure_ascii=False) if data else output, meta, error, h, cause)
+    conn.commit()
+    return f"{result}：{err[:160]}" if result != "ok" else f"{len(job['items'])} 条陈述 → {len(data['nodes'])} 个节点"
+
+
 def _others(conn, u):
     """同一工作区已有的会话入口（不含这个会话自己的）。"""
     return {k: e for k, e in entries(conn).items() if e["ws"] == u["session"]["workspace"] and e["session"] != tuple(u["unit"][:2])}
@@ -763,9 +889,10 @@ def _keep_entry(conn, u):
 
 
 def request_repack(conn, statements, reason):
-    """form 写给自己的申请：这几条陈述的来源不合页对齐标准，从 pack 起重做这段会话的陈述，入口和挂线保留（_keep_entry）。返回编号。"""
-    op = st.operator(conn, "form/check-pages-v0.1", "form", "program", model=st.NA, prompt=st.NA, prompt_hash=st.NA,
-                     isolation=st.NA, window="session", params={"check": ["pack.check-v2", pack.LIMIT, pack.HARD]})
+    """form 写给自己的申请：这几条陈述没过 pack 的检查（v0.1 是页对齐，2026-11-04 起是范围、编号、覆盖），从 pack 起重做这段会话的陈述，
+    入口和挂线保留（_keep_entry）。返回编号。"""
+    op = st.operator(conn, "form/check-v0.2", "form", "program", model=st.NA, prompt=st.NA, prompt_hash=st.NA,
+                     isolation=st.NA, window="session", params={"check": ["pack.check-v3", pack.DROP_SHARE], "soft": "正文长度不申请"})
     return st.request(conn, "form", "form", {"form_record": list(statements)}, reason, op)
 
 
@@ -773,7 +900,7 @@ REPACK_MAX = 1          # 同一段会话 form 自己写的重做申请最多几
 
 
 def auto_repack(conn, log=sys.stderr):
-    """页对齐检查（pack.check）重写一次后仍不合规、入了库的陈述，form 给自己写重做申请（request_repack，陈述级，入口和挂线沿用）。
+    """pack 的检查（pack.check）重写一次后仍不合规、入了库的陈述（软的问题不算），form 给自己写重做申请（request_repack，陈述级，入口和挂线沿用）。
     每段会话最多 REPACK_MAX 张（J4，2026-10-27）：重做是整段 pack，再违规也可能；超过的不再自动重做，由 `mh check` 列出、主会话定。
     只看每个单位最后一次成功的 pack（重做掉的不看）；已经有没认领的申请的不重复写。返回写了几张。"""
     h = history(conn)
@@ -785,7 +912,8 @@ def auto_repack(conn, log=sys.stderr):
         if step != "pack":
             continue
         meta = json.loads(conn.execute("SELECT meta FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0] or "{}")
-        bad = {n for n, _ in meta.get("violations", [])}
+        hard = [(n, w) for n, w in meta.get("violations", []) if not pack.soft(w)]       # 正文长度是软的：确认过还长就保持
+        bad = {n for n, _ in hard}
         key = unit[:2]
         if not bad or len(asked[key]) >= REPACK_MAX or any(r["state"] != "handled" for r in redo_requests(conn).get(key, [])):
             continue
@@ -793,8 +921,8 @@ def auto_repack(conn, log=sys.stderr):
         ids = [rid for rid, label_ in rows if 0 in bad or label_ in {f"陈述{n}" for n in bad}]
         if not ids:
             continue
-        why = "；".join(f"{'陈述' + str(n) if n else '整份记录'}：{w}" for n, w in meta["violations"])
-        rid = request_repack(conn, ids, f"页对齐检查重写一次后仍不合规：{why}"[:500])
+        why = "；".join(f"{'陈述' + str(n) if n else '整份记录'}：{w}" for n, w in hard)
+        rid = request_repack(conn, ids, f"pack 检查重写一次后仍不合规：{why}"[:500])
         asked[key].append({"id": rid, "from": "form", "state": "open"})
         wrote += 1
         print(f"[重做申请] {unit[1][:12]}：{rid}（{len(ids)} 条陈述）", file=log, flush=True)
@@ -1027,6 +1155,8 @@ def build_attach(conn, u, label_act, the_pool, corpus):
 
 def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_pool, output, meta, error, h, cause):
     node, target, parent, why = attach.parse(output, bool(ns)) if error is None else (None, "", None, "")
+    if ns and node and not node.startswith("k-") and node.strip("/") in ns:     # 节点写成了路径（“global”），按路径认（11-03 起 2 个会话一直挂不上）
+        meta["node_by_path"], node = node, ns[node.strip("/")]["id"]
     name = attach.new_line(target)
     target, parent = (target if name else handle_of(target)), (handle_of(parent) if parent else parent)
     if error is None:
@@ -1217,7 +1347,7 @@ def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stder
     if env:
         return done, env
     if session is None:
-        auto_repack(conn, log=log)                  # 页对齐检查仍不合规的，form 给自己写重做申请（有上限）
+        auto_repack(conn, log=log)                  # pack 检查仍不合规的，form 给自己写重做申请（有上限）
     h = history(conn)
     todo = units(conn, now, session)[:limit]
 
@@ -1298,6 +1428,13 @@ def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stder
             break
         if not _complete(h, unit) and not _failed(h, "attach", unit, ops[step]):
             break                                                      # 这次没挂上：后面的等下一批
+    if env:
+        return done, env
+    # ④ 会话结构：现行 pack 写的、relive 过的旧话题；陈述变了才重做（D4，2026-11-05）；失败不挡别的
+    jobs = []
+    for j in structure_todo(conn, h, ops, session)[:limit]:
+        jobs.append({**j, "u": j, "step": "structure", "text": build_structure(conn, j)})
+    parallel(jobs, lambda j, o, m, e: store_structure(conn, ops["structure"], j, j["text"], o, m, e, h, cause), "结构")
     return done, env
 
 

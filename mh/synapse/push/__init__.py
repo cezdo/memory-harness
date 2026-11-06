@@ -101,11 +101,11 @@ def entry(L, cwd):
     from ...engram.store import workspace as ws_of
     here = ws_of(cwd)
     return "\n".join(["### 工具",
-                      f"- `{TOOL}evoke`：按词回忆，几个词一起给，带上换个说法的词；",
-                      f"- `{TOOL}relive`：按句柄读下去，需要时一直走到原话；",
-                      f"- `{TOOL}roam`：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
-                      f"- `{TOOL}yorimichi`：告诉记忆现在给联想留几条；",
-                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。参数见各工具的说明。"])
+                      f"- `{TOOL}evoke`（words）：按词回忆，几个词一起给，带上换个说法的词；",
+                      f"- `{TOOL}relive`（handles）：按句柄读下去，需要时一直走到原话；",
+                      f"- `{TOOL}roam`（node）：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
+                      f"- `{TOOL}yorimichi`（width）：告诉记忆现在给联想留几条；",
+                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。括号里是主参数，其余参数见各工具的说明。"])
 
 
 def render(cwd, host="claude", session="", start="", model=""):
