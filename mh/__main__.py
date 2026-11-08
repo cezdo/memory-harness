@@ -139,7 +139,7 @@ def main():
         x.add_argument("--page", type=int, default=None, help="第几页，从 1 起（一页 8 条）")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
     top.add_parser("reply", help="回复：在实例配置 [reply] 的群里被叫到时回几句（常驻，memory-harness-reply 服务跑它）")
-    qa = top.add_parser("quota", help="三家订阅的额度（codex / claude / opencode-go），只读，不发模型请求")
+    qa = top.add_parser("quota", help="额度查询（只读；部署自己接，公开包不带）")
     qa.add_argument("names", nargs="*", help="只看这几家")
     qa.add_argument("--json", action="store_true")
     qa.add_argument("--wait", action="store_true", help="只看一家：用完了就打印要等到的 unix 秒，没用完打印 0，读不到打印 -1")
@@ -306,7 +306,10 @@ def main():
         conn = estore.connect(estore.DEFAULT_DB)
         print(f"补成 use：form 内部的拉取 {track.backfill_internal(conn)} 条；引用回填 {'，出错 '.join(map(str, cite.backfill(conn)))} 轮")
     elif args.cmd == "quota":
-        from .rhythm import quota
+        try:
+            from .rhythm import quota
+        except ImportError:                  # 公开包不带 quota（2026-11-08）
+            sys.exit("这个安装里没有额度查询（mh/rhythm/quota.py 不随公开包发布）")
         qs = quota.read(args.names or None)
         if args.wait:
             w = quota.wait_until(qs[0])

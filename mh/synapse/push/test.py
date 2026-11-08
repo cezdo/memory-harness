@@ -152,6 +152,10 @@ class RecentTest(unittest.TestCase):
             got = [x['session'] for x in recent.candidates(None, 'mh', n=3)]
         self.assertEqual(got, ['o0', 'new', 'o1', 'o2', 'o3', 'o4'])
         self.assertNotIn('old', seen)                                            # 比第 n+1 条还旧的不读原始记录
+        far.append(dict(self.item('me', 'm', '2026-10-24T04:50:00+00:00'), cwd='/home/u/.memory-harness/self'))
+        with mock.patch.object(recent, 'sessions', lambda c, ws, foreign=False: far if foreign else own), \
+             mock.patch.object(recent, 'crossed', lambda x, ws: True):
+            self.assertNotIn('me', [x['session'] for x in recent.candidates(None, 'mh', n=3)])   # self 的会话只在 self 那一节列
         x = dict(self.item('new', 'n', '2026-10-24T04:30:00+00:00'), cwd='/nowhere/other', ws='mh')
         with mock.patch.object(recent, 'workspace', lambda p: 'other'):
             self.assertIn('Claude Code（在 other 开的） · ', recent.line(x, 'L7:T1'))
@@ -276,6 +280,15 @@ class CluesTest(unittest.TestCase):
         for r in rows:                                                                       # 同一份内容，两种排版
             self.assertTrue(all(x in model and x in user for x in (r["h"], r["s"], r["date"], r["name"], r["head"])))
         self.assertTrue(a.shown_text(rows, True).startswith("[Souhatsu]\n1> "))
+
+    def test_self_rows_marked(self):
+        """self 来的话题：联想的两种排版都在日期后面标“自语”，别处的不标。"""
+        rows = a.topic_rows(self.idx, [("s", 1), ("s", 3)], ["配色"])
+        rows[0]["alone"] = True
+        model, user = a.clues(rows), a.shown_text(rows, True)
+        self.assertIn(f"- L1:T1 · 10-21 自语 · 甲话题 · 1：", model)
+        self.assertIn("1> 甲话题 · L1:T1 · 10-21 自语 · 1", user)
+        self.assertEqual(model.count("自语") + user.count("自语"), 2)
 
     def test_shown_keys_follow_topics(self):
         self.assertEqual(a.shown_keys(self.idx, [("s", 1), ("s", 3), ("s", 2)]), [("s", 1), ("s", 3)])   # 每个话题开头那条，和显示一致

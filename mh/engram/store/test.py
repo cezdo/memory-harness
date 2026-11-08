@@ -48,6 +48,11 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(usage_rows([{"inputTokens": 5}]), [{"inputTokens": 5}])
         self.assertEqual(cost(1, usage_rows(None))["tokens"], UNKNOWN)
 
+    def test_self_root(self):
+        """self 的整个目录都是 self，醒来的子目录也是；不靠实例配置（2026-11-08）。"""
+        self.assertEqual(st.workspace(str(st.SELF_ROOT / "2026-11-08-自语标记")), "self")
+        self.assertEqual(st.workspace(str(st.SELF_ROOT)), "self")
+
     def test_workspace(self):
         """工作区：按目录的映射（最长前缀）优先，其余取 cwd 最后一节；旧名字读的时候换成映射后的（2026-10-21）。"""
         h = "/h"

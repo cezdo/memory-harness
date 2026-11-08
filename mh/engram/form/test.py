@@ -973,6 +973,39 @@ class FormTest(unittest.TestCase):
         self.assertNotIn("工作区：", rows[2][1])                                   # other 只碰过 1 处：不进范围，也不写线索
         self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id").fetchall()[1][0], 1)
 
+    def test_self_attach(self):
+        """self 的会话（2026-11-08）：便签叫醒的由程序挂到便签同名的线，同一张便签再来挂同一条，不调模型；
+        认不出便签的照常问模型，但只挂得上 self 的线，碰过别处多少路径都不跨。"""
+        from unittest import mock
+        a = self._session("s1", "2026-10-17T08:00:00Z", cwd="/home/u/other")
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的"]))
+        home = "/home/u/.memory-harness/self"
+        b = self._session("s2", "2026-10-17T09:00:00Z", cwd=home)
+        c = self._session("s3", "2026-10-17T10:00:00Z", cwd=home)
+        d = self._session("s4", "2026-10-17T11:00:00Z", cwd=home)
+        notes = {"s2": "runbook稿", "s3": "runbook稿", "s4": None}
+        with mock.patch.object(form, "self_note", lambda conn, u: notes[u["unit"][1]]), \
+             mock.patch.object(form, "crossed", lambda conn, u: {"other": 9}):
+            fakes = self._fakes([PACK.format(a=x[0], b=x[1]) for x in (b, c, d)], [LABEL] * 3,
+                                ["挂到：L1｜为什么：同一次升级", "挂到：新线 自己想的｜为什么：新的"])
+            self._run(fakes)
+            self._run(fakes)
+        lines = {r["id"]: (r["name"], r["workspace"]) for r in self.conn.execute("SELECT * FROM topic_line")}
+        got = [lines[r[0]] for r in self.conn.execute("SELECT line FROM attachment ORDER BY id")]
+        self.assertEqual(got, [("X 升级", "other"), ("runbook稿", "self"), ("runbook稿", "self"), ("自己想的", "self")])
+        rows = self.conn.execute("SELECT o.outcome, a.input, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()
+        self.assertEqual([r[0] for r in rows], ["ok", "ok", "ok", "content_error", "ok"])     # s4 挂 L1（other 的）不收
+        self.assertEqual(json.loads(rows[1][2])["self_note"], "runbook稿")
+        self.assertEqual(rows[1][1], "")                                                    # 程序挂的：没有给模型的输入
+        self.assertNotIn("[L1]", rows[3][1])                                               # other 的线不进候选
+        self.assertIn("[L2]", rows[3][1])
+
+    def test_wake_note(self):
+        from ..observe.label import wake_note
+        self.assertEqual(wake_note("正文\n---\n此刻：2026-11-09 00:30。叫醒我的便签：`便签/runbook稿.md`（到：2026-11-09）。"), "runbook稿")
+        self.assertIsNone(wake_note("把 X 升级一下"))
+
     def test_skeleton(self):
         design = self.dir / "design"
         for d in ("", "engram", "engram/form"):

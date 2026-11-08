@@ -87,6 +87,18 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual(json.loads(self._uses()[-1]["query"])["big"], [f"{U}"])
         self.assertIn("X 升级", pull.evoke(self.conn, [f"{U}", "甲服务"], **self.kw))   # 别的词照常查
 
+    def test_self_marked(self):
+        """v0.42：self 来的话题、陈述标“自语”（按节点的工作区认）；roam 一个 self 的节点往下不逐行再标；别处的不标。"""
+        from unittest.mock import patch
+        L = pull.layers(self.conn)
+        ws = L.nodes["T1"]["ws"]
+        self.assertNotIn("自语", pull.evoke(self.conn, ["X 升级"], **self.kw))
+        with patch.object(pull, "SELF_WORKSPACE", ws):
+            self.assertIn("T1 X 升级（2026-10-17，自语，2 条陈述；", pull.evoke(self.conn, ["X 升级"], **dict(self.kw, session="t8")))
+            self.assertIn("[L1:T1] X 升级（2026-10-17，自语，2 条陈述）", pull.relive(self.conn, ["T1"], **self.kw))
+            self.assertIn("[L1:T1:S1]（自语） ", pull.relive(self.conn, ["L1:T1:S1"], **self.kw))
+            self.assertIn("- L1:T1 X 升级（2026-10-17，2 条陈述）", pull.relive(self.conn, ["L1"], **self.kw))
+
     def test_search_get_layers(self):
         text = pull.evoke(self.conn, ["X 升级"], **self.kw)
         self.assertIn("T1 X 升级", text)

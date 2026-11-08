@@ -14,6 +14,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from ...engram.observe.label import SELF_WORKSPACE
 from ...engram.store import HOME, UNKNOWN
 from ...engram.store.instance import QUIET, USER_ALIASES, USER_NAME
 
@@ -233,7 +234,7 @@ def terms(text):
 
 # ---- 新库上的联想（E1a）----
 
-CACHE_V = 8                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名；8：加上会话，向量一路排除同一段会话的陈述）
+CACHE_V = 9                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名；8：加上会话，向量一路排除同一段会话的陈述；9：加上 self 来的标记）
 NAMES_FILE = HOME / "names.json"   # 名单变体：旧记忆系统迁来的节点名（用户整理过），换库时从旧库冻结下来；是用户的数据，放数据目录（重构 H）
 
 
@@ -247,7 +248,8 @@ class Docs:
             e = L.nodes[s["entry"]]
             self.k[("s", sid)] = {"text": s["text"], "anchor": e["date"], "holder": "", "workspace": e["ws"],
                                   "topic": L.nodes[e["parent"]]["name"] if e["parent"] else e["name"], "h": s["h"],
-                                  "entry": s["entry"], "line": e["parent"], "name": e["name"], "session": str(e.get("session") or "")}
+                                  "entry": s["entry"], "line": e["parent"], "name": e["name"], "session": str(e.get("session") or ""),
+                                  "alone": e["ws"] == SELF_WORKSPACE}
         self.post, self.len = defaultdict(dict), {}
         for key, d in self.k.items():
             tf = terms(d["text"])
@@ -465,7 +467,8 @@ def topic_rows(idx, cand, words, keep=None, budget=None):
     rows = []
     for h, ks in list(by_topic(idx, cand).items())[:keep]:
         d = idx.k[ks[0]]
-        rows.append({"h": h, "s": d["h"], "date": (d["anchor"] or "")[5:10], "name": d["name"], "n": len(ks), "text": d["text"]})
+        rows.append({"h": h, "s": d["h"], "date": (d["anchor"] or "")[5:10], "name": d["name"], "n": len(ks), "text": d["text"],
+                     **({"alone": True} if d.get("alone") else {})})
     per = budget.get(len(rows), max(budget.values())) // len(rows) if budget and rows else None
     for r in rows:
         text = r.pop("text")
@@ -495,17 +498,22 @@ def shown_keys(idx, cand):
     return [ks[0] for ks in by_topic(idx, cand).values()]
 
 
+def _alone(r):
+    """self 来的话题（2026-11-08 起草）：日期后面标“自语”，联想冒出来时一眼看出是用户不在场时“我”想的。"""
+    return " 自语" if r.get("alone") else ""
+
+
 def clues(rows):
     """给模型的排版（线索式的联想，2026-10-10；2026-10-28 改成按话题）：和其他注入一样包在 <memory-harness> 里，
     第一行 [Souhatsu] 说明这是联想，不写用法提示。"""
-    body = [f"- {r['h']} · {r['date']} · {r['name']} · {r['n']}：（{r['s']}）{r['head']}" for r in rows]
+    body = [f"- {r['h']} · {r['date']}{_alone(r)} · {r['name']} · {r['n']}：（{r['s']}）{r['head']}" for r in rows]
     return "\n".join([f"<{TAG}>", "[Souhatsu]"] + body + [f"</{TAG}>"])
 
 
 def shown_text(rows, delivered, yorimichi=""):
     """给用户看的排版：同样的内容，一个话题两行，片段缩进在下一行。标题后面带上当前的 yorimichi（允许拐几次），一眼看出判得对不对。"""
     return "\n".join(["[Souhatsu]" + ("" if delivered else " 只记录，未推送") + (f" · {yorimichi}" if yorimichi else "")]
-                     + [f"{i}> {r['name']} · {r['h']} · {r['date']} · {r['n']}\n   （{r['s']}）{r['head']}" for i, r in enumerate(rows, 1)])
+                     + [f"{i}> {r['name']} · {r['h']} · {r['date']}{_alone(r)} · {r['n']}\n   （{r['s']}）{r['head']}" for i, r in enumerate(rows, 1)])
 
 
 def _seen(conn, session):

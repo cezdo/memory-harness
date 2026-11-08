@@ -40,7 +40,7 @@ from .. import invoke, observe
 from .. import store as st
 from ..invoke import Codex
 from ..store import NA, UNKNOWN, absent, cost, dumps, occurrence, operator as register, outcome
-from ..observe.label import USER_NAME
+from ..observe.label import SELF_WORKSPACE, USER_NAME, wake_note
 from ...synapse import track
 from ...synapse.pull import retrieve
 from . import attach, glossary, induce, label, pack, restate as _restate, skeleton, structure
@@ -1113,10 +1113,29 @@ def reach_of(conn, u, counts=None):
     """能挂到哪些工作区的线：store.reachable，加上碰过 CROSS_MIN 处以上的工作区。有骨架的工作区先不跨（挂线要选本区的
     节点，别处的线过不了节点的检查；M2 逐层往下时再定）。"""
     ws = u["session"]["workspace"]
+    if ws == SELF_WORKSPACE:                         # self 的会话只挂 self 的线：醒来常读 mh 的文件，跨过去自言自语就混进别处的线
+        return {ws}                                  # （2026-11-08，design/rhythm/self“进记忆”）；和别处的关联交给读的时候
     if skeleton.nodes(ws, conn):
         return st.reachable(conn, ws)
     counts = crossed(conn, u) if counts is None else counts
     return st.reachable(conn, ws) | {w for w, n in counts.items() if n >= CROSS_MIN}
+
+
+def self_note(conn, u):
+    """self 里便签叫醒的会话 → 便签短名（读这段会话第一轮开头程序写的“此刻”）；不在 self、不是便签叫醒的返回 None。"""
+    if u["session"]["workspace"] != SELF_WORKSPACE:
+        return None
+    row = conn.execute("""SELECT x.user FROM turn_detail d JOIN turn_text x ON x.id=d.text
+                          WHERE d.source=? AND d.session=? ORDER BY d.ordinal LIMIT 1""", tuple(u["unit"][:2])).fetchone()
+    return wake_note(row[0]) if row else None
+
+
+def note_line(the_pool, note):
+    """便签那条线的输出（照 attach_lines 的格式）：self 里同名的线还在就挂上去，没有就新起一条。一张便签是一条线。"""
+    have = [k for k, e in the_pool.items() if e["kind"] == "line" and e["ws"] == SELF_WORKSPACE and not e.get("retired")
+            and label.norm(e["name"]) == label.norm(note)]
+    why = f"便签 {note} 叫醒的会话，一张便签是一条线（程序定）"
+    return f"挂到：{have[-1] if have else '新线 ' + note}｜为什么：{why}"
 
 
 def build_attach(conn, u, label_act, the_pool, corpus):
@@ -1191,7 +1210,8 @@ def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_po
         inputs["act"].append(registered["act"])
     act, result, err = _act(conn, op_id, "attach", u["unit"], {"label": label_act}, inputs,
                             text, output, meta, error, h, cause)
-    track.internal(conn, act, "attach", picks, u["unit"][1])                     # 挂线的候选是一次内部拉取
+    if not meta.get("self_note"):                                                # 便签定的挂线没有查候选
+        track.internal(conn, act, "attach", picks, u["unit"][1])                 # 挂线的候选是一次内部拉取
     if result == "ok":
         entry_id = conn.execute("SELECT id FROM session_entry WHERE born=?", (label_act,)).fetchone()[0]
         if name is not None:
@@ -1418,9 +1438,16 @@ def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stder
         if _failed(h, "attach", unit, ops[step]):
             continue
         the_pool = pool(conn)
-        step, text, ns, picks, count = build_attach(conn, u, la, the_pool, corpus)
-        output, meta, error = _call(mods[step], text)
-        state = store_attach(conn, ops[step], u, la, step, text, ns, picks, count, the_pool, output, meta, error, h, cause)
+        note = self_note(conn, u)
+        if note:                                                       # self 里便签叫醒的：一张便签是一条线，程序直接挂，不问模型
+            op = st.operator(conn, "form/self-note-v0.1", "form", "program", model=st.NA, prompt=st.NA, prompt_hash=st.NA,
+                             isolation=st.NA, window="session", params={"line": "叫醒这段会话的便签同名的线"})
+            state = store_attach(conn, op, u, la, "attach_lines", "", {}, [], 0, the_pool, note_line(the_pool, note),
+                                 {"self_note": note}, None, h, cause)
+        else:
+            step, text, ns, picks, count = build_attach(conn, u, la, the_pool, corpus)
+            output, meta, error = _call(mods[step], text)
+            state = store_attach(conn, ops[step], u, la, step, text, ns, picks, count, the_pool, output, meta, error, h, cause)
         done += 1
         print(f"[挂线] {unit[1][:12]}：{state}", file=log, flush=True)
         if state.startswith("env_error"):

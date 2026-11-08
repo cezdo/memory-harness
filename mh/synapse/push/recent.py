@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 
 from . import workspace
+from ...engram.observe.label import self_talk
 
 N = 3                  # 列几条
 SAID = 60              # “你最后说”最多几个字
@@ -55,7 +56,8 @@ def candidates(conn, ws, n=N):
     只列在那个项目那边）。只查够近的别处会话，免得每次把全部原始记录读一遍。"""
     own = dedupe(sessions(conn, ws))
     edge = own[n]["last"] if len(own) > n else None
-    far = [x for x in sessions(conn, ws, foreign=True) if (edge is None or x["last"] > edge) and crossed(x, ws)]
+    far = [x for x in sessions(conn, ws, foreign=True) if (edge is None or x["last"] > edge) and not self_talk(x.get("cwd"))
+           and crossed(x, ws)]                       # self 的会话常读本仓，但没有用户在场、不是停下的事（2026-11-08）：只在 self 那一节列
     return dedupe(sorted(own + far, key=lambda x: x["last"], reverse=True))
 
 

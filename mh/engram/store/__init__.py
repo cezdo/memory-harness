@@ -295,6 +295,10 @@ def iso(text, minus_seconds=None):
 # 是这台机器的设定，在实例配置里（重构 H）。
 from .instance import ENGRAM_DIRS as WORKSPACE_DIRS, MANAGING, SESSIONS as SESSION_WORKSPACE
 
+# “我”自己的工作区（design/rhythm/self）：整个目录都是 self，醒来的子目录也是；程序定，不靠每个实例去配（2026-11-08）。
+SELF_ROOT = Path.home() / ".memory-harness" / "self"
+WORKSPACE_DIRS = {str(SELF_ROOT): "self", **WORKSPACE_DIRS}
+
 
 def local_tz():
     """显示用的本地时区，每次现读系统时区（time.tzset）。存、算都用绝对时间（UTC），只在显示的一端换算（用户 2026-11-07：

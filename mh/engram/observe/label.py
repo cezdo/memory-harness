@@ -112,6 +112,16 @@ def self_talk(cwd):
     return bool(cwd) and workspace(cwd) == SELF_WORKSPACE
 
 
+# 叫醒时程序写的“此刻”里点名是哪张便签（rhythm/self 的 awaken 照这个写，测试核对两边一致）：form 按它把会话挂到便签那条线
+WAKE_NOTE = re.compile(r"叫醒我的便签：`便签/(.+?)\.md`")
+
+
+def wake_note(text):
+    """一轮开头的文字 → 叫醒这一轮的便签短名；不是便签叫醒的返回 None。"""
+    m = WAKE_NOTE.search(text or "")
+    return m.group(1) if m else None
+
+
 SELF_NOTE = (f"这段会话在 self 工作区：“我”自己的地方，只有“我”在，{USER_NAME}不在场，这里的一切都是“我”的自言自语。"
              f"每一轮开头（U 段）是之前的“我”留给自己的便签，加上程序写的“此刻”（时间、为什么醒、世界的现状），不是{USER_NAME}的话；"
              f"A 段是“我”在想、在做。每条都以“我”开头：便签里的话写成“我之前记下……”，子代理交回来的写成“我查到……”，"

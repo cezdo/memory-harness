@@ -26,11 +26,12 @@ import re
 from collections import Counter, defaultdict
 
 from ...engram import form, observe, show
+from ...engram.observe.label import SELF_WORKSPACE
 from ...engram.store import absent
 from .. import track
 from . import retrieve, structure, vector
 
-VERSION = "v0.41"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.42"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -66,6 +67,7 @@ VERSION = "v0.41"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.39 relive 一条陈述默认只给它自己，前后几条改成 near 选项（用户 2026-11-05：陈述写到能用以后，相邻是要时才看的）
                          # v0.40 evoke 的陈述行带日期（用户 2026-11-05：现状题里新旧两条摆在一起分不出先后，F5）
                          # v0.41 MCP 撤 observe-now（用户 2026-11-06：快不该放在 SSD 层，连同 observe 的快道一起撤）
+                         # v0.42 self 来的话题、陈述标“自语”（2026-11-08 self 第一次醒来起草，用户同日同意落地）：按节点的工作区认，不另存
                          # 挂线待审视只标出来，不再叫主会话用 feedback 改挂（那个工具本来也改不了挂线）
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
@@ -275,17 +277,31 @@ def _who(j):
     return "、".join(h["who"] for h in j["holders"] if not absent(h.get("who", ""))) or "持有者未知"
 
 
+SELF_MARK = "自语"       # self 工作区来的话题、陈述（v0.42，2026-11-08 self 第一次醒来起草）：用户不在场时“我”写下的
+
+
+def _alone(L, nid):
+    """这个节点（话题、线）在不在 self：self 的会话只挂 self 的线（form.reach_of），按节点的工作区认就够，不另存。"""
+    return L.nodes.get(nid, {}).get("ws") == SELF_WORKSPACE
+
+
+def _mark(L, nid, sep="，"):
+    return f"{sep}{SELF_MARK}" if _alone(L, nid) else ""
+
+
 def name(nid):
     """对外的句柄：form 的编号原样（话题线 L3、话题 T5、骨架 k-…；form 10-19 以前写 l-3、s-5）。"""
     return nid
 
 
-def _node_line(L, nid):
+def _node_line(L, nid, marked=True):
+    """marked：标不标“自语”。上一级已经是 self 的（roam self 往下走）不再逐行标。"""
     n = L.nodes[nid]
+    m = _mark(L, nid) if marked else ""
     if n["kind"] == "entry":
-        return f"{L.where(nid)} {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+        return f"{L.where(nid)} {n['name']}（{_day(n['date'])}{m}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n["kind"] == "line":
-        return f"{nid} {n['name']}（{_size(L, nid)}）"
+        return f"{nid} {n['name']}（{_size(L, nid)}{m}）"
     return f"{nid} {n['name']}（骨架）"
 
 
@@ -345,7 +361,7 @@ def _span(hs):
 
 def _head(L, nid):
     n = L.nodes[nid]
-    head = f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+    head = f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}{_mark(L, nid)}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n.get("review"):          # 中间插入留下的标记（v0.23）：这条挂线形成时没看到后来补进的内容，用到时由你带着新内容再看
         head += f"\n挂线{n['review']}"
     return head
@@ -381,7 +397,7 @@ def show_node(L, nid, recall=None, conn=None, start=0):
     ents = sorted((k for k in kids if L.nodes[k]["kind"] == "entry"), key=lambda k: L.nodes[k]["date"], reverse=True)
     kind = "骨架" if n["kind"] == "node" else _size(L, nid)
     out = [f"[{nid}] {n['name']}（{n['ws'] or '工作区未知'}，{kind}）"]
-    out += _cap([f"- {_node_line(L, k)}" for k in sub + ents], len(sub) + len(ents))
+    out += _cap([f"- {_node_line(L, k, not _alone(L, nid))}" for k in sub + ents], len(sub) + len(ents))
     ins = defaultdict(list)
     for k in _slice(sub + ents):
         ins[INPUT_KIND[L.nodes[k]["kind"]]].append(L.nodes[k].get("row", k))
@@ -548,7 +564,8 @@ def show_stmt(conn, L, sid, h, source=False, said=False, recall=None, section=0,
     正文不再重复（evoke、relive 已经给过）。"""
     row = conn.execute("SELECT * FROM form_record WHERE id=?", (sid,)).fetchone()
     now = sid in L.stmts or sid in L.under          # 降半级的陈述照样是现在的，直接给句柄读得到（2026-10-29）
-    head = f"[{L.stmt_handle(sid, h)}]" + ("" if now else "（已不是现在的陈述）") + \
+    ent = L.stmts[sid]["entry"] if sid in L.stmts else None
+    head = f"[{L.stmt_handle(sid, h)}]" + (f"（{SELF_MARK}）" if ent and _alone(L, ent) else "") + ("" if now else "（已不是现在的陈述）") + \
         (f"（归纳进 {L.stmt_handle(L.under[sid], '')}）" if sid in L.under else "")
     attrs = source or said or files or recall is not None
     out = [head if attrs else head + (" " if now else "") + row["text"]]
@@ -1032,14 +1049,14 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
         c = cited.get(x, 0)
         mark = f"引用过 {c} 次" if c else ""
         if kind == "stmt":
-            return f"- {L.stmts[x]['h']}（{_stmt_day(L, x)}）{L.stmts[x]['text']}" + (f"（{mark}）" if mark else "")
+            return f"- {L.stmts[x]['h']}（{_stmt_day(L, x)}{_mark(L, L.stmts[x]['entry'])}）{L.stmts[x]['text']}" + (f"（{mark}）" if mark else "")
         nd = L.nodes[x]
         has = ("含 " + "、".join(live[i] for i in sorted(cover[x])) if n >= 2 else "") if x in cover else "意思相近"
         extra = "；".join(filter(None, [has, mark]))
         if nd["kind"] == "entry":
-            return f"- {L.where(x)} {nd['name']}（{_day(nd['date'])}，{len(nd.get('items', []))} 条陈述" + \
+            return f"- {L.where(x)} {nd['name']}（{_day(nd['date'])}{_mark(L, x)}，{len(nd.get('items', []))} 条陈述" + \
                    (f"；{extra}" if extra else "") + f"）：{nd['topic']}"
-        return f"- {x} {nd['name']}（{_size(L, x) if nd['kind'] == 'line' else '骨架'}" + (f"；{extra}" if extra else "") + "）"
+        return f"- {x} {nd['name']}（{_size(L, x) if nd['kind'] == 'line' else '骨架'}{_mark(L, x)}" + (f"；{extra}" if extra else "") + "）"
     take = _fit(rem, line)
     shown, rest = rem[:take], rem[take:]
     again = []

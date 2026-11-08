@@ -117,7 +117,7 @@ TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面
         ("引用回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
         ("runbook 更新稿", "模型", 86400, _runbook),  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）；照看 11-05 起自己一个服务（memory-harness-tend）
         ("self", "模型", 3600, _self)]              # 每小时看一眼有没有到点的便签，到了就叫醒（2026-11-08）；该不该叫由 self.pick 定
-if importlib.util.find_spec(f"{__name__}.self") is None:      # 公开包里冻结着、还没有 self（release/frozen.txt），缺了照常跑
+if importlib.util.find_spec(f"{__name__}.self") is None:      # 公开包缺了 self（只装了 mh 的一部分）也照常跑
     TIDY = [t for t in TIDY if t[0] != "self"]
 
 
@@ -137,9 +137,14 @@ _picked = {"at": 0.0, "order": None}
 
 def pick(names, read=None):
     """预览先用哪个模型（2026-10-20：Sol、Sonnet 按额度并用）：周额度用得少的排前面；5 小时额度用到 BUSY_5H% 以上、
-    或已经用不了的排后面；读不到额度的排最后。同样的按原来的先后。read：取额度（测试替换），默认 quota.read。"""
-    from . import quota
-    qs = {q["name"]: q for q in (read or quota.read)(sorted({PROVIDER[n] for n in names if n in PROVIDER}))}
+    或已经用不了的排后面；读不到额度的排最后。同样的按原来的先后。read：取额度（测试替换），默认 quota.read；
+    没有 quota（公开包不带，2026-11-08：读额度要借宿主的登录令牌调未公开的接口，不公开）就照原来的先后。"""
+    if read is None:
+        if importlib.util.find_spec(f"{__name__}.quota") is None:
+            return list(names)
+        from . import quota
+        read = quota.read
+    qs = {q["name"]: q for q in read(sorted({PROVIDER[n] for n in names if n in PROVIDER}))}
 
     def key(item):
         i, n = item
