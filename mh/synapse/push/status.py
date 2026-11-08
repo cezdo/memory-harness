@@ -141,7 +141,7 @@ def compile(ws, home=None):
     wts = _worktrees(repo)
     if wts:
         parts.append("- 别处的 worktree：" + "；".join(wts))
-    log = _run(["git", "log", f"-{COMMITS}", "--format=%h %cd %s", "--date=format:%m-%d %H:%M"], repo).splitlines()
+    log = _run(["git", "log", f"-{COMMITS}", "--format=%h %cd %s", "--date=format-local:%m-%d %H:%M"], repo).splitlines()
     if log:
         parts += ["", "### 最近的提交", *[f"- {_cut(x)}" for x in log]]
     dirty = [x.split(None, 1)[1].split(" -> ")[-1] for x in _run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], repo).splitlines() if x.strip()]
@@ -163,6 +163,20 @@ def compile(ws, home=None):
         rb = runbook.section(ws, repo, cfg["runbook"], home)
         if rb:
             parts += ["", f"### runbook（`{cfg['runbook']}`）", *rb]
+    try:
+        from ...rhythm import explore      # 方向探索每周一轮的结果（2026-11-08）：写出来没人知道就又是一处静默
+        ex = explore.section(repo)
+    except Exception:
+        ex = []
+    if ex:
+        parts += ["", "### 方向探索（每周一轮，无人在场；结果页给你看，补丁等在场时落地）", *ex]
+    try:
+        from ...rhythm import self as own   # self 工作区（2026-11-08）：到点的便签、醒来留下的东西
+        sf = own.section(repo)
+    except Exception:
+        sf = []
+    if sf:
+        parts += ["", "### self（我自己的工作区）", *sf]
     near = _recent(ws)                 # 放最后：送手记时 recent.drop_self 只切这一节
     if near:
         parts += ["", near]

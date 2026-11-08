@@ -14,7 +14,9 @@
   先到先得：新会话在它可以预览的那一刻到，再观察的会话在点名范围的那一刻到（同一刻到的从新往旧）。
 - 观察：预览分出的每一组一次调用，给这几轮的全文和预览写的计划。精读 = dsh web minimal 原样带 bash（只放行字数命令），high；
   粗读 = 去掉全部工具，low。路径、文件名、链接打码后给观察者，输出后换回（guard.py）。不读的不调用。
-- 不观察：用户用 /no-observe 关掉的会话（最后一次开关说了算），以及开关那一轮本身（switch/）。开关影响 observe 全流程
+- 不观察：用户用 /no-observe 关掉的会话（最后一次开关说了算），以及开关那一轮本身（switch/）。另有工作区级的默认：
+  实例配置 [observe].skip_workspaces 里的工作区（2026-11-07），那里的会话不预览、不读，原文照收，已经产出的 E 不动；
+  会话里显式的 /do-observe 压过它（临时要看时用）。开关影响 observe 全流程
   （2026-10-17）：关掉的会话不预览、预览过的也不读；已经产出的 E 不再交给上一层（withheld）。开关只在 E 跨过
   observe → form 的边界时留记录（mark_switches）：已被 form 读过的，关掉记 withdraw、恢复记 restore（程序 act：哪些 E、
   因为哪一轮开关、理由）；没被 form 读过的两头都不记。E 本身不删。
@@ -176,6 +178,18 @@ def _stuck(h, op_ids):
     return out
 
 
+def unwatched(conn, states=None):
+    """工作区默认不观察的会话：{(来源, 会话)}（实例配置 [observe].skip_workspaces，2026-11-07）。和 /no-observe 一样作用于
+    observe 的全流程：不预览、不读；已经产出的 E 不动（规则只管以后）。会话里显式的 /do-observe 压过它（临时要看时用）。
+    按会话认工作区（store.session_workspace），按目录的更正、按会话的更正都算。states：调用方已经算过的 switch.states。"""
+    skip = set(instance.SKIP_WORKSPACES)
+    if not skip:
+        return set()
+    on = {k for k, v in (switch.states(conn) if states is None else states).items() if v == "on"}
+    return {(src, ses) for src, ses, cwd in conn.execute("SELECT source, session, cwd FROM session_detail")
+            if st.session_workspace(src, ses, cwd) in skip} - on
+
+
 def ready(conn, op_id, session=None, now=None, reobserve=None):
     """该预览的窗口：[(这几轮, 前面已经处理过几轮)]。会话里第一串连续的、没处理过、已经结束的轮次；会话告一段落，
     才预览，整段一次（轮数不设上限）。只看人直接参与的会话，没写出文字的轮次不看，关掉的会话和开关那一轮不看；
@@ -185,6 +199,7 @@ def ready(conn, op_id, session=None, now=None, reobserve=None):
     h = history(conn)
     done = (h.previewed if reobserve is not None else h.done) | _stuck(h, op_id)
     off = switch.states(conn)
+    skip = unwatched(conn, off)
     now = now or datetime.now(timezone.utc)
     sql, args = TURNS + " WHERE s.kind='user'", []
     if session:
@@ -195,7 +210,7 @@ def ready(conn, op_id, session=None, now=None, reobserve=None):
         by[(row["source"], row["session"])].append(row)
     out = []
     for key, rows in by.items():
-        if off.get(key) == "off":
+        if off.get(key) == "off" or key in skip:
             continue
         if reobserve is not None and not (key in reobserve and any(r["text"] in h.legacy and r["text"] not in done for r in rows)):
             continue
@@ -374,7 +389,8 @@ def to_read(conn, session=None):
     """该观察的几组轮次：[(预览 act, 这一组, 步骤)]。成功或被过滤过的不再挑；当前 Operator 下失败满次数的进待重做清单；
     预览之后会话被关掉了观察的，不读。状态由 group_parts 推。"""
     h = history(conn)
-    off = {k for k, v in switch.states(conn).items() if v == "off"}
+    states = switch.states(conn)
+    off = {k for k, v in states.items() if v == "off"} | unwatched(conn, states)
     ops = {step: operator(conn, step)[0] for step in ("deep", "rough")}
     first_of = {}
     out = []
@@ -596,7 +612,8 @@ def correct(conn, models=None, log=sys.stderr, cause="request", limit=10):
     改正的 E 写取代，不成立的记在 act 的 meta.invalid；form 读过的旧 E 给 form 写修订提示。返回 (处理了几组, 环境错误几次)。"""
     obs = dict(models) if models else {}
     h = history(conn)
-    off = {k for k, v in switch.states(conn).items() if v == "off"}
+    states = switch.states(conn)
+    off = {k for k, v in states.items() if v == "off"} | unwatched(conn, states)
     done = env = 0
     named = [{"id": rid, "inputs": json.loads(inputs), "reason": reason} for rid, inputs, reason in conn.execute(
         "SELECT o.id, o.inputs, d.reason FROM request_detail d JOIN occurrence o ON o.id=d.occurrence "
@@ -967,6 +984,7 @@ STATES = {
     "filtered": "被服务商的内容过滤拦下，不要了",
     "failed": "失败满次数，进待重做清单",
     "off": "会话关着观察（/no-observe）",
+    "unwatched": "工作区默认不观察（[observe].skip_workspaces）",
     "switch": "开关那一轮，永远不观察",
     "no_answer": "“我”没写出最终回答，不观察",
     "to_read": "预览定了精读或粗读，还没读完",
@@ -978,12 +996,14 @@ TO_OBSERVE = ("to_read", "not_previewed")   # 待观测：以后还会产出 E
 def progress(conn, session=None, now=None):
     """观察进度：人直接参与的会话里每个已经结束的轮次，observe 走到了哪一步。
     [{turn, source, session, ordinal, started, state}]，按开始时间排；state 见 STATES，在 TO_OBSERVE 里的是待观测的（以后还会产出 E，
+    unwatched（工作区默认不观察）不算待观测、不挡上一层；读过的不改，历史照旧，
     form 取最早的开始时间做门槛，只算 idle（会话告一段落）的：还在进行的会话以后才到、排在已结束的后面，不挡），其余的以后不会产出、不挡上一层。还没结束的轮次不列，会话是否告一段落由上一层自己看。
     同一份原文出现在几处（fork、迁移副本）只观察一次，各处的 state 相同。session：会话 ID 前缀。"""
     h = history(conn)
     ops = {step: operator(conn, step, register_new=False)[0] for step in CURRENT}      # 只读：不登记
     stuck = _stuck(h, {o for o in pool_ops(conn, register_new=False).values() if o is not None})
     states = switch.states(conn)
+    skip = unwatched(conn, states)
     # 预览定下的分组 → 每份原文的决定（按原文，fork 的副本跟着走）
     turn_text = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
     by_text = {}
@@ -1027,8 +1047,12 @@ def progress(conn, session=None, now=None):
             d = "off"
         elif r["text"] in by_text:
             d = by_text[r["text"]]
+            if d == "to_read" and key in skip:             # 预览过、还没读的，工作区默认不观察后不再读
+                d = "unwatched"
         elif r["text"] in legacy:
             d = legacy[r["text"]]                          # 旧版本逐轮观察过
+        elif key in skip:
+            d = "unwatched"
         elif r["text"] in stuck:
             d = "failed"
         else:

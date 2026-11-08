@@ -39,6 +39,7 @@ MANAGING = {w: _dir(d) for w, d in _ws.get("managing", {}).items()}            #
 SESSIONS = {(s["source"], s["session"]): s["workspace"] for s in _ws.get("sessions", ())}   # 按会话更正工作区
 
 QUIET = frozenset(w.lower() for w in _D.get("synapse", {}).get("quiet", ()))   # Synapse 不当“查不到的词”送的词（手动名单）
+SKIP_WORKSPACES = tuple(dict.fromkeys(w for w in _D.get("observe", {}).get("skip_workspaces", ()) if w))   # 默认不观察的工作区：不预览、不读，原文照收（observe，2026-11-07）
 
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # mh 专用的 dsh 实例（精读用；不要指到 dsh 升级的测试环境，它会被 teardown）

@@ -9,9 +9,11 @@ import json
 from pathlib import Path
 
 from .turn import Session, Turn
+from ...store import HOME
 from .. import participants
 
 ROOT = Path.home() / ".claude/projects"
+SELF_ROOT = HOME / "claude-self-home/projects"   # self 工作区的会话（2026-11-08，design/rhythm/self）：独立配置目录，只装 mh 的钩子和 MCP
 
 # Zeron 给会话起标题时另起的一次 Claude Code 调用（2026-11-07）：cwd 是 /tmp/.tmpXXXX，唯一一轮是起标题的提示词，
 # 用户第一句话作为材料嵌在里面。不是对话，记成 kind = title（采集只收 user），免得那句话被当成另一段会话再记一次。
@@ -20,6 +22,7 @@ _TITLE_PROMPT = "You generate session titles."
 
 def files():
     yield from sorted(ROOT.glob("*/*.jsonl"))
+    yield from sorted(SELF_ROOT.glob("*/*.jsonl"))
 
 
 def _text(o):

@@ -75,9 +75,9 @@ def active(conn, since):
 def dirty_sources(conn, repo, files, ws, days=DAYS):
     """没提交的改动是哪段会话碰的（2026-10-26：别的项目的目录开的会话改了 runbook 没提交，开工时没人认领）。每个文件归给改动时刻
     （mtime）之前最后碰过它的会话（工具调用里出现过它或它所在的目录，不分读写）；按会话归组 → 一行一行的说明。"""
-    from ...engram.observe.written_files import touches, _t as iso
+    from ...engram.observe.written_files import touch_times, _t as iso
     since = iso((datetime.now().timestamp() - days * 86400) * 1000)
-    seen = [(x, touches(x["source"], x["file"], x["cwd"])) for x in active(conn, since)]
+    seen = [(x, touch_times(x["source"], x["file"], x["cwd"])) for x in active(conn, since)]
     by, lost = {}, []
     for f in files:
         p = repo / f.rstrip("/")
@@ -89,7 +89,7 @@ def dirty_sources(conn, repo, files, ws, days=DAYS):
         for near in (lambda q: q == str(p) or q.startswith(str(p) + "/"),                 # 碰过这个文件（或这个新目录里的）
                      lambda q: str(p).startswith(q.rstrip("/") + "/") and q.rstrip("/") != str(repo)):   # 只碰过所在的目录
             for x, t in seen:
-                hit = [ts for q, ts in t.items() if ts <= at and near(q)]
+                hit = [x for q, ts in t.items() if near(q) for x in ts if x <= at]
                 if hit and (best is None or max(hit) > best[1]):
                     best = (x, max(hit))
             if best:
@@ -104,7 +104,7 @@ def dirty_sources(conn, repo, files, ws, days=DAYS):
     for x, ts, fs in sorted(by.values(), key=lambda v: v[1], reverse=True):
         where = workspace(x["cwd"])
         host = HOST[x["source"]] + (f"（在 {where} 开的）" if where != ws else "")
-        title = x["title"] if (x["title"] or "?")[:1] != "?" else x["session"][:8]
+        title = x["title"] if (x["title"] or "?")[:1] != "?" else short(x["session"])
         when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
         out.append(f"- {'、'.join(fs)}：{host}「{title}」（{handle(conn, x)}）{when:%m-%d %H:%M} 最后{TOUCHED}")
     if lost:
@@ -124,13 +124,18 @@ def dedupe(items):
     return out
 
 
+def short(session):
+    """会话号的短写：前 8 个字；dsh 的会话号都以 session- 开头，去掉再截（2026-11-08 方向探索第 3 轮：原来截出来全是 session-）。"""
+    return session.removeprefix("session-")[:8]
+
+
 def handle(conn, x):
     """已经形成的给话题句柄（L:T，relive 读得到）；还没形成的给宿主的会话号。"""
     got = []
     for (e,) in conn.execute("SELECT id FROM session_entry WHERE source=? AND session=? ORDER BY id", (x["source"], x["session"])):
         line = conn.execute("SELECT line FROM attachment WHERE entry=? ORDER BY id DESC LIMIT 1", (e,)).fetchone()
         got.append(f"L{line[0]}:T{e}" if line else f"L?:T{e}")
-    return "、".join(got) if got else f"{x['source']}:{x['session'][:8]}，还没整理"
+    return "、".join(got) if got else f"{x['source']}:{short(x['session'])}，还没整理"
 
 
 def line(x, handle, last_commit=None):

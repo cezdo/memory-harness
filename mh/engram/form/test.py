@@ -1056,12 +1056,25 @@ class FormTest(unittest.TestCase):
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
             **({"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when} if when else {})})
         git("init", "-q")
-        for msg, when in (("先", "2026-10-17T08:10:00Z"), ("后", "2026-10-17T08:20:00Z")):
+        for msg, when in (("先", "2026-10-17T08:10:00Z"), ("后", "2026-10-17T08:20:00Z"), ("别", "2026-10-17T08:40:00Z")):
             git("commit", "-q", "--allow-empty", "-m", msg, when=when)
-        log.write_text(json.dumps({"timestamp": "2026-10-17T08:05:00Z", "message": {"content": [
-            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git commit -m x"}}]}}))
+        log.write_text("\n".join(json.dumps({"timestamp": t, "message": {"content": [
+            {"type": "tool_use", "id": t, "name": "Bash", "input": {"command": "git commit -m x"}}]}})
+            for t in ("2026-10-17T08:09:58Z", "2026-10-17T08:19:59Z")))
         got = written.written("claude", str(log), str(repo), ["2026-10-17T08:00:00Z"])
-        self.assertEqual([x.split("「")[1][0] for x in got[0]], ["先", "后"])   # 同一轮几次提交，早的在前
+        self.assertEqual([x.split("「")[1][0] for x in got[0]], ["先", "后"])   # 同一轮几次提交，早的在前；08:40 是并行会话的，不算（2026-11-07）
+        got = written.written("claude", str(log), str(repo / ".claude/worktrees/gone"), ["2026-10-17T08:00:00Z"])
+        self.assertEqual([x.split("「")[1][0] for x in got[0]], ["先", "后"])   # worktree 删了：到主仓库找（2026-11-07）
+        other = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True).stdout.strip()
+        def said(text, command="git log --oneline"):
+            log.write_text("\n".join(json.dumps(x) for x in [
+                {"timestamp": "2026-10-17T08:30:00Z", "message": {"content": [
+                    {"type": "tool_use", "id": "g", "name": "Bash", "input": {"command": command}}]}},
+                {"message": {"content": [{"type": "tool_result", "tool_use_id": "g", "content": text}]}}]))
+            return [x.split("「")[1][0] for x in written.written("claude", str(log), str(repo), ["2026-10-17T08:00:00Z"]).get(0, [])]
+        self.assertEqual(said(f"{other} 别\nabc1234 后"), [])                    # git log 列出的别人的提交不算（2026-11-08）
+        self.assertEqual(said(f"[main {other}] 别\n 1 file changed"), ["别"])    # git commit 自己打的那行算
+        self.assertEqual(said(f"OK\n{other} 别", "make test && git commit -q -m 别 && git log --oneline -1"), ["别"])  # 同一次调用：先测后提交，超过 120 秒也算
 
 
 class FileSkeletonTest(unittest.TestCase):
@@ -1201,6 +1214,18 @@ class GlossaryIndexTest(unittest.TestCase):
             before = path.read_text()
             glossary.write_index(path)
             self.assertEqual(path.read_text(), before)
+
+    def test_fuller(self):
+        """命名演进的影子（D5，2026-11-08）：查词里的非全名对到全名；全名已在、单个字、本身是另一条全名的不算。"""
+        from . import glossary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "glossary.md"
+            path.write_text("**手记 / 开场映像 / 常态记忆**\n**yorimichi / pace**\n**会话入口、话题线 / 线**\n**evoke / search；回想 / recall**\n**回想**\n")
+            self.assertEqual(glossary.fuller(["开场映像", "pace", "图例", "线", "recall"], path),
+                             [["开场映像", "手记"], ["pace", "yorimichi"], ["recall", "回想"]])
+            self.assertEqual(glossary.fuller(["search", "evoke"], path), [])
+            self.assertEqual(glossary.fuller(["回想"], path), [])
+            self.assertEqual(glossary.home(path), "")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from ...engram.store.instance import USER_ALIASES, USER_NAME
 LONG = 1500             # 一项超过几个字算经过写长了（起步值：10-29 清理时移出的几项是 3000–8000 字，留着的多在 1000 以内）
 WAIT_DAYS = 3           # “等用户……”挂了几天没动算久
 LOG_CUT = 20000         # 给模型的提交说明最多几个字
-PROMPT = Path(__file__).parent / "prompts" / "runbook-v0.1.md"
+PROMPT = Path(__file__).parent / "prompts" / "runbook-v0.2.md"
 ITEM = re.compile(r"^(\s*)- \[([ x])\] (?:~~)?([A-Z]\d+[a-z]?′?)?")
 ID = re.compile(r"(?<![A-Za-z0-9])([A-Z]\d+[a-z]?′?)(?![A-Za-z0-9])")
 LINK = re.compile(r"\]\(([^)\s#]*)(?:#([^)\s]+))?\)")
@@ -179,16 +179,29 @@ def section(ws, repo, rel, home=None, now=None):
     return lines
 
 
-def material(repo, rel):
-    """给模型的材料：runbook 全文、它上次提交之后的提交（说明和改了哪些文件）、程序认出的落后之处。"""
-    at, commits = since(repo, rel)
+def window(ws, repo, rel, home=None):
+    """写稿看哪些提交 → [“短哈希 说明”]，最新的在前：上一份稿写下时的 HEAD 之后的；还没写过稿（或那次 HEAD 已经不在库里）
+    才退回 runbook 上次提交之后的。原来只看后者，runbook 一天改十几次时窗口总被清空：11-05 最后一次改在 22:39，
+    每天的任务 22:40 醒来看到没有提交就跳过，v0.40 上线（F5 做完）那次提交写稿的模型一直没看到（方向探索第 0 轮，2026-11-06）。"""
+    try:
+        m = re.search(r"head=(\w+)", _draft_path(ws, home).read_text().splitlines()[0])
+    except (OSError, IndexError):
+        m = None
+    if m and _run(["git", "rev-parse", "--verify", "-q", m.group(1) + "^{commit}"], repo):
+        return _run(["git", "log", f"{m.group(1)}..HEAD", "--format=%h %s"], repo).splitlines()
+    return since(repo, rel)[1]
+
+
+def material(ws, repo, rel, home=None):
+    """给模型的材料：runbook 全文、上一份稿以来的提交（说明和改了哪些文件，见 window）、程序认出的落后之处。"""
+    commits = window(ws, repo, rel, home)
     log = ""
     if commits:
         first = commits[-1].split()[0]
-        log = _run(["git", "log", f"{first}~1..HEAD", "--format=### %h %cd%n%B", "--date=format:%m-%d %H:%M", "--stat=100"], repo)
+        log = _run(["git", "log", f"{first}~1..HEAD", "--format=### %h %cd%n%B", "--date=format-local:%m-%d %H:%M", "--stat=100"], repo)
         if len(log) > LOG_CUT:
             log = log[:LOG_CUT] + "\n……（后面截掉了）"
-    return {"runbook": (repo / rel).read_text(), "log": log or "（runbook 上次提交之后没有新提交）",
+    return {"runbook": (repo / rel).read_text(), "log": log or "（上一份稿之后没有新提交）",
             "behind": "\n".join(behind(repo, rel)) or "（没有）"}
 
 
@@ -203,14 +216,18 @@ def draft(ws, repo, rel, model, home=None):
             return False
     except (OSError, IndexError):
         pass
-    m = material(repo, rel)
-    if not since(repo, rel)[1] and m["behind"] == "（没有）":
+    m = material(ws, repo, rel, home)
+    if not window(ws, repo, rel, home) and m["behind"] == "（没有）":
         return False
     text = express.prompt(PROMPT.read_text(), USER_NAME)
     for k, v in m.items():
         text = text.replace("{{" + k + "}}", v)
     out, meta = invoke.call(model, text)
+    now = datetime.now(timezone.utc)
+    body = f"<!-- 编于 {now.isoformat(timespec='seconds')} runbook={blob} head={head} model={meta.get('model')} -->\n{out.strip()}\n"
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(f"<!-- 编于 {datetime.now(timezone.utc).isoformat(timespec='seconds')} runbook={blob} head={head} "
-                 f"model={meta.get('model')} -->\n{out.strip()}\n")
+    f.write_text(body)
+    kept = f.parent / "runbook-drafts" / f"{ws}-{now:%Y%m%dT%H%M}.md"     # 每份留底：G8 要攒几次稿再看，覆盖就攒不起来（2026-11-07）
+    kept.parent.mkdir(exist_ok=True)
+    kept.write_text(body)
     return True

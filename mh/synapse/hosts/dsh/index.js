@@ -83,6 +83,19 @@ function message(event, form, text) {
 const textOf = (m) => (m?.content || []).filter((b) => b?.type === "text").map((b) => b.text).join("\n").trim();
 const isSubagent = (h) => h?.origin === "subagent" || (h?.delegationDepth ?? 0) > 0;
 
+// 恢复的会话还没开始过一轮、手记也没挂在待发里：dsh web 重启会把没说过话的会话里待发的手记撤掉（inbox 的 canceled），
+// 恢复时原来按 resume 不推，这段会话就整段没有手记（2026-11-08 方向探索第 3 轮：11-01 起 7 段、59 轮）。
+export function unseen(session) {
+  let pending = false;
+  for (const e of session?.ownEvents?.() ?? []) {
+    if (e.type === "turn/start") return false;
+    if (e.type !== "agent/inbox/spliced" || e.data?.target !== "next-step") continue;
+    if ((e.data.inserted || []).some((m) => m?.source?.kind === "mh-synapse")) pending = true;
+    else if (e.data.removedCount) pending = false;
+  }
+  return !pending;
+}
+
 // 拉取服务：一个常驻子进程，退出了下次调用再拉起
 function mcpClient(cfg, logger) {
   let proc = null, buf = "", nextId = 1;
@@ -147,7 +160,7 @@ export async function apply(ctx, config) {
   ctx.on("agent/created", async ({ agent, source }) => {
     try {
       const h = agent.session.header;
-      if ((!cfg.subagents && isSubagent(h)) || (!cfg.resume && source === "resume")) return;
+      if ((!cfg.subagents && isSubagent(h)) || (!cfg.resume && source === "resume" && !unseen(agent.session))) return;
       const r = await runPy(cfg, ["-m", "mh", "inject"], {
         session_id: h.id, cwd: h.cwd ?? "", source, host: "dsh", hook_event_name: "SessionStart", transcript_path: "",
       }, cfg.injectTimeoutMs);

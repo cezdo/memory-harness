@@ -9,9 +9,11 @@
 - inputs（看了什么）是 JSON：{"<种类>": [编号…]}，种类是 Occurrence 的角色（turn、act、use……）或 Claim 的种类（event、judgment、
   cognition、form_record）。
 """
+import functools
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -294,10 +296,55 @@ def iso(text, minus_seconds=None):
 from .instance import ENGRAM_DIRS as WORKSPACE_DIRS, MANAGING, SESSIONS as SESSION_WORKSPACE
 
 
+def local_tz():
+    """显示用的本地时区，每次现读系统时区（time.tzset）。存、算都用绝对时间（UTC），只在显示的一端换算（用户 2026-11-07：
+    后续可能还会变，改来改去麻烦）；常驻进程不 tzset 就一直停在启动时的时区（11-07 改了系统时区后，整理、照看、看板还按旧时区）。"""
+    time.tzset()
+    return datetime.now().astimezone().tzinfo
+
+
+def day_start(now=None):
+    """mh 中的一天的开头：UTC 0 点（用户 2026-11-07 改，原来是按旧的本地时区 8:00；按绝对时间，换到哪个时区看都是同一刻）。"""
+    now = now or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+_ZERON = re.compile(r"^(.*/\.zeron/worktrees/([^/]+)/[^/]+)(/.*)?$")
+
+
+def worktree_main(root):
+    """git worktree 的根 → 主仓库的路径：根下的 .git 是文件，写着 gitdir: <主仓库>/.git/worktrees/<名>。不是 worktree、读不出返回 None。"""
+    try:
+        got = Path(root, ".git").read_text().strip()
+    except OSError:                     # 不存在，或 .git 是目录（普通仓库）
+        return None
+    if got.startswith("gitdir:") and "/.git/worktrees/" in got:
+        return got[len("gitdir:"):].strip().split("/.git/worktrees/")[0]
+    return None
+
+
+@functools.lru_cache(maxsize=256)
+def _zeron_main(root, project):
+    """Zeron worktree 的根 → 主仓库的路径；worktree 已经删了或读不出时，按 <家目录>/<项目> 猜（工作区名只用到最后一节）。"""
+    return worktree_main(root) or str(Path.home() / project)
+
+
+def unworktree(path):
+    """worktree 里的路径 → 所在仓库里的同一个路径：Claude Code 的 <仓库>/.claude/worktrees/<名>/…，
+    Zeron 的 ~/.zeron/worktrees/<项目>/<名>/…（2026-11-07 方向探索第 2 轮：原来只认前一种，Zeron 的会话被算成工作区 <名>，
+    手记拿不到近况），仓库里的 <仓库>/tmp/worktrees/<任务>/…（用户 11-07：会话留在工作区、分支放 tmp；原来只有 Synapse 的
+    push.workspace 认，Engram 按 cwd 分工作区时会算成 <任务>）。按路径认，worktree 删了也一样。不是 worktree 的原样返回。"""
+    p = (path or "").rstrip("/")
+    m = _ZERON.match(p)
+    if m:
+        return _zeron_main(m.group(1), m.group(2)) + (m.group(3) or "")
+    return re.sub(r"/(?:\.claude|tmp)/worktrees/[^/]+(?=/|$)", "", p)
+
+
 def workspace(cwd):
-    """工作区名：先按 WORKSPACE_DIRS（最长前缀），否则取会话 cwd 的最后一节；worktree（…/.claude/worktrees/<名>）算回它所在的仓库。
-    没有 cwd 返回 ""。"""
-    c = re.sub(r"/\.claude/worktrees/[^/]+/?$", "", (cwd or "").rstrip("/"))
+    """工作区名：先按 WORKSPACE_DIRS（最长前缀），否则取会话 cwd 的最后一节；worktree（Claude Code、Zeron，见 unworktree）
+    算回它所在的仓库。没有 cwd 返回 ""。"""
+    c = unworktree(cwd)
     for d in sorted(WORKSPACE_DIRS, key=len, reverse=True):
         if c == d or c.startswith(d + "/"):
             return WORKSPACE_DIRS[d]

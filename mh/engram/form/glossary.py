@@ -5,13 +5,16 @@
 - entries()：[{"full": 全名, "names": [这一个东西的全部叫法], "head": 词头}]
 - used(text)：这段文字里用到了哪些词条（叫法逐字出现；ASCII 的叫法前后不能是字母数字；单个汉字的叫法不算）
 - aliases(word)：这个词所在那一个东西的全部叫法（全名在前）；另补本实例已确认的个人称呼候选；通用角色词不并入个人组
+- fuller(terms)：查词里哪些是某个东西的非全名（旧名、别名、简写），全名是什么（命名演进的影子，runbook D5）
+- home()：这份词典属于哪个工作区
 """
 import re
 from pathlib import Path
-from ..store import instance
+from ..store import instance, workspace
 from ..store.instance import resource
 
-PATH = resource("glossary", Path(__file__).resolve().parents[3] / "design/global/词典.md", "glossary.md")
+_REPO = Path(__file__).resolve().parents[3]
+PATH = resource("glossary", _REPO / "design/global/词典.md", "glossary.md")
 _cache = {}
 
 
@@ -76,6 +79,29 @@ def aliases(word, path=PATH):
         if w in {n.lower() for n in e["names"]}:
             return list(dict.fromkeys([*e["names"], *private]))
     return private
+
+
+def home(path=PATH):
+    """这份词典属于哪个工作区：开发目录里的是这个仓库的；实例另配的说不准，返回 ""（D6 按工作区读词典时再改）。"""
+    return workspace(str(_REPO)) if Path(path) == _REPO / "design/global/词典.md" else ""
+
+
+def fuller(terms, path=PATH):
+    """查词里用了某个东西的非全名（词头“/”后面的旧名、别名、简写）、全名又不在查词里的：[(查词, 全名)]。
+    整词比、不分大小写；单个字、本身是另一条全名的不算。命名演进的影子（runbook D5，2026-11-08）：evoke 记进足迹、不给人看，
+    攒一阵看拿旧名查的有多少、给全名帮不帮得上。"""
+    es = entries(path)
+    fulls = {e["full"].lower() for e in es}
+    have = {t.lower() for t in terms}
+    out = []
+    for t in terms:
+        k = t.lower()
+        if len(k) < 2 or k in fulls:
+            continue
+        e = next((e for e in es if k in {n.lower() for n in e["names"][1:]}), None)
+        if e and e["full"].lower() not in have:
+            out.append([t, e["full"]])
+    return out
 
 
 def text(record, path=PATH):

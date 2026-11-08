@@ -21,6 +21,9 @@ aliases = []                                     # 另外的称呼：识别与�
 # session = "<会话 id>"
 # workspace = "<工作区>"
 
+[observe]                                        # 观察（2026-11-07）：工作区级的默认
+# skip_workspaces = ["tmp"]                      # 这些工作区的会话默认不观察：不预览、不读，原文照收；已有 E 不动；会话里 /do-observe 可临时打开
+
 [synapse]
 quiet = []                                       # 不当“查不到的词”送的词（手动名单）
 
@@ -89,6 +92,7 @@ quiet = []                                       # 不当“查不到的词”�
 # raid = "md0"                                  # RAID 阵列（/proc/mdstat、/sys/block/<名>/md）
 # patrol = "/var/lib/nas-patrol/last.status"    # 每天巡检的结论（key=value，exit 0/1/2）；patrol_log 给 WARN/CRIT 行
 # proxy_api = "http://127.0.0.1:9090"           # mihomo / clash 的 external-controller：连接数、累计流量
+# proxy_probe = "~/probe/nodes.jsonl"           # 节点探针的 jsonl（ts/node/target/ok/ms）：每个节点一行，带 24 小时成功率；不写就只看连接数
 # [[show.units]]                                # 本机 mh 以外的服务：name、unit、scope（user / system）、group、note；
                                                 # 可选 log（路径里可写 {%Y-%m-%d}）和 err（正则），数近一小时出错行
 # [[show.entries]]                              # 入口：name、url、note

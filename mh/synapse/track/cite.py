@@ -150,9 +150,11 @@ def backfill(conn, judge=None, limit=200, now=None):
         from .judge import choose as judge
     done, redo = _todo(conn)
     now = now or datetime.now(timezone.utc)
-    rows = conn.execute("SELECT d.occurrence, d.session, o.started, d.source, d.ordinal, x.assistant FROM turn_detail d "
+    # 中途的叙述（commentary：codex 的进度消息、Claude 工具调用之间的话）里写的〖〗也算（2026-11-08 方向探索第 3 轮：原来只查最后的回复）
+    rows = conn.execute("SELECT d.occurrence, d.session, o.started, d.source, d.ordinal, x.assistant, x.commentary FROM turn_detail d "
                         "JOIN turn_text x ON x.id=d.text JOIN occurrence o ON o.id=d.occurrence "
-                        "WHERE instr(x.assistant, '〖')>0 ORDER BY o.id").fetchall()
+                        "WHERE instr(x.assistant, '〖')>0 OR instr(x.commentary, '〖')>0 ORDER BY o.id").fetchall()
+    rows = [(r[0], r[1], r[2], r[3], r[4], "\n".join([*json.loads(r[6] or "[]"), r[5]])) for r in rows]
     rows = [(r[0], r[1], r[2], cut, r[5]) for r in rows if r[0] not in done and spans(r[5])
             for cut in [until(conn, r[3], r[1], r[4], r[2], now)] if cut][:limit]
     if not rows:

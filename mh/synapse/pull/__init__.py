@@ -1071,8 +1071,11 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
     query = {"words": list(words), **({"big": big} if big else {}), **({"skipped": skipped} if skipped else {}),
              **({"grain": g} if g != "S" else {}), **({"vector": "off"} if dense is None and vector.ENABLED else {})}
     evoked = [key(it) for it in shown]
+    from ...engram.form import glossary             # 用到才导入（form 包导入要几十毫秒）
+    naming = glossary.fuller(ts) if ws and ws == glossary.home() else []   # 命名演进的影子（D5，11-08）：只记、不给看
+    meta = {**({"evoked": evoked} if evoked else {}), **({"naming": naming} if naming else {})}
     text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note,
-                         meta={"evoked": evoked} if evoked else None)
+                         meta=meta or None)
     return text
 
 

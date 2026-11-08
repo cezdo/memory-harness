@@ -7,8 +7,8 @@
 写进（written）：
 
 来源：会话的原始记录（Claude Code 的 jsonl、dsh 的 session.v4.jsonl.zstd、codex 的 rollout jsonl），加上工作区的 git 提交。
-- Edit、Write、NotebookEdit、MultiEdit（dsh：write、edit）的 file_path；
-- git 提交：时间窗里全部分支的提交，按提交时间落到轮次；只留哈希在本会话工具输出里出现过的，或那一轮跑过 git commit 的
+- Edit、Write、NotebookEdit、MultiEdit（dsh：write、edit，包在 run_code 里的也算）的 file_path；
+- git 提交：时间窗里全部分支的提交，按提交时间落到轮次；只留哈希在本会话跑 git commit 的那次调用的输出里、或别的输出里有 commit 打出的“[分支 哈希]”那行的，或落在本会话某次 git commit 调用前后（COMMIT_LAG）的
   （并行的会话同一轮里也提交时可能混进来）。再用 git show 取这次提交的文件。工作区不是 git 仓库时只认写文件。
 Bash 里用 sed、heredoc、python 写文件的认不出来；没提交的这类写入会漏掉。codex：exec 里的 apply_patch 当写文件、exec_command 当 Bash（2026-10-26）。
 按工具调用的时间落到轮次上（轮次 i 从它的开始到下一轮的开始）。
@@ -28,8 +28,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
-_DSH = {"write": "Write", "edit": "Edit", "bash": "Bash"}
+_DSH = {"write": "Write", "edit": "Edit", "bash": "Bash", "read": "Read"}
 TAIL = timedelta(hours=6)          # 最后一轮没有下一轮的开始时间，提交的时间窗往后放这么久
+COMMIT_LAG = (5, 120)              # 哈希既不在本会话跑 git commit 的那次调用的输出里、别的输出里也没有 commit 打的“[分支 哈希]”那行时，
+                                   # 提交要落在本会话某次 git commit 调用的前 5 秒到后 120 秒里才算它的
+                                   # （2026-11-08 方向探索第 3 轮：原来哈希在任何输出里出现就算，git log 列出的别人的提交也被认走；
+                                   # 先跑测试再提交的调用可能超过 120 秒，靠同一次调用的输出接住）
+                                   # （2026-11-07 方向探索第 2 轮：原来按“那一轮跑过 git commit”认，最后一轮再放宽 6 小时，
+                                   # 并行会话的提交大批记到别人头上，手记的“最后提交”约五分之一是错的）
 HOME_DIR = str(Path.home())
 
 
@@ -50,6 +56,10 @@ def _t(x):
         d = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
         d = (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"
+
+
+def _at(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
 def _claude(path):
@@ -79,11 +89,18 @@ def _claude(path):
 
 
 def _dsh(path):
-    """dsh 的 tool-call：name 是小写的 write、edit、bash，参数是 JSON 字符串；结果不细分，整份记录当作输出查哈希。"""
+    """dsh 的 tool-call：name 是小写的 write、edit、bash、read，参数是 JSON 字符串；结果不细分，整份记录当作输出查哈希。
+    多数调用包在 run_code 里（JS 里再调 tools.edit 等），实际的子调用记在 tool/ptc-dispatch 事件里，参数已是对象
+    （2026-11-07 方向探索第 1 轮：10-20 以后 83 段 dsh 会话里 58 段的写文件只在这里，原来全漏）。"""
     from .sources import dsh
     uses, raw = {}, []
     for e in dsh._events(path):
         raw.append(json.dumps(e, ensure_ascii=False))
+        if e.get("type") == "tool/ptc-dispatch":
+            d = e.get("data") or {}
+            if d.get("name") in _DSH and isinstance(d.get("arguments"), dict):
+                uses[d.get("subCallId") or f"ptc{len(uses)}"] = (_t(e.get("time")), _DSH[d["name"]], d["arguments"])
+            continue
         if e.get("type") != "assistant/message":
             continue
         for b in ((e.get("data") or {}).get("message") or {}).get("content") or []:
@@ -215,19 +232,25 @@ def touches(source, path, cwd=None):
     """一段会话的工具调用里出现过的绝对路径（~ 展开）→ 最后一次出现的时刻（UTC ISO），不分读写：文件参数，加 Bash 命令里
     路径样的词（重定向、heredoc、变量赋值里的也算）。给 Synapse 认“在别的工作区开、动过这个工作区”的会话、没提交的改动是谁
     碰的（2026-10-26，别的项目的会话改本仓，Bash heredoc 写文件 written() 认不出）。认不出的来源、找不到的原始记录返回空。"""
+    return {p: max(ts) for p, ts in touch_times(source, path, cwd).items()}
+
+
+def touch_times(source, path, cwd=None):
+    """同 touches()，但每个路径给出现过的全部时刻（排好序）。没提交的改动认是谁碰的，要的是改动时刻之前的那次：
+    先改、后 git diff 看的会话，只留最后一次会被当成改动之后的、整个漏掉（2026-11-07 方向探索第 1 轮）。"""
     reader = READERS.get(source)
     if not reader or not path or not Path(path).exists():
         return {}
     uses, _ = reader(path)
-    out = {}
+    out = defaultdict(set)
     for ts, name, inp in uses.values():
         for v in (inp.get("file_path"), inp.get("path"), inp.get("command") if name == "Bash" else None):
             if isinstance(v, str):
                 got = [m.replace("~", HOME_DIR, 1) if m.startswith("~") else m for m in ABS.findall(v)]
                 got += _rel(v, cwd)
                 for m in got:
-                    out[m] = max(out.get(m, ts), ts)
-    return out
+                    out[m].add(ts)
+    return {p: sorted(ts) for p, ts in out.items()}
 
 
 def touched(source, path, cwd=None):
@@ -273,12 +296,18 @@ def written(source, path, cwd, starts):
         line = f"写了 {rel(inp['file_path'], cwd)}"
         if line not in out[turn]:
             out[turn].append(line)
-    committing = {bisect.bisect_right(starts, ts) - 1 for ts, name, inp in uses.values()
-                  if name == "Bash" and "git commit" in (inp.get("command") or "")}
+    committing = {k: _at(ts) for k, (ts, name, inp) in uses.items() if name == "Bash" and "git commit" in (inp.get("command") or "")}
+    calls = list(committing.values())
     said = "\n".join(results.values())
+    by_commit = "\n".join(results.get(k) or "" for k in committing)   # 跑了 git commit 的那次调用自己的输出（同一条命令里 git log 打出的哈希也算）
     until = _t((datetime.fromisoformat(starts[-1].replace("Z", "+00:00")) + TAIL).timestamp() * 1000)
-    for h, when, subject in commits(cwd, starts[0], until):
+    repo = cwd
+    if cwd and not Path(cwd).is_dir():         # worktree 删了：到主仓库找，worktree 和主仓库共用提交（2026-11-07，Zeron 的 worktree 用完就删）
+        from ..store import unworktree
+        repo = unworktree(cwd)
+    for h, when, subject in commits(repo, starts[0], until):
         turn = bisect.bisect_right(starts, when) - 1
-        if turn >= 0 and (h[:7] in said or turn in committing):
-            out[turn].append(f"提交 {h[:8]}「{subject[:80]}」：" + "、".join(rel(f, cwd) for f in commit_files(cwd, h)))
+        at = _at(when)
+        if turn >= 0 and (h[:7] in by_commit or re.search(r"\[[^\]\n]*\b" + h[:7] + r"[0-9a-f]*\]", said) or any(-COMMIT_LAG[0] <= (at - c).total_seconds() <= COMMIT_LAG[1] for c in calls)):
+            out[turn].append(f"提交 {h[:8]}「{subject[:80]}」：" + "、".join(rel(f, cwd) for f in commit_files(repo, h)))
     return dict(out)

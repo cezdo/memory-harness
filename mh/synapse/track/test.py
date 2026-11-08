@@ -50,8 +50,8 @@ class TreesTest(pt.PullTest):             # 借 pull 测试造的数据（会话
 
 
 class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数据照 pull 的测试造，Jev 换成假的
-    def _reply(self, sid, reply, start="2099-01-01T00:00:00Z"):
-        """采进一段会话，一轮，“我”的回复是 reply；时刻放在后面，排在此前的拉取之后。"""
+    def _reply(self, sid, reply, start="2099-01-01T00:00:00Z", commentary=()):
+        """采进一段会话，一轮，“我”的回复是 reply（中途的叙述 commentary）；时刻放在后面，排在此前的拉取之后。"""
         import io
         from ...engram.observe import collect
         from ...engram.observe.sources.turn import Session, Turn
@@ -60,7 +60,18 @@ class CiteTest(pt.PullTest):              # 〖〗回填（2026-10-22）：数�
         f.write_text("x")
         collect.run(self.conn, sources=("dsh",), force=True, fresh=0, log=io.StringIO(),       # 时刻在未来：不等它“够旧”
                     modules={"dsh": FakeSource(f, Session("dsh", sid, str(f), started=start, cwd="/w"),
-                                               [Turn("接着做吧", reply, closed=True, started=start)])})
+                                               [Turn("接着做吧", reply, closed=True, started=start,
+                                                     commentary=list(commentary))])})
+
+    def test_cite_commentary(self):
+        """中途的叙述（codex 的进度消息、Claude 工具调用之间的话）里写的〖〗也回填（2026-11-08 方向探索第 3 轮）。"""
+        from . import cite
+        judge = lambda *a: {"value": "A", "probabilities": {"A": 0.9, "B": 0.05, "无": 0.05}}
+        pull.relive(self.conn, ["T1"], session="s5", purpose="interactive", cwd="/w")
+        self._reply("s5", "补好了。", commentary=["先照〖甲服务的步骤写进了 docs/x.md〗看一眼"])
+        self.assertEqual(cite.backfill(self.conn, judge=judge, now=FAR), (1, 0))
+        q, = self.conn.execute("SELECT query FROM use_detail WHERE mode='cite'").fetchone()
+        self.assertEqual(json.loads(q)["cite"][0]["pick"], ["form_record", pull.layers(self.conn).by_h["L1:T1:S2"]])
 
     def test_cite(self):
         from . import cite

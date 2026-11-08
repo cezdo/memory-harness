@@ -15,6 +15,7 @@ form 自己按 observe 的接口（progress 里待观测的）定门槛，跟在
 以后加上睡眠（第 5 步）、额度的使用（quota.py 现在只读，供 mh quota 和长实验用）。
 """
 import fcntl
+import importlib.util
 import sys
 import time
 from datetime import datetime
@@ -89,6 +90,13 @@ def _clean(conn, log):
     return f"清理空会话 {len(got)} 个：" + "、".join(f"{src}:{sid[:12]}" for src, sid, _ in got) if got else ""
 
 
+def _self(conn, log):
+    """self 工作区（用户 2026-11-08）：先收上一次醒来，再看有没有到点的便签，有就在后台起 claude -p 叫醒“我”，不挡整理循环
+    （rhythm/self）。每周的方向探索是其中一张便签（“每：7 天”）。"""
+    from . import self as own
+    return own.tick(log)
+
+
 def _vector(conn, log):
     """检索面的向量一路（Synapse v0.33）：把新写的陈述、改了名的话题补进向量服务，报在场名单。
     联想的钩子每轮只查不同步，靠这里跟上；没配 [vector] 就什么也不做。"""
@@ -107,7 +115,10 @@ TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面
         ("向量同步", "程序", 600, _vector),          # 检索面的向量一路跟上新陈述（2026-11-02）
         ("清理空会话", "程序", 3600, _clean),         # 打开了却没开口的会话（2026-11-06）；最近 6 小时动过的不动
         ("引用回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
-        ("runbook 更新稿", "模型", 86400, _runbook)]  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）；照看 11-05 起自己一个服务（memory-harness-tend）
+        ("runbook 更新稿", "模型", 86400, _runbook),  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）；照看 11-05 起自己一个服务（memory-harness-tend）
+        ("self", "模型", 3600, _self)]              # 每小时看一眼有没有到点的便签，到了就叫醒（2026-11-08）；该不该叫由 self.pick 定
+if importlib.util.find_spec(f"{__name__}.self") is None:      # 公开包里冻结着、还没有 self（release/frozen.txt），缺了照常跑
+    TIDY = [t for t in TIDY if t[0] != "self"]
 
 
 def lock(name, home=None):
@@ -214,6 +225,7 @@ def _loop(name, step, db, interval, log, once, watch=None):
             return seen
     seen = None
     while True:
+        time.tzset()                    # 显示按现在的系统时区（11-07 改时区后进程还停在旧的）
         since = _touched(wake)
         seen = look() if watch else None
         try:

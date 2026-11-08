@@ -103,13 +103,31 @@ def asides(row):
     return json.loads(v) if isinstance(v, str) else list(v or [])
 
 
+SELF_WORKSPACE = "self"     # “我”自己的工作区（2026-11-08，design/rhythm/self）：里面的会话当作自言自语来读
+
+
+def self_talk(cwd):
+    """这段会话在不在 self 工作区。"""
+    from ..store import workspace
+    return bool(cwd) and workspace(cwd) == SELF_WORKSPACE
+
+
+SELF_NOTE = (f"这段会话在 self 工作区：“我”自己的地方，只有“我”在，{USER_NAME}不在场，这里的一切都是“我”的自言自语。"
+             f"每一轮开头（U 段）是之前的“我”留给自己的便签，加上程序写的“此刻”（时间、为什么醒、世界的现状），不是{USER_NAME}的话；"
+             f"A 段是“我”在想、在做。每条都以“我”开头：便签里的话写成“我之前记下……”，子代理交回来的写成“我查到……”，"
+             f"读到的{USER_NAME}的话是转述，写成“我读到{USER_NAME}……说……”。这里没有{USER_NAME}做的决定，"
+             f"“我”在这里定的只是“我打算”“我认为”，等{USER_NAME}在场时才落地。")
+
+
 def environment(row, model):
-    """输入里的“环境”一节：对话平台、工作目录、当时的“我”、回看的“我”（总设计“我是谁”的两层环境）。"""
+    """输入里的“环境”一节：对话平台、工作目录、当时的“我”、回看的“我”（总设计“我是谁”的两层环境）。
+    self 工作区的会话再加一段：通篇是“我”的自言自语（SELF_NOTE，2026-11-08）。"""
     unknown = lambda v: not v or str(v).startswith("?")
     return (f"## 环境\n对话平台：{PLATFORMS.get(row['source'], row['source'])}，"
             f"工作目录 {'未知' if unknown(row['cwd']) else row['cwd']}，"
             f"当时的“我”：{'未知模型' if unknown(row['model']) else row['model']}，"
-            f"现在回看的“我”：{model.model}（经 {model.platform}）")
+            f"现在回看的“我”：{model.model}（经 {model.platform}）"
+            + (f"\n{SELF_NOTE}" if not unknown(row["cwd"]) and self_talk(row["cwd"]) else ""))
 
 
 def notes(user, assistant, closed, nxt=None, rewound=False, ending=None):

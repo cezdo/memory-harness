@@ -354,6 +354,22 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertTrue(retrieve.finder("外接键盘")(retrieve.plain("接上 外接 键盘")))
         self.assertTrue(retrieve.finder("ds·")(retrieve.plain("例如「ds·Deepseek」")))
 
+    def test_evoke_naming_shadow(self):
+        """命名演进的影子（D5，2026-11-08）：词典所属的工作区里，查词用了非全名就记进足迹，不改给看的文本；别的工作区不记。"""
+        from pathlib import Path
+        from ...engram.form import glossary
+        repo = str(Path(pull.__file__).resolve().parents[3])
+        meta = lambda: json.loads(self.conn.execute("SELECT meta FROM use_detail ORDER BY occurrence DESC LIMIT 1").fetchone()[0])
+        if glossary.home() != st.workspace(repo):
+            self.skipTest("实例另配的词典")
+        if not glossary.fuller(["pace", "甲服务"]):
+            self.skipTest("词典里没有“pace → yorimichi”这一条（公开包里的词典要么没有、要么是公开版）")
+        a = pull.evoke(self.conn, ["pace", "甲服务"], session="t", purpose="dev", cwd=repo)
+        self.assertEqual(meta().get("naming"), [["pace", "yorimichi"]])
+        b = pull.evoke(self.conn, ["pace", "甲服务"], session="t2", purpose="dev", cwd="/w")
+        self.assertNotIn("naming", meta())
+        self.assertEqual(a, b)
+
     def test_stmt_day(self):
         """v0.40：陈述的日期取它的 E 出自的轮次里最晚的那天；读视图里缓存。"""
         L = pull.layers(self.conn)

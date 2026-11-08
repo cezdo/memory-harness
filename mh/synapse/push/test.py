@@ -122,6 +122,16 @@ class RecentTest(unittest.TestCase):
                  self.item('c', 't2', '2026-10-24T01:00:00+00:00')]
         self.assertEqual([x['session'] for x in recent.dedupe(items)], ['b', 'c'])
 
+    def test_workspace_long_segment(self):
+        from .. import push
+        long = push.HOME / "x" / ("A" * 300) / "b"            # dsh run_code 里的 base64 被认成路径（2026-11-08）：不抛 Errno 36
+        self.assertIsInstance(push.workspace(long), str)
+
+    def test_short_session(self):
+        from . import recent
+        self.assertEqual(recent.short('session-bd60a834-xx'), 'bd60a834')    # dsh：去掉 session- 再截（2026-11-08）
+        self.assertEqual(recent.short('504cab11-cbc5'), '504cab11')
+
     def test_line_falls_back_to_first_words_and_cuts(self):
         from . import recent
         x = self.item('a', 't', '2026-10-24T03:00:00+00:00', said='长' * 80)
@@ -161,11 +171,11 @@ class RecentTest(unittest.TestCase):
             iso = lambda dt: __import__("mh.engram.observe.written_files", fromlist=["_t"])._t(dt * 1000)
             ses = [{"source": "claude", "session": "s-here", "file": "f1", "cwd": d, "title": "这里"},
                    {"source": "claude", "session": "s-other", "file": "f2", "cwd": "/x/other", "title": "那边"}]
-            touch = {"f1": {d: iso(t - 10), str(repo / "b.md"): iso(t + 3600)},             # 只碰过目录；碰 b 在改动之后
-                     "f2": {str(repo / "a.md"): iso(t - 100), str(repo / "b.md"): iso(t - 50)}}
+            touch = {"f1": {d: [iso(t - 10)], str(repo / "b.md"): [iso(t + 3600)]},         # 只碰过目录；碰 b 在改动之后
+                     "f2": {str(repo / "a.md"): [iso(t - 100)], str(repo / "b.md"): [iso(t - 50), iso(t + 7200)]}}   # 先改、后 git diff 看（2026-11-07）
             with mock.patch.object(recent, "active", lambda c, since: ses), mock.patch.object(recent, "handle", lambda c, x: "L1:T1"), \
                  mock.patch.object(recent, "workspace", lambda p: "mh" if p == d else "other"), \
-                 mock.patch("mh.engram.observe.written_files.touches", lambda s, f, c=None: touch[f]):
+                 mock.patch("mh.engram.observe.written_files.touch_times", lambda s, f, c=None: touch[f]):
                 got = recent.dirty_sources(None, repo, ["a.md", "b.md", "c.md"], "mh")
         self.assertEqual(len(got), 2)
         self.assertTrue(got[0].startswith("- a.md、b.md：Claude Code（在 other 开的）「那边」（L1:T1）"))
@@ -547,6 +557,7 @@ class RunbookTest(unittest.TestCase):
         self.assertIn("A1 做完了", calls[0])                                    # 材料里有 runbook 全文
         self.assertFalse(runbook.draft("ws", self.repo, "runbook.md", model, home=self.home))   # 没变就不再调
         self.assertEqual(len(calls), 1)
+        self.assertEqual(len(list((self.home / "runbook-drafts").glob("ws-*.md"))), 1)       # 每份留底（2026-11-07）
         self.assertIn("没处理的更新稿（1 处）", "\n".join(runbook.section("ws", self.repo, "runbook.md", self.home)))
         (self.repo / "runbook.md").write_text("# runbook\n\n- [ ] B2 还在做\n")
         self.assertEqual(runbook.section("ws", self.repo, "runbook.md", self.home), [])   # 改过 = 处理过
@@ -577,6 +588,20 @@ class RunbookTest(unittest.TestCase):
         self.assertNotIn("#x-y", got)                                    # <a id> 也算锚点
         self.assertIn("synapse/设计.md 的 I3", got)
         self.assertNotIn("B2；", got), self.assertNotIn("A1", got), self.assertNotIn("cases", got)
+
+    def test_window_from_last_draft_not_last_runbook_edit(self):
+        """11-05：写完稿后有一次提交没跟上 runbook，随后 runbook 又因别的事提交了；下一份稿仍要看到那次提交。"""
+        from . import runbook
+        model = lambda p: ("- B2：……（依据：abc）", {"model": "fake"})
+        self.assertTrue(runbook.draft("ws", self.repo, "runbook.md", model, home=self.home))
+        self.commit("Synapse v0.40：陈述行带日期")
+        (self.repo / "runbook.md").write_text("# runbook\n\n- [ ] B2 还在做，别的事改了一句\n")
+        self.git("commit", "-qam", "runbook D6：别的事")
+        self.assertEqual(runbook.since(self.repo, "runbook.md")[1], [])          # 旧窗口：空，会跳过
+        calls = []
+        self.assertTrue(runbook.draft("ws", self.repo, "runbook.md", lambda p: calls.append(p) or model(p), home=self.home))
+        self.assertIn("v0.40", calls[0])
+        self.assertFalse(runbook.draft("ws", self.repo, "runbook.md", lambda p: 1 / 0, home=self.home))   # 稿之后没新提交
 
     def test_nothing_to_do_skips_model(self):
         from . import runbook

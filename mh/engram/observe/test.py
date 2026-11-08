@@ -253,6 +253,17 @@ class ObserveTest(unittest.TestCase):
             self.assertEqual(sorted((v[1], v[2].get("file_path") or v[2].get("command")) for v in uses.values()),
                              [("Bash", "cd /srv/w && sed -n 1p design/a.md"), ("Write", "/home/u/p/mh/b.py"), ("Write", "/srv/c.md")])
             self.assertEqual(written_files.touched("codex", str(log), "/home/u/p"), {"/srv/w", "/srv/w/design/a.md", "/home/u/p/mh/b.py", "/srv/c.md"})
+        from unittest.mock import patch
+        from .sources import dsh as dsh_src                                         # dsh：run_code 里的子调用在 tool/ptc-dispatch（2026-11-07）
+        events = [{"type": "assistant/message", "time": 1794000000000, "data": {"message": {"content": [
+                      {"type": "tool-call", "id": "c1", "name": "run_code", "arguments": json.dumps({"code": "await tools.edit({})"})}]}}},
+                  {"type": "tool/ptc-dispatch", "time": 1794000001000, "data": {"subCallId": "c1:ptc:1", "name": "edit",
+                      "arguments": {"file_path": "/home/u/p/mh/a.py", "old_string": "x", "new_string": "y"}}},
+                  {"type": "tool/ptc-dispatch", "time": 1794000002000, "data": {"subCallId": "c1:ptc:2", "name": "read", "arguments": {"file_path": "/srv/r.md"}}},
+                  {"type": "tool/ptc-dispatch", "time": 1794000003000, "data": {"subCallId": "c1:ptc:3", "name": "mcp__mh__evoke", "arguments": {"words": ["x"]}}}]
+        with patch.object(dsh_src, "_events", return_value=events):
+            uses, _ = written_files._dsh("s.jsonl.zstd")
+        self.assertEqual(sorted((v[1], v[2]["file_path"]) for v in uses.values()), [("Edit", "/home/u/p/mh/a.py"), ("Read", "/srv/r.md")])
         self.assertEqual(drr.file_note({"read": ["a.py", "tmp/x/"], "wrote": []}), ["这一轮“我”读过：a.py、tmp/x/"])
         events = [{"text": f"{U}说明脚本的四步。", "segments": ["8:A1"]}, {"text": f"{U}决定先做 A。", "segments": ["8:U1"]},
                   {"text": "我说明了做法，细节见当轮设计材料。", "segments": ["8:A2"]}, {"text": "我在讨论中提出先做 B。", "segments": ["8:A2"]}]
@@ -1019,6 +1030,26 @@ class ObserveTest(unittest.TestCase):
         self._collect([Turn("一", "答", closed=True), Turn("/no-observe", "", closed=True), Turn("三", "答", closed=True)])
         self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
 
+    def test_unwatched_workspace(self):
+        """工作区默认不观察（2026-11-07）：[observe].skip_workspaces 里的工作区不预览、不读，原文照收；进度记 unwatched、
+        不算待观测（不挡 form 的门槛）；会话里显式的 /do-observe 压过工作区默认。"""
+        from ..store import instance
+        old = instance.SKIP_WORKSPACES
+        instance.SKIP_WORKSPACES = ("w",)
+        try:
+            self._collect([Turn("一", "答", closed=True), Turn("二", "答", closed=True)])
+            self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
+            self.assertEqual({p["state"] for p in observe.progress(self.conn)}, {"unwatched"})
+            self.assertEqual(waiting(self.conn), [])
+            self.assertEqual(observe.to_read(self.conn), [])
+            assert_live(self, self.conn)
+            self._collect([Turn("甲", "答", closed=True), Turn("/do-observe", "", closed=True), Turn("丙", "答", closed=True)], sid="s2")
+            got = {r["ordinal"] for rows, _ in observe.ready(self.conn, observe.operator(self.conn)[0]) for r in rows}
+            self.assertIn(0, got)                          # 打开的会话照常排进预览
+            self.assertEqual({p["state"] for p in observe.progress(self.conn, session="s2")}, {"not_previewed", "switch"})
+        finally:
+            instance.SKIP_WORKSPACES = old
+
     def test_redo(self):
         self._collect([Turn("一", "答", closed=True), Turn("二", "答" * 10, closed=True)])
         fakes = self._fakes([RuntimeError("观察者调用了工具")] * 3 + [RuntimeError("quota exceeded")])
@@ -1205,3 +1236,17 @@ class ExpressionOperatorTest(unittest.TestCase):
             self.assertEqual(register.call_args.kwargs['params']['expression'], express.signature())
             with patch('mh.express.VERSION', 'test-next'):
                 self.assertNotEqual(a, module.operator(None, step)[1])
+
+
+class SelfTalkTest(unittest.TestCase):
+    def test_environment(self):
+        """self 工作区的会话当作自言自语来读（2026-11-08，design/rhythm/self）：环境一节多一段说明；别的工作区不变。"""
+        from . import label
+        from .sources import claude
+        row = {"source": "claude", "cwd": str(Path.home() / ".memory-harness" / "self"), "model": "m"}
+        got = label.environment(row, FakeModel([]))
+        self.assertIn(label.SELF_NOTE, got)
+        self.assertIn(f"不是{U}的话", got)
+        self.assertNotIn(label.SELF_NOTE, label.environment({**row, "cwd": "/w"}, FakeModel([])))
+        self.assertNotIn(label.SELF_NOTE, label.environment({**row, "cwd": "?n/a"}, FakeModel([])))
+        self.assertTrue(str(claude.SELF_ROOT).startswith(str(st.HOME)))           # 采集多读 self 的配置目录

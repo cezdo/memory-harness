@@ -10,16 +10,27 @@ from ...engram.store.instance import resource
 HOME = Path.home()
 
 
+def _exists(p):
+    """路径在不在；一节超过 255 字节之类的 OSError 当不在（2026-11-08 方向探索第 3 轮：dsh run_code 里的 base64 带“/”，被认成
+    相对路径进了 touches，form.crossed 在这里抛 Errno 36，挂线整轮出错、同一个单元每轮排第一）。"""
+    try:
+        return p.exists()
+    except OSError:
+        return False
+
+
 def workspace(path):
     """工作区的键。先查 WORKSPACES；否则取所在 git 仓库根目录的名字（跳过家目录本身的仓库）；
     再否则取放项目的目录（PROJECTS）下的第一层目录；都不是就归 home。纯程序判断，目录不必仍然存在。"""
-    p = Path(path or "")
+    from ...engram.store import unworktree, worktree_main
+    p = Path(unworktree(str(path or "")))                  # worktree 算回所在仓库（Claude Code、Zeron，2026-11-07）
     for d in sorted(WORKSPACES, key=lambda d: -len(d.parts)):
         if p == d or d in p.parents:
             return WORKSPACES[d]
     for d in [p, *p.parents]:
-        if d != HOME and HOME in d.parents and (d / ".git").exists():
-            return d.name
+        if d != HOME and HOME in d.parents and _exists(d / ".git"):
+            main = worktree_main(d)                # 仓库里的 worktree（tmp/worktrees/<任务>，用户 11-07）算回主仓库
+            return workspace(main) if main else d.name
     if PROJECTS and PROJECTS in p.parents:
         return p.relative_to(PROJECTS).parts[0]
     return "home"

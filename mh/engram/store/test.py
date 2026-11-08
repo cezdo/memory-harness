@@ -58,8 +58,25 @@ class StoreTest(unittest.TestCase):
                                                                   ".dsh/.memory", "p/memory-system", "p/nas")],
                              ["nas", "dsh", "dsh", "dsh", ".memory", ".memory", "nas"])
             self.assertEqual((st.workspace(h), st.workspace(f"{h}/r/.claude/worktrees/w"), st.workspace("")), ("h", "r", ""))
-            self.assertEqual([st.canonical(w) for w in ("mobile-ui", "memory-system", ".dsh", "dsh", "x")],
-                             ["dsh", ".memory", "dsh", "dsh", "x"])
+        with tempfile.TemporaryDirectory() as d:                     # Zeron 的 worktree：按 .git 的 gitdir 算回主仓库；删了按项目名（2026-11-07）
+            wt = Path(d, ".zeron/worktrees/proj/aspen")
+            wt.mkdir(parents=True)
+            (wt / ".git").write_text(f"gitdir: {d}/src/real-repo/.git/worktrees/aspen\n")
+            self.assertEqual(st.unworktree(f"{wt}/mh/a.py"), f"{d}/src/real-repo/mh/a.py")
+            with mock.patch.dict(st.WORKSPACE_DIRS, {}, clear=True):
+                self.assertEqual((st.workspace(str(wt)), st.workspace(f"{d}/.zeron/worktrees/gone/x")), ("real-repo", "gone"))
+            self.assertEqual(st.unworktree(f"{h}/r/.claude/worktrees/w/mh"), f"{h}/r/mh")
+            inner = Path(d, "src/real-repo/tmp/worktrees/task")             # 仓库里的 worktree（用户 11-07：会话留在工作区，分支放 tmp）
+            inner.mkdir(parents=True)
+            (inner / ".git").write_text(f"gitdir: {d}/src/real-repo/.git/worktrees/task\n")
+            self.assertEqual(st.worktree_main(inner), f"{d}/src/real-repo")
+            with mock.patch.dict(st.WORKSPACE_DIRS, {}, clear=True):           # 会话 cwd 落在里面也算回主仓库，删了也一样
+                self.assertEqual((st.workspace(str(inner)), st.workspace(f"{h}/r/tmp/worktrees/gone")), ("real-repo", "r"))
+            self.assertEqual(st.unworktree(f"{inner}/mh/a.py"), f"{d}/src/real-repo/mh/a.py")
+            self.assertIsNone(st.worktree_main(Path(d, "src")))                # 不是 worktree
+            with mock.patch.dict(st.WORKSPACE_DIRS, dirs, clear=True):               # 换名按这台机器的映射；公开包里没有映射，自带一份
+                self.assertEqual([st.canonical(w) for w in ("mobile-ui", "memory-system", ".dsh", "dsh", "x")],
+                                 ["dsh", ".memory", "dsh", "dsh", "x"])
 
     def test_delete_sessions(self):
         """删除（2026-10-22）：只属于这段会话的发生和 Claim 删掉，混着别的会话的留下；删除留记录，触发器装回去。"""
