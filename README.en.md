@@ -60,7 +60,7 @@ The further in, the stricter and more mechanical: the program locates citations,
 
 ### The notebook brings back the flyleaf and recent progress
 
-Each time a session connects, it receives a notebook: the flyleaf (`core.md`, also called the core), recall tool instructions, recent status and the current environment, in that order. Recent status lists recently paused sessions with topic handles to help resume work. With core-editing hooks enabled, the core is normally read-only; the user can authorize edits for one turn with `/mhcore` (`$mhcore` in Codex), and changes are appended to a kernel log. See [the usage guide](design/global/使用.en.md#core-and-session-start-context) for installation and host support.
+Each time a session connects, it receives a notebook: the flyleaf (`core.md`, also called the core), recall tool instructions, recent status and the current environment, in that order. Recent status lists recently paused sessions with topic handles to help resume work. With core-editing hooks enabled, the core is normally read-only; the user can authorize edits for one turn with `/mhcore` (`$mhcore` in Codex), and changes are appended to a kernel log. See [the usage guide](design/global/usage.en.md#core-and-session-start-context) for installation and host support.
 
 ### A supplement to the host's own memory
 
@@ -101,7 +101,7 @@ python3 -m pip install --no-cache-dir --no-build-isolation .
 mh --help
 ```
 
-Requires Python 3.11 or later. Instance configuration, model calls, host integration and optional tools are covered in [Install, configure and integrate](design/global/使用.en.md).
+Requires Python 3.11 or later. Instance configuration, model calls, host integration and optional tools are covered in [Install, configure and integrate](design/global/usage.en.md).
 
 For the internal structure, source tracing and correction mechanisms, see the [design documents](design/INDEX.md) (Chinese). They distinguish the current implementation from planned work.
 

@@ -16,7 +16,7 @@ CUT = 72                 # 一行最多几个字
 ERR_HOURS = 6            # 服务看近几个小时的出错
 ERR = re.compile(r"：(env_error|timeout|content_error)：|出错：|Traceback")   # act 失败（observe、form 的日志行）、循环出错
 CHECK_TIMEOUT = 300      # 检查命令最多跑几秒
-KERNEL_DAYS = 3          # 内核日志看近几天的 warn：窗口外改了内核（elevate.view，2026-10-30；天数和 ACTIVE_DAYS 一样）
+KERNEL_DAYS = 3          # 内核日志看近几天的 warn：窗口外改了内核（engram.elevate.view，2026-10-30；天数和 ACTIVE_DAYS 一样）
 # 宿主自己在会话接入时给了的，不再给（2026-10-20）：Claude Code 自带 git 状态和最近 5 次提交
 HOST_GIVES = {"claude": ("最近的提交", "没提交的改动")}
 
@@ -39,12 +39,17 @@ def _cut(s, n=CUT):
 
 
 def source(ws):
-    """手写的部分 → {"repo", "services", "check", "runbook", "notes": {目录: 说明}}；这个工作区没写就返回 None。"""
+    """手写的部分 → {"repo", "services", "check", "runbook", "notes": {目录: 说明}, "reflex": [行…]}；这个工作区没写就返回 None。"""
     f = SOURCES / f"{ws}.md"
     if not f.exists():
         return None
     text = f.read_text()
-    cfg = {"repo": None, "services": [], "check": None, "runbook": None, "notes": {}}
+    cfg = {"repo": None, "services": [], "check": None, "runbook": None, "notes": {}, "reflex": []}
+    if "## 反射" in text:                      # 反射条目（runbook I9）：推送时放近况最前，这里先摘出来，别混进目录说明
+        head, _, rest = text.partition("## 反射")
+        block, mark, tail = rest.partition("\n## ")
+        cfg["reflex"] = [l for l in block.splitlines() if l.strip().startswith("- ")]
+        text = head + ("## " + tail if mark else "")
     for line in text.splitlines():
         m = re.match(r"- (仓库|服务|检查|runbook)：(.+)", line)
         if m and "## 目录" not in text.split(line)[0]:
@@ -87,17 +92,22 @@ def _dirs(repo, notes):
 
 
 def _worktrees(repo):
+    repo = Path(repo).resolve()
     out, cur = [], {}
     for line in _run(["git", "worktree", "list", "--porcelain"], repo).splitlines() + [""]:
         if not line:
-            if cur.get("worktree") and Path(cur["worktree"]) != repo:
-                br = cur.get("branch", "").removeprefix("refs/heads/") or "（游离）"
-                if br != "（游离）" and subprocess.run(["git", "merge-base", "--is-ancestor", br, "HEAD"], cwd=repo).returncode == 0:
-                    state = "已合进当前分支，可以删"
+            if cur.get("worktree") and Path(cur["worktree"]).resolve() != repo:
+                name = cur["worktree"].replace(str(Path.home()), "~")
+                if not Path(cur["worktree"]).is_dir():          # 目录删了但还没 git worktree prune：别再当活的工作树
+                    out.append(f"{name}（目录已不在，`git worktree prune` 清掉）")
                 else:
-                    ahead = _run(["git", "rev-list", "--count", f"HEAD..{br}"], repo) if br != "（游离）" else "?"
-                    state = f"没合，领先 {ahead} 个提交"
-                out.append(f"{cur['worktree'].replace(str(Path.home()), '~')}（{br}，{state}）")
+                    br = cur.get("branch", "").removeprefix("refs/heads/") or "（游离）"
+                    if br != "（游离）" and subprocess.run(["git", "merge-base", "--is-ancestor", br, "HEAD"], cwd=repo).returncode == 0:
+                        state = "已合进当前分支，可以删"
+                    else:
+                        ahead = _run(["git", "rev-list", "--count", f"HEAD..{br}"], repo) if br != "（游离）" else "?"
+                        state = f"没合，领先 {ahead} 个提交"
+                    out.append(f"{name}（{br}，{state}）")
             cur = {}
             continue
         k, _, v = line.partition(" ")
@@ -137,7 +147,10 @@ def compile(ws, home=None):
     if not cfg or not cfg["repo"] or not (cfg["repo"] / ".git").exists():
         return None
     repo = cfg["repo"]
-    parts = ["### 目录", *_dirs(repo, cfg["notes"])]
+    parts = []
+    if cfg["reflex"]:                          # 稳定的在前：反射比近况的其余节都稳
+        parts += ["### 反射（一句话现行答案；失效当场改源文件那一行、换新句柄）", *cfg["reflex"], ""]
+    parts += ["### 目录", *_dirs(repo, cfg["notes"])]
     wts = _worktrees(repo)
     if wts:
         parts.append("- 别处的 worktree：" + "；".join(wts))
@@ -147,12 +160,15 @@ def compile(ws, home=None):
     dirty = [x.split(None, 1)[1].split(" -> ")[-1] for x in _run(["git", "-c", "core.quotepath=false", "status", "--porcelain"], repo).splitlines() if x.strip()]
     parts += ["", "### 没提交的改动"] + ([f"- {len(dirty)} 个文件（可能是别的会话做到一半）：" + "、".join(dirty[:DIRTY])
                                          + ("……" if len(dirty) > DIRTY else "")] + _dirty_sources(repo, dirty[:DIRTY * 3], ws) if dirty else ["- 没有"])
+    marks = _shiori(ws)
+    if marks:
+        parts += ["", "### 未落库（夹了栞、还没形成陈述；形成了就不再列）", *marks]
     svc = _services(cfg["services"])
     if svc:
         parts += ["", "### 服务", *svc]
     kernel = _kernel(repo)
     if kernel:
-        parts += ["", "### 内核日志（warn，`python3 -m mh.synapse.push.elevate log` 看全部，给编号展开）", *kernel]
+        parts += ["", "### 内核日志（warn，`python3 -m mh.engram.elevate log` 看全部，给编号展开）", *kernel]
     check = _read_stamped((home or _out()) / f"{ws}.check") if cfg["check"] else None
     if check:
         at, body = check
@@ -186,7 +202,7 @@ def compile(ws, home=None):
 def _kernel(repo, log=None, now=None):
     """内核（core.md）在这个仓库里时，近 KERNEL_DAYS 天的 warn 行；没有就是空，不出声（像只看 dmesg -l warn）。"""
     from . import CORE
-    from .elevate import view
+    from ...engram.elevate import view
     from ...engram.store import HOME
     try:
         Path(CORE).resolve().relative_to(Path(repo).resolve())
@@ -208,6 +224,30 @@ def _dirty_sources(repo, files, ws):
             conn.close()
     except Exception:
         return []
+
+
+def _shiori(ws, conn=None):
+    """未落库（I7 shiori，2026-11-13）：从库里的轮次派生，夹了栞、还没产出陈述的，一轮一行；读库出任何错都不给这一节。"""
+    try:
+        from .. import library
+        from ...engram.observe import shiori
+        from .recent import HOST
+        own = conn is None
+        conn = conn or library()
+        try:
+            rows = shiori.pending(conn, ws)
+        finally:
+            if own:
+                conn.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        said = _cut(" ".join((r["user"] or "").split()), 40)
+        why = f"：{_cut(r['why'], 60)}" if r["why"] else ""
+        out.append(f"- {(r['started'] or '')[5:16].replace('T', ' ')} · {HOST.get(r['source'], r['source'])} · "
+                   f"第 {r['ordinal'] + 1} 轮（{r['session'][:8]}）{why}；你说：{said}")
+    return out
 
 
 def _recent(ws):

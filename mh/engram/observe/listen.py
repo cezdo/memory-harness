@@ -1,4 +1,4 @@
-"""监听（G7，design/rhythm/shelved/群聊.md）：连 QQ 协议端（NapCat）的 OneBot 11 正向 WS，事件原样追加进数据目录的
+"""监听（design/reply/设计.md）：连 QQ 协议端（NapCat）的 OneBot 11 正向 WS，事件原样追加进数据目录的
 listen-onebot.jsonl。只收不发；常驻，memory-harness-listen 服务跑它（python3 -m mh listen），不开库。
 
 协议端在别的机器上、只听那台机器的本机时，自己起 ssh 隧道（实例配置 [listen]）；隧道或 WS 断了就整个重来，

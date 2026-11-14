@@ -15,7 +15,7 @@
 - 观察：预览分出的每一组一次调用，给这几轮的全文和预览写的计划。精读 = dsh web minimal 原样带 bash（只放行字数命令），high；
   粗读 = 去掉全部工具，low。路径、文件名、链接打码后给观察者，输出后换回（guard.py）。不读的不调用。
 - 不观察：用户用 /no-observe 关掉的会话（最后一次开关说了算），以及开关那一轮本身（switch/）。另有工作区级的默认：
-  实例配置 [observe].skip_workspaces 里的工作区（2026-11-07），那里的会话不预览、不读，原文照收，已经产出的 E 不动；
+  实例配置 [connect].unwatched 里的工作区（2026-11-07），那里的会话不预览、不读，原文照收，已经产出的 E 不动；
   会话里显式的 /do-observe 压过它（临时要看时用）。开关影响 observe 全流程
   （2026-10-17）：关掉的会话不预览、预览过的也不读；已经产出的 E 不再交给上一层（withheld）。开关只在 E 跨过
   observe → form 的边界时留记录（mark_switches）：已被 form 读过的，关掉记 withdraw、恢复记 restore（程序 act：哪些 E、
@@ -90,7 +90,8 @@ def operator(conn, step="preview", register_new=True, name=None, prompt=None):
     body = (PROMPTS / f"{prompt}.md").read_bytes()   # 模板属于做法；实际称呼在 act 的表达上下文中
     model = MODELS[name]()
     iso = getattr(model, "isolation", "") or NA
-    wp = {**window_params(step), "expression": express.signature()}
+    wp = {**window_params(step), "expression": express.signature(), "source_models": "turn-models-v1",
+          "source_notes": "chatgpt-export-v1"}
     full = f"{name}/{prompt}.{iso}-{hashlib.sha256(body + iso.encode() + dumps(wp).encode()).hexdigest()[:8]}"
     params = {"definition": name, "platform": getattr(model, "platform", UNKNOWN), "step": step, **wp}
     if not register_new:
@@ -105,7 +106,7 @@ TURNS = """SELECT d.*, x.user, x.assistant, x.commentary, x.tools, o.started, s.
                   so.started AS session_started
            FROM turn_detail d JOIN occurrence o ON o.id=d.occurrence JOIN turn_text x ON x.id=d.text
            JOIN session_detail s ON s.source=d.source AND s.session=d.session JOIN occurrence so ON so.id=s.occurrence"""
-ACTS = """SELECT o.id, o.operator, o.outcome, a.step, a.window, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence
+ACTS = """SELECT o.id, o.operator, o.outcome, a.step, a.window, a.meta, o.error FROM act_detail a JOIN occurrence o ON o.id=a.occurrence
           WHERE a.process='observe' ORDER BY o.id"""
 
 
@@ -121,7 +122,7 @@ def history(conn):
     ordinal = dict(conn.execute("SELECT occurrence, ordinal FROM turn_detail"))
     done, fails, last, finished, windows = set(), collections.defaultdict(collections.Counter), {}, {}, {}
     previewed, legacy = set(), set()
-    for oid, op, result, step, window, meta in conn.execute(ACTS):
+    for oid, op, result, step, window, meta, error in conn.execute(ACTS):
         w = json.loads(window)
         if step == "split":                                   # 旧版本：逐轮
             key = ("turn", turn_text.get(w.get("turn")))
@@ -144,7 +145,7 @@ def history(conn):
             if result in ("ok", "filtered"):
                 finished[key] = result
         last[key] = oid
-        if result in ("timeout", "content_error"):
+        if st.counted(result, error):
             fails[(key, op)][result] += 1
     return types.SimpleNamespace(done=done, fails=fails, last=last, finished=finished, windows=windows,
                                  previewed=previewed, legacy=legacy)
@@ -179,15 +180,17 @@ def _stuck(h, op_ids):
 
 
 def unwatched(conn, states=None):
-    """工作区默认不观察的会话：{(来源, 会话)}（实例配置 [observe].skip_workspaces，2026-11-07）。和 /no-observe 一样作用于
+    """工作区默认不观察的会话：{(来源, 会话)}（实例配置 [connect].unwatched，2026-11-07）。和 /no-observe 一样作用于
     observe 的全流程：不预览、不读；已经产出的 E 不动（规则只管以后）。会话里显式的 /do-observe 压过它（临时要看时用）。
-    按会话认工作区（store.session_workspace），按目录的更正、按会话的更正都算。states：调用方已经算过的 switch.states。"""
-    skip = set(instance.SKIP_WORKSPACES)
-    if not skip:
+    按会话的路径认（instance.under 的通配符，2026-11-14 起；之前按工作区名），worktree 先算回所在仓库（store.unworktree：
+    mh 自己的 tmp/worktrees/<任务> 不算 tmp）。states：调用方已经算过的 switch.states。"""
+    skip, paused = instance.UNWATCHED, instance.PAUSE_SOURCES
+    if not skip and not paused:
         return set()
     on = {k for k, v in (switch.states(conn) if states is None else states).items() if v == "on"}
-    return {(src, ses) for src, ses, cwd in conn.execute("SELECT source, session, cwd FROM session_detail")
-            if st.session_workspace(src, ses, cwd) in skip} - on
+    rows = conn.execute("SELECT source, session, cwd FROM session_detail").fetchall()
+    return ({(src, ses) for src, ses, cwd in rows if skip and instance.under(st.unworktree(cwd), skip)} - on) \
+        | {(src, ses) for src, ses, _ in rows if src in paused}           # 暂停的来源（[engram].pause_sources）：/do-observe 也不压过
 
 
 def ready(conn, op_id, session=None, now=None, reobserve=None):
@@ -248,7 +251,7 @@ def previous(conn, row):
                                                          "ORDER BY ordinal DESC", (row["source"], row["session"]))}
     text_of = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
     out = []
-    for _, _, _, _, window, meta in conn.execute(sql):
+    for _, _, _, _, window, meta, _ in conn.execute(sql):
         o = mine.get(text_of.get(json.loads(window)["turns"][0]))
         if o is not None and o < row["ordinal"]:
             out += [g for g in reads(json.loads(meta)) if not g.get("program")]     # 程序判的不显示的轮，续上时也不给
@@ -305,7 +308,7 @@ def store_preview(conn, op_id, rows, text, output, meta, error, last, cause="new
 
 def _fast_acts(conn):
     """快道的读：[(act, 结果, 轮次)]。"""
-    return [(oid, result, json.loads(window)["turns"]) for oid, _, result, step, window, _ in conn.execute(ACTS)
+    return [(oid, result, json.loads(window)["turns"]) for oid, _, result, step, window, _, _ in conn.execute(ACTS)
             if step == "rough" and json.loads(window).get("fast")]
 
 
@@ -346,7 +349,7 @@ def fast_retired(conn):
     text_of = dict(conn.execute("SELECT occurrence, text FROM turn_detail"))
     gone = set()
     sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome='ok'")
-    for _, _, _, _, _, meta in conn.execute(sql):
+    for _, _, _, _, _, meta, _ in conn.execute(sql):
         for g in reads(json.loads(meta)):
             if g["how"] == "不读" or g["how"] == "精读" and h.finished.get(("turns", tuple(g["turns"]))) == "ok":
                 gone |= {text_of.get(t) for t in g["turns"]}
@@ -363,7 +366,7 @@ def group_parts(conn, h, fast, ops, outcomes=("ok",)):
     marks = ",".join("?" * len(outcomes))
     sql = ACTS.replace("WHERE a.process='observe'", f"WHERE a.process='observe' AND a.step='preview' AND o.outcome IN ({marks})")
     out = []
-    for pid, _, result, _, window, meta in conn.execute(sql, outcomes):
+    for pid, _, result, _, window, meta, _ in conn.execute(sql, outcomes):
         if result == "filtered":
             continue
         for g in reads(json.loads(meta)):
@@ -737,7 +740,7 @@ def previews_of(conn, source, session):
     ids = [r[0] for r in conn.execute("SELECT occurrence FROM turn_detail WHERE source=? AND session=?", (source, session))]
     sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome='ok'")
     reread_op = conn.execute("SELECT id FROM operator WHERE name=?", (REREAD,)).fetchone()
-    return [oid for oid, op, _, _, window, _ in conn.execute(sql)
+    return [oid for oid, op, _, _, window, _, _ in conn.execute(sql)
             if set(json.loads(window)["turns"]) & set(ids) and not (reread_op and op == reread_op[0])]
 
 
@@ -858,6 +861,10 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
             env += state.startswith("env_error")
             done += 1
             print(f"[{group['how']}] {_session_of(conn, group)} 第 {group['from']}–{group['to']} 轮（预览 {pid}）：{state}", file=log, flush=True)
+    if not env and session is None and instance.VIEWS:     # 导入的来源：读完的会话带着视角筛 E（select），再交给 form
+        from . import select
+        n, e = select.run(conn, limit=limit, log=log)
+        done, env = done + n, env + e
     return done, env
 
 
@@ -875,9 +882,28 @@ def _switched(conn):
     return out
 
 
+def paused_sessions(conn):
+    """暂停的来源（[engram].pause_sources）的会话：连同已有的 E、陈述一起撤下，和关着观察一样读不到（用户 2026-11-11）。"""
+    if not instance.PAUSE_SOURCES:
+        return set()
+    return {(s, ses) for s, ses in conn.execute("SELECT source, session FROM session_detail") if s in instance.PAUSE_SOURCES}
+
+
+def hidden_sessions(conn):
+    """读不到的会话：关着观察（最后一次开关是 /no-observe）的，和暂停的来源的。form 的入口、Synapse 的句柄都按它挡。"""
+    return {k for k, v in switch.states(conn).items() if v == "off"} | paused_sessions(conn)
+
+
 def withheld(conn):
-    """不交给上一层的 E：会话现在关着观察（最后一次开关是 /no-observe）。form 读 E 时排除它们；/do-observe 以后又交出去。"""
-    return {e for state, _, ids in _switched(conn).values() if state == "off" for e in ids}
+    """不交给上一层的 E：会话现在关着观察（最后一次开关是 /no-observe），或来源暂停着。form 读 E 时排除它们；
+    /do-observe、去掉暂停以后又交出去。"""
+    out = {e for state, _, ids in _switched(conn).values() if state == "off" for e in ids}
+    paused = instance.PAUSE_SOURCES
+    if paused:
+        q = ",".join("?" * len(paused))
+        out |= {e for e, in conn.execute(f"SELECT e.id FROM event e JOIN turn_detail d ON d.occurrence=e.turn WHERE d.source IN ({q})",
+                                         list(paused))}
+    return out
 
 
 PRUNE = "observe/prune-v1"
@@ -984,7 +1010,7 @@ STATES = {
     "filtered": "被服务商的内容过滤拦下，不要了",
     "failed": "失败满次数，进待重做清单",
     "off": "会话关着观察（/no-observe）",
-    "unwatched": "工作区默认不观察（[observe].skip_workspaces）",
+    "unwatched": "工作区默认不观察（[connect].unwatched）",
     "switch": "开关那一轮，永远不观察",
     "no_answer": "“我”没写出最终回答，不观察",
     "to_read": "预览定了精读或粗读，还没读完",
@@ -1009,7 +1035,7 @@ def progress(conn, session=None, now=None):
     by_text = {}
     fast = fast_texts(conn)
     sql = ACTS.replace("WHERE a.process='observe'", "WHERE a.process='observe' AND a.step='preview' AND o.outcome='filtered'")
-    for _, _, _, _, window, _ in conn.execute(sql):
+    for _, _, _, _, window, _, _ in conn.execute(sql):
         for t in json.loads(window)["turns"]:
             by_text.setdefault(turn_text.get(t), "filtered")
     for _, _, g, step, part, d in group_parts(conn, h, fast, ops, ("ok",)):

@@ -4,6 +4,7 @@ python3 -m unittest mh.engram.observe.switch.test
 """
 import io
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -169,7 +170,9 @@ class SwitchTest(unittest.TestCase):
         (home / ".claude").mkdir(parents=True)
         (home / ".claude/settings.json").write_text(json.dumps({"model": "x", "hooks": {"UserPromptSubmit": [
             {"hooks": [{"type": "command", "command": "synapse"}]}]}}))
-        done = install(home)
+        self.assertEqual(len(install(home)), 8)                            # 默认只列，不动宿主
+        self.assertFalse((home / ".claude/commands/no-observe.md").exists())
+        done = install(home, apply=True)
         self.assertEqual(len(done), 8)
         self.assertTrue((home / ".claude/commands/no-observe.md").read_text().startswith("---"))
         self.assertTrue((home / ".codex/skills/do-observe/SKILL.md").exists())
@@ -179,11 +182,24 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(len(list((home / ".claude").glob("settings.json.bak-observe-switch-*"))), 1)
         self.assertEqual(cfg["hooks"]["Stop"][0]["hooks"][0]["command"].split()[-2:], ["claude", "stop"])   # 叫醒
         self.assertEqual(set(json.loads((home / ".codex/hooks.json").read_text())["hooks"]), {"UserPromptSubmit", "Stop"})
-        self.assertEqual(install(home), [])                                # 再装一次什么都不做
+        self.assertEqual(install(home, apply=True), [])                     # 再装一次什么都不做
         (home / ".claude/commands/do-observe.md").unlink()
         (home / ".claude/commands/do-observe.md").write_text("别人的")
         with self.assertRaises(FileExistsError):                           # 不覆盖不是自己装的文件
-            install(home)
+            install(home, apply=True)
+
+    def test_install_moves_old_links(self):
+        """2026-11-14 命令文件搬到 mh/skills/：宿主里指向旧位置的链接就地换成新的，不并存。"""
+        home = self.dir / "home"
+        (home / ".claude/commands").mkdir(parents=True)
+        (home / ".claude/commands/no-observe.md").symlink_to("/r/mh/engram/observe/switch/claude/no-observe.md")
+        (home / ".codex/skills").mkdir(parents=True)
+        (home / ".codex/skills/do-observe").symlink_to("/r/mh/engram/observe/switch/codex/do-observe")
+        install(home, apply=True)
+        self.assertEqual(os.readlink(home / ".claude/commands/no-observe.md"),
+                         str(HERE.parents[2] / "skills/no-observe/claude/no-observe.md"))
+        self.assertEqual(os.readlink(home / ".codex/skills/do-observe"),
+                         str(HERE.parents[2] / "skills/do-observe/codex/do-observe"))
 
 if __name__ == "__main__":
     unittest.main()

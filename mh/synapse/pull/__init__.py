@@ -31,7 +31,7 @@ from ...engram.store import absent
 from .. import track
 from . import retrieve, structure, vector
 
-VERSION = "v0.42"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
+VERSION = "v0.44"        # v0.8 换库：读新库，get 只给一层，一次最多 SHOW 条；v0.9 句柄定成话题线 L3、话题 T5、陈述 L3:S1；
                          # v0.10 只给主要内容（来源、原话、历史另取），新的优先，旧 J 只进联想；
                          # v0.11 句柄带归属（话题 L3:T5、陈述 L3:T5:S1，陈述按会话编号），陈述是最小单位：带 source、said、recall 时
                          # 不重复正文，陈述的 recall 给写出的时间和现在在不在；
@@ -68,7 +68,10 @@ VERSION = "v0.42"        # v0.8 换库：读新库，get 只给一层，一次�
                          # v0.40 evoke 的陈述行带日期（用户 2026-11-05：现状题里新旧两条摆在一起分不出先后，F5）
                          # v0.41 MCP 撤 observe-now（用户 2026-11-06：快不该放在 SSD 层，连同 observe 的快道一起撤）
                          # v0.42 self 来的话题、陈述标“自语”（2026-11-08 self 第一次醒来起草，用户同日同意落地）：按节点的工作区认，不另存
+                         # v0.43 读得到 C（2026-11-10，runbook D7 第一步）：relive 认 C8 和理、事的名字、别名（show_c）；evoke 的查词对上
+                         #        现状里一条理的名字或别名时，页首提一行（_c_hits）。取了哪条 C 记进足迹（cognition），是“主会话采用”的痕迹
                          # 挂线待审视只标出来，不再叫主会话用 feedback 改挂（那个工具本来也改不了挂线）
+                         # v0.44 MCP 加 shiori（2026-11-13，runbook I7）：“我”夹栞，调用本身是标记，服务不写东西
 SHOW = 8                 # 一次最多展示几条（2026-10-19：实验里最多六到八条）
 CONTEXT = 3              # relive 一条陈述：前后各给几条（v0.13）
 EVOKE_PAGE = (6, 8)      # evoke 一页至少、至多几条（v0.17，2026-10-27）
@@ -169,7 +172,7 @@ class Layers:
         """关着观察（最后一次开关是 /no-observe）的会话，和没有一样（审查 05，2026-10-28）：入口 form.entries 已经不给；这里把它的
         话题号、陈述序号（会话里的、线里的，连同已换掉的旧版本）和 E 从句柄能解析到的映射里去掉，直接给句柄也只得到“没有”。
         /do-observe 以后库变了，读视图重建，自然回来。"""
-        off = {k for k, v in observe.switch.states(conn).items() if v == "off"}
+        off = observe.hidden_sessions(conn)                  # 暂停的来源同样读不到（[engram].pause_sources，2026-11-11）
         gone = {rid for rid, k in self.ssess.items() if k in off}
         self.events_hidden = observe.withheld(conn)
         self.t_session = {t: k for t, k in self.t_session.items() if k not in off}
@@ -787,6 +790,87 @@ MISSING = ("没有这个句柄。话题线 L3、话题 L3:T5（T5）、陈述 L3
            "J；名字要逐字对上。")
 
 
+_C = re.compile(r"[Cc](\d+)")
+C_KIND = {"abstract": "理", "concrete": "事"}
+
+
+def _c_of(conn, h):
+    """句柄或名字 → C 编号：C8，或现状里逐字对上的名字、别名；不是就 None。"""
+    from ...engram import cognize
+    m = _C.fullmatch(h.strip())
+    if m:
+        return int(m.group(1))
+    return cognize.lookup(conn, h) if h.strip() else None
+
+
+def _ref_handle(L, r):
+    """C 里的一条引用 → 读的人能接着 relive 的句柄（钉住的那一版）。"""
+    if r["kind"] == "cognition":
+        return f"C{r['id']}"
+    if r["kind"] == "form_record":
+        if r["id"] in L.stmts:
+            return L.stmts[r["id"]]["h"]
+        for nd in L.nodes.values():                      # form 归纳时折进一条概括的：给概括那条的句柄
+            for it in nd.get("items", ()) if nd["kind"] == "entry" else ():
+                if r["id"] in it.get("from", ()) and it["id"] in L.stmts:
+                    return f"{L.stmts[it['id']]['h']}（归纳前的一条）"
+        return f"陈述 {r['id']}（旧版）"
+    if r["kind"] == "skeleton":
+        return next((n for n, x in L.nodes.items() if x["kind"] == "node" and x.get("path") == r["path"]), r["path"])
+    if r["kind"] == "session_entry":
+        return L.where(f"T{r['id']}") if f"T{r['id']}" in L.nodes else f"T{r['id']}"
+    return {"topic_line": "L", "judgment": "J"}[r["kind"]] + str(r["id"])
+
+
+def show_c(conn, L, cid):
+    """一个 C：名字、理还是事、候选还是已验证、别名、表述（每句带引用的句柄）；理列出它的事（各一句），事标出挂在哪几条理下。"""
+    from ...engram import cognize
+    try:
+        c = cognize.get(conn, cid)
+    except ValueError:
+        return f"C{cid}：没有这个认知。", {}
+    now = cognize.current(conn)
+    ids = cognize.chain(conn, cid)
+    al = [t for (t,) in conn.execute(f"SELECT text FROM alias WHERE cognition IN ({','.join('?' * len(ids))}) ORDER BY id", ids)]
+    nxt = [x for x in now if x != cid and cid in cognize.chain(conn, x)]
+    up = [x for x in now if any(m["kind"] == "cognition" and m["id"] == cid for m in cognize.get(conn, x)["members"])]
+    tags = [C_KIND[c["kind"]], "已验证" if cognize.verified(conn, cid) else "候选"]
+    if al:
+        tags.append("别名：" + "、".join(al))
+    if up:
+        tags.append("属于 " + "、".join(f"C{x} {cognize.get(conn, x)['name']}" for x in up))
+    if nxt:
+        tags.append("已被 " + "、".join(f"C{x}" for x in nxt) + " 接替")
+    out = [f"[C{cid}] {c['name']}（{'，'.join(tags)}）"]
+    many = len(c["statements"]) > 1
+    for i, st_ in enumerate(c["statements"], 1):
+        out.append(f"{f'{i}. ' if many else ''}{st_['text']} ← {'、'.join(_ref_handle(L, r) for r in st_['refs'])}")
+    got = {"cognition": [cid]}
+    subs = [m["id"] for m in c["members"] if m["kind"] == "cognition"]
+    if subs:
+        out.append("事：" if c["kind"] == "abstract" else "成员：")
+        for x in subs:
+            sub = cognize.get(conn, x)
+            out.append(f"- C{x} {sub['name']}：{sub['statements'][0]['text']}")
+        got["cognition"] += subs
+    return "\n".join(out), got
+
+
+def _c_hits(conn, ts):
+    """evoke 的查词对上现状里哪几条理：词在名字里、名字在词里，或和别名互相包含（两个字以上）。只认理，事从理走下去。"""
+    from ...engram import cognize
+    hits = []
+    names = cognize.names(conn)
+    for cid in cognize.current(conn):
+        c = cognize.get(conn, cid)
+        if c["kind"] != "abstract":
+            continue
+        mine = [k for k, v in names.items() if v == cid]
+        if any(len(t) >= 2 and (t.casefold() in k or k in t.casefold()) for t in ts for k in mine):
+            hits.append((cid, c["name"]))
+    return hits
+
+
 def relive(conn, handles, said=False, recall=None, session="", purpose="interactive", cwd="", note="", source=False,
            page=None, files=False, near=False, **_):
     tok = _WIN.set(paging(page))
@@ -812,7 +896,10 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
     sections = {}
     for h in handles:
         kind, v = resolve(L, h)
-        if kind == "node":
+        cid = _c_of(conn, h) if kind in ("missing", "j") and not h.strip().isdigit() else None   # C8，或理、事的名字（v0.43）
+        if cid is not None and (kind == "missing" or _C.fullmatch(h.strip())):
+            text, got = show_c(conn, L, cid)
+        elif kind == "node":
             text, got = show_node(L, v, recall, conn)
         elif kind == "earlier":
             text, got = show_node(L, v[1], recall, conn)
@@ -1084,6 +1171,10 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
         out = [f"这一轮前面已经都给过了（{skipped} 条" + (f"，排在前面的：{'、'.join(again)}" if again else "") + "），往下没有了。"]
     else:
         out = ["没有命中。"]
+    chits = _c_hits(conn, ts)                           # v0.43：查词对上的理，页首提一行
+    if chits:
+        out = ["认知（relive 读全文）：" + "；".join(f"C{c} {nm}" for c, nm in chits)] + out
+        ins["cognition"] += [c for c, _ in chits]
     text = "\n".join(out)
     query = {"words": list(words), **({"big": big} if big else {}), **({"skipped": skipped} if skipped else {}),
              **({"grain": g} if g != "S" else {}), **({"vector": "off"} if dense is None and vector.ENABLED else {})}

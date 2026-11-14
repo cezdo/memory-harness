@@ -1,4 +1,4 @@
-"""内核态：认命令、开关窗口、拦写入、比对记日志、安装。python3 -m unittest mh.synapse.push.elevate.test"""
+"""内核态：认命令、开关窗口、拦写入、比对记日志、安装。python3 -m unittest mh.engram.elevate.test"""
 import io
 import json
 import os
@@ -16,7 +16,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.src = root / "repo/design/synapse/core.md"
+        self.src = root / "repo/design/engram/core.md"
         self.src.parent.mkdir(parents=True)
         self.src.write_text("# core\n\n- 你：称呼示例用户、示例别名或 demo-user，任选。\n")
         self.k = Kernel(self.src, root / "data")
@@ -59,7 +59,7 @@ class Flow(Base):
         self.assertEqual(self.ev("pre", tool_name="Bash", tool_input={"command": f"cat {self.src}"}), (None, 0))
 
     def test_codex_patch_relative_path_denied(self):
-        patch = "*** Begin Patch\n*** Update File: design/synapse/core.md\n@@\n-a\n+b\n*** End Patch"
+        patch = "*** Begin Patch\n*** Update File: design/engram/core.md\n@@\n-a\n+b\n*** End Patch"
         out, _ = self.ev("pre", "codex", tool_name="apply_patch", tool_input={"command": patch})
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
@@ -170,6 +170,23 @@ class Install(unittest.TestCase):
             self.assertNotIn("matcher", json.loads((home / ".codex/hooks.json").read_text())["hooks"]["PreToolUse"][0])
             self.assertTrue((home / ".claude/commands/mhcore.md").is_symlink())
             self.assertEqual(install(home, apply=True), [])                  # 装过就不动
+
+    def test_install_moves_old_paths(self):
+        """2026-11-13 elevate 从 mh/synapse/push/ 搬到 mh/engram/：指向旧位置的钩子、链接就地换成新的，不并存。"""
+        with tempfile.TemporaryDirectory() as t:
+            home = Path(t)
+            old = "/r/mh/synapse/push/elevate/hook.py"
+            (home / ".claude").mkdir()
+            (home / ".claude/settings.json").write_text(json.dumps({"hooks": {
+                "Stop": [{"hooks": [{"command": f"/usr/bin/python3 -I -S {old} claude stop"}]}]}}))
+            (home / ".claude/commands").mkdir()
+            (home / ".claude/commands/mhcore.md").symlink_to("/r/mh/synapse/push/elevate/claude/mhcore.md")
+            install(home, apply=True)
+            stop = json.loads((home / ".claude/settings.json").read_text())["hooks"]["Stop"]
+            self.assertEqual(len(stop), 1)
+            self.assertEqual(stop[0]["hooks"][0]["command"], f"/usr/bin/python3 -I -S {HERE / 'hook.py'} claude stop")
+            self.assertEqual(os.readlink(home / ".claude/commands/mhcore.md"), str(HERE.parents[1] / "skills/mhcore/claude/mhcore.md"))
+            self.assertEqual(install(home, apply=True), [])
 
 
 if __name__ == "__main__":

@@ -1,14 +1,17 @@
 """self 的程序部分（design/rhythm/self/设计.md）：读便签、判到点、挑哪张叫醒、醒来眼前的东西、核查自己做了什么、手记一节。
 不起 claude。"""
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-from . import REPO, ROOT, TO_USER, awaken, due, hosts, notes, own_actions, pick, section, thread, turns, wakes
+from . import REPO, ROOT, confine, TO_USER, awaken, due, hosts, notes, own_actions, pick, section, thread, turns, wakes
 from ...engram import store
 from .hosts import claude
+from .hosts.codex_test import CodexTest
 
 
 class SelfTest(unittest.TestCase):
@@ -23,15 +26,17 @@ class SelfTest(unittest.TestCase):
         (self.root / "便签" / f"{name}.md").write_text(text)
 
     def test_notes(self):
-        self.note("命名影子", "到：2026-11-22\n---\n我想看命名影子攒了几次。\n上次看到 4 次。\n")
-        self.note("探索", "每：7 天\n\n---\n看看 mh 的现状。")
-        self.note("怪", "下周二\n到: 2026-11-30\n---\n正文")
+        self.note("命名影子", "at: 2026-11-22\n---\n我想看命名影子攒了几次。\n上次看到 4 次。\n")
+        self.note("探索", "every: 7d\n\n---\n看看 mh 的现状。")
+        self.note("挂线", "every: 14d\ntopics: 100\n---\n整体看挂线。")
+        self.note("怪", "下周二\nat: 2026-11-30\n---\n正文")
         self.note("没有头", "只有正文")
-        self.note("别的宿主", "谁：codex\n谁：claude\n---\n还没接入的宿主认不出")
-        (self.root / "便签" / "撕了" / "旧.md").write_text("到：2026-11-01\n---\n撕掉的不算")
+        self.note("别的宿主", "host: unknown\nhost: codex\n---\n还没接入的宿主认不出")
+        (self.root / "便签" / "撕了" / "旧.md").write_text("at: 2026-11-01\n---\n撕掉的不算")
         got = {n["name"]: n for n in notes(self.root)}
-        self.assertEqual(sorted(got), ["别的宿主", "命名影子", "怪", "探索", "没有头"])
-        self.assertEqual((got["别的宿主"]["bad"], got["别的宿主"]["host"]), (["谁：codex"], "claude"))   # codex 还没接入
+        self.assertEqual(sorted(got), ["别的宿主", "命名影子", "怪", "挂线", "探索", "没有头"])
+        self.assertEqual((got["挂线"]["every"], got["挂线"]["topics"], got["挂线"]["bad"]), (14, 100, []))
+        self.assertEqual((got["别的宿主"]["bad"], got["别的宿主"]["host"]), (["host: unknown"], "codex"))
         self.assertEqual(got["探索"]["host"], hosts.DEFAULT)
         self.assertEqual(got["命名影子"]["at"], date(2026, 11, 22))
         self.assertEqual(got["命名影子"]["body"], "我想看命名影子攒了几次。\n上次看到 4 次。")
@@ -49,13 +54,26 @@ class SelfTest(unittest.TestCase):
         self.assertFalse(due(every, datetime(2026, 11, 14), woke=datetime(2026, 11, 8)))
         self.assertTrue(due(every, datetime(2026, 11, 15), woke=datetime(2026, 11, 8)))
         self.assertFalse(due({"at": None, "every": None}, datetime(2026, 11, 8)))
+        many = {"at": None, "every": 14, "topics": 80}                                         # 按数量：上次醒以来新话题满 N 个
+        woke = datetime(2026, 11, 8)
+        self.assertFalse(due(many, datetime(2026, 11, 10), woke=woke, count=lambda s: 79))
+        self.assertTrue(due(many, datetime(2026, 11, 10), woke=woke, count=lambda s: 80))
+        self.assertTrue(due(many, datetime(2026, 11, 22), woke=woke, count=lambda s: 3))       # 时间先到也算
+        self.assertFalse(due(many, datetime(2026, 11, 10), woke=woke))                         # 没给数法不按数量判
+
+    def test_host_header(self):
+        self.note("旧字段", "谁：codex\n宿主：codex\n到：2026-11-09\n每：7 天\n---\n中文键不再认（11-08 起键一律英文）")
+        self.note("新字段", "host: codex\n---\n选承载的部分")
+        got = {n["name"]: n for n in notes(self.root)}
+        self.assertEqual(got["旧字段"]["bad"], ["谁：codex", "宿主：codex", "到：2026-11-09", "每：7 天"])
+        self.assertEqual((got["新字段"]["host"], got["新字段"]["bad"]), ("codex", []))
 
     def test_pick(self):
         free, now = (lambda: False), datetime(2026, 11, 22, 10)
         self.assertEqual(pick(now, {}, self.root, free), (None, ""))                           # 没有便签
-        self.note("晚", "到：2026-11-21\n---\n晚到的")
-        self.note("早", "到：2026-11-09\n---\n早到的")
-        self.note("周", "每：7 天\n---\n每周")
+        self.note("晚", "at: 2026-11-21\n---\n晚到的")
+        self.note("早", "at: 2026-11-09\n---\n早到的")
+        self.note("周", "every: 7d\n---\n每周")
         st = {"woke": {"周": "2026-11-20T10:00:00"}}
         self.assertEqual(pick(now, st, self.root, free)[0]["name"], "早")                      # 到点最早的先叫
         self.assertIsNone(pick(now, {**st, "run": {"note": "x"}}, self.root, free)[0])          # 有一次醒来还没收
@@ -69,14 +87,19 @@ class SelfTest(unittest.TestCase):
         class Host:
             NAME, ok = "claude", True
             new_session = staticmethod(lambda: "new")
-            resumable = lambda self, s: self.ok
+            def resumable(self, s):
+                raise AssertionError("记录能接不等于缓存命中，当前不应按它自动续接")
         h = Host()
         self.assertEqual(thread({}, "探索", h), ("new", False, None))
-        self.assertEqual(thread({"threads": {"探索": "abc"}}, "探索", h), ("abc", True, "abc"))          # 旧的存法照旧认
-        self.assertEqual(thread({"threads": {"探索": {"host": "claude", "session": "abc"}}}, "探索", h), ("abc", True, "abc"))
+        self.assertEqual(thread({"threads": {"探索": "abc"}}, "探索", h), ("new", False, "abc"))          # 旧的存法保留来路
+        self.assertEqual(thread({"threads": {"探索": {"host": "claude", "session": "abc"}}}, "探索", h), ("new", False, "abc"))
         self.assertEqual(thread({"threads": {"探索": {"host": "codex", "session": "abc"}}}, "探索", h), ("new", False, "abc"))  # 换了宿主
         h.ok = False
         self.assertEqual(thread({"threads": {"探索": "abc"}}, "探索", h), ("new", False, "abc"))       # 太长了另开一段
+        for host in hosts.HOSTS.values():
+            new, resumed, prev = thread({"threads": {"探索": {"host": host.NAME, "session": "old"}}}, "探索", host)
+            self.assertEqual((resumed, prev), (False, "old"))
+            self.assertNotEqual(new, "old")
 
     def test_claude_resumable(self):
         h = Path(self.tmp.name) / "home"
@@ -92,8 +115,9 @@ class SelfTest(unittest.TestCase):
         got = awaken(n, datetime(2026, 11, 15, 10), self.root / "2026-11-15-探索", False, "abc",
                      datetime(2026, 11, 8, 1), self.root / "草稿")
         self.assertTrue(got.startswith("看看 mh 的现状。"))                                      # 便签在前，是我自己的话
-        self.assertIn("每：7 天，上次醒在 11-08 01:00", got)
+        self.assertIn("every: 7d，上次醒在 11-08 01:00", got)
         self.assertIn("另开一段", got)
+        self.assertNotIn("太长了", got)
         self.assertIn("草稿纸", got)
         self.assertIn("main 在", got)                                                          # 世界的现状由程序填
         self.assertNotIn("不会被采进记忆", got)                                                 # 那句只属于旧的方向探索
@@ -132,10 +156,33 @@ class SelfTest(unittest.TestCase):
         self.assertIn("mh", json.loads((h / "mcp.json").read_text())["mcpServers"])
         self.assertTrue((h / ".credentials.json").is_symlink())
 
+    @unittest.skipUnless(shutil.which("bwrap"), "没有 bwrap")
+    def test_confine(self):
+        """醒着的进程只写得了 self、草稿纸、宿主给的和记忆自己的记录；别处只读，/tmp 是自己的一块。"""
+        t = Path(self.tmp.name)
+        logs, host, mind, other = t / "logs", t / "host", t / "data", t / "other"
+        for d in (logs / confine.SCRATCHPAD, host, mind / "events", other):
+            d.mkdir(parents=True)
+        cred = t / "cred.json"
+        cred.write_text("{}")
+        (host / "cred.json").symlink_to(cred)
+        got = confine.writable(self.root, logs, [host, host / "cred.json", t / "没有"], mind)
+        self.assertEqual(got, [self.root.resolve(), (logs / confine.SCRATCHPAD).resolve(), host.resolve(), cred.resolve(),
+                               (mind / "events").resolve()])                          # 链接绑指向的；不存在的跳过；日志本身不给
+        targets = (self.root, logs / confine.SCRATCHPAD, mind / "events", logs, other, REPO)
+        sh = "; ".join(f"echo x > {p}/self-confine-test 2>/dev/null" for p in targets) + f"; echo x > {cred}; pwd"
+        out = subprocess.run(confine.wrap(["sh", "-c", sh], self.root, logs, [host, host / "cred.json"], mind),
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        self.assertEqual(out, [str(self.root.resolve())])
+        # 看外面真留下了什么（测试落在 /tmp 下，沙箱里的 /tmp 是另一块，写进去的不会出来）
+        self.assertEqual([(p / "self-confine-test").exists() for p in targets], [True, True, True, False, False, False])
+        self.assertEqual(cred.read_text(), "x\n")
+
     def test_hosts_contract(self):
         """每个接入的宿主都实现了接入标准里的那组函数。"""
         for name, m in hosts.HOSTS.items():
             self.assertEqual(m.NAME, name)
+            self.assertTrue(isinstance(getattr(m, "MODEL", None), str) and m.MODEL, f"{name}.MODEL")
             for f in ("ready", "new_session", "resumable", "launch", "outcome", "actions"):
                 self.assertTrue(callable(getattr(m, f, None)), f"{name}.{f}")
         self.assertIn(hosts.DEFAULT, hosts.HOSTS)
@@ -143,8 +190,8 @@ class SelfTest(unittest.TestCase):
     def test_section(self):
         now = datetime(2026, 11, 22, 10)
         self.assertEqual(section("/elsewhere", now, self.root, {}, {}), [])                    # 只给 memory-harness
-        self.note("命名影子", "到：2026-11-22\n---\n我想看命名影子攒了几次。")
-        self.note("还早", "到：2026-12-01\n---\n还没到")
+        self.note("命名影子", "at: 2026-11-22\n---\n我想看命名影子攒了几次。")
+        self.note("还早", "at: 2026-12-01\n---\n还没到")
         self.note("怪", "下周二\n---\n正文")
         w = self.root / "2026-11-15-探索"
         w.mkdir()

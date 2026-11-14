@@ -19,6 +19,11 @@ SELF_ROOT = HOME / "claude-self-home/projects"   # self 工作区的会话（202
 # 用户第一句话作为材料嵌在里面。不是对话，记成 kind = title（采集只收 user），免得那句话被当成另一段会话再记一次。
 _TITLE_PROMPT = "You generate session titles."
 
+# 无头调用（`claude -p`，entrypoint = sdk-cli）在主配置目录里只有脚本和测试：11-10 测 cc switch 连发的 27 段一轮会话、
+# 起标题的“Name this chat”、定时巡检，没有人在场对话。记成 kind = headless，采集不收。self 叫醒也是 claude -p，
+# 但在自己的配置目录（SELF_ROOT），照常收。
+_HEADLESS = "sdk-cli"
+
 
 def files():
     yield from sorted(ROOT.glob("*/*.jsonl"))
@@ -58,6 +63,7 @@ def parse(path):
     记下它接在哪一轮之后（Turn.prev），被放弃的那条分支照常观察（2026-10-10）。"""
     session = Session("claude", path.stem, str(path))
     turns, cur, texts, stop = [], None, {}, None
+    entry = None     # 第一条用户条目的 entrypoint
     owner = {}       # 消息 uuid → 它所在的轮次序号（-1 = 第一轮之前）
     pending, replies = None, {}   # 两轮之间别的会话发来的消息（记在前一轮的 asides）和“我”对它的回答（消息 ID → 文字）
 
@@ -78,6 +84,8 @@ def parse(path):
             except json.JSONDecodeError:
                 continue
             t = o.get("type")
+            if t == "user" and entry is None and o.get("entrypoint"):
+                entry = o["entrypoint"]
             if o.get("cwd") and not session.cwd:
                 session.cwd = o["cwd"]
                 session.started = o.get("timestamp", "")
@@ -112,6 +120,7 @@ def parse(path):
             elif t == "assistant" and cur is not None and not o.get("isSidechain"):
                 msg = o.get("message") or {}
                 session.model = msg.get("model", session.model)
+                cur.note_model(msg.get("model"))
                 if msg.get("stop_reason"):
                     stop = msg["stop_reason"]
                 # 同一条消息按内容块分多行写入，用消息 ID 拼回
@@ -135,4 +144,6 @@ def parse(path):
     close(stop == "end_turn")
     if turns and turns[0].user.startswith(_TITLE_PROMPT):
         session.kind = "title"
+    elif entry == _HEADLESS and SELF_ROOT not in path.parents:
+        session.kind = "headless"
     return session, turns

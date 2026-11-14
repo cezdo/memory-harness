@@ -382,6 +382,37 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertNotIn("naming", meta())
         self.assertEqual(a, b)
 
+    def test_cognition(self):
+        """v0.43：relive 认 C 的句柄、名字、别名；理列出它的事，事标出属于哪条理；evoke 的查词对上理的名字或别名时页首提一行；
+        取了哪条 C 记进足迹。"""
+        from ...engram import cognize
+        L = pull.layers(self.conn)
+        sids = list(L.stmts)[:2]
+        act = st.occurrence(self.conn, "act", st.main_operator(self.conn, "test"), cause="manual", outcome="ok")
+        ids = []
+        for i, sid in enumerate(sids):
+            ref = cognize.pin(self.conn, "form_record", sid)
+            ids.append(cognize.write(self.conn, act, "concrete", f"第{i}件事", [{"text": f"这里落成了{i}。", "refs": [ref]}], [dict(ref, rel="part")]))
+        refs = [{"kind": "cognition", "id": i} for i in ids]
+        top = cognize.write(self.conn, act, "abstract", "先问谁在用", [{"text": "先问谁在用它。", "refs": refs}], [dict(r, rel="instance") for r in refs])
+        cognize.alias(self.conn, act, top, "读的人")
+        self.conn.commit()
+        inputs = lambda: json.loads(self.conn.execute("SELECT inputs FROM occurrence WHERE role='use' ORDER BY id DESC LIMIT 1").fetchone()[0])
+        a = pull.relive(self.conn, [f"C{top}"], **self.kw)
+        self.assertIn(f"[C{top}] 先问谁在用（理，已验证，别名：读的人）", a)
+        self.assertIn(f"先问谁在用它。 ← C{ids[0]}、C{ids[1]}", a)
+        self.assertIn(f"- C{ids[0]} 第0件事：这里落成了0。", a)
+        self.assertEqual(inputs()["cognition"], [top, *ids])
+        self.assertEqual(pull.relive(self.conn, ["读的人"], **self.kw), a)
+        b = pull.relive(self.conn, [f"C{ids[0]}"], **self.kw)
+        self.assertIn(f"（事，已验证，属于 C{top} 先问谁在用）", b)
+        self.assertIn(f"这里落成了0。 ← {L.stmts[sids[0]]['h']}", b)
+        self.assertIn("没有这个认知", pull.relive(self.conn, ["C999"], **self.kw))
+        e = pull.evoke(self.conn, ["读的人", "甲服务"], **self.kw)
+        self.assertIn(f"认知（relive 读全文）：C{top} 先问谁在用", e)
+        self.assertEqual(inputs()["cognition"], [top])
+        self.assertNotIn("认知（", pull.evoke(self.conn, ["第0件事"], session="t2", purpose="dev", cwd="/w"))   # 只认理
+
     def test_stmt_day(self):
         """v0.40：陈述的日期取它的 E 出自的轮次里最晚的那天；读视图里缓存。"""
         L = pull.layers(self.conn)
@@ -682,7 +713,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
 
     def test_mcp(self):
         names = [t["name"] for t in mcp.handle(self.conn, {"id": 1, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["evoke", "relive", "roam", "yorimichi"])      # v0.36 撤了 feedback，v0.41 撤了 observe-now
+        self.assertEqual(names, ["evoke", "relive", "roam", "yorimichi", "shiori"])      # v0.36 撤了 feedback，v0.41 撤了 observe-now，v0.44 加 shiori
         r = mcp.handle(self.conn, {"id": 2, "method": "tools/call",
                                    "params": {"name": "relive", "arguments": {"handles": ["s-1"], "session": "t"}}})["result"]
         self.assertFalse(r["isError"])
@@ -703,6 +734,19 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
                                         "params": {"name": "evoke", "arguments": {"words": ["X 升级"], "grain": "L", "session": "t"}}})["result"]
         self.assertTrue(hidden["isError"])                          # 真带了照常报参数不对
         self.assertIn("没有参数 grain", hidden["content"][0]["text"])
+
+    def test_mcp_unplugged(self):
+        """不接 mh 的目录（[connect].unplugged，2026-11-14）：在那里起的服务不给工具；按参数带的 cwd 调用也不查、不留足迹。"""
+        from unittest.mock import patch
+        from ...engram.store import instance
+        with patch.object(instance, "UNPLUGGED", ("/t/x",)):
+            with patch("os.getcwd", lambda: "/t/x/a"):
+                self.assertEqual(mcp.handle(self.conn, {"id": 1, "method": "tools/list"})["result"]["tools"], [])
+            before = self.conn.execute("SELECT count(*) FROM use_detail").fetchone()[0]
+            r = mcp.handle(self.conn, {"id": 2, "method": "tools/call", "params": {"name": "evoke",
+                           "arguments": {"words": ["X"], "session": "t", "cwd": "/t/x"}}})["result"]
+            self.assertEqual(r["content"][0]["text"], mcp.UNPLUGGED_SAID)
+            self.assertEqual(self.conn.execute("SELECT count(*) FROM use_detail").fetchone()[0], before)
 
 
 for _name in [n for n in dir(ft.FormTest) if n.startswith("test_")]:

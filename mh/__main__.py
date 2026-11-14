@@ -139,10 +139,20 @@ def main():
         x.add_argument("--page", type=int, default=None, help="第几页，从 1 起（一页 8 条）")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
     top.add_parser("reply", help="回复：在实例配置 [reply] 的群里被叫到时回几句（常驻，memory-harness-reply 服务跑它）")
+    lk = top.add_parser("links", help="机器连接：列出现在到登记表里那几台机器的连接、按标识对上，标认不出和未知；"
+                                      "--errors 把最近两小时的报错按标识归过来")
+    lk.add_argument("--registry", type=Path, help="登记表（默认 <仓库>/tmp/links/registry.toml）")
+    lk.add_argument("--errors", action="store_true", help="连最近两小时的报错一起看")
+    lk.add_argument("--json", action="store_true", help="给程序读")
     qa = top.add_parser("quota", help="额度查询（只读；部署自己接，公开包不带）")
     qa.add_argument("names", nargs="*", help="只看这几家")
     qa.add_argument("--json", action="store_true")
     qa.add_argument("--wait", action="store_true", help="只看一家：用完了就打印要等到的 unix 秒，没用完打印 0，读不到打印 -1")
+    top.add_parser("unplug", help="拔掉 mh 起宿主：unplug <claude|codex|dsh> [宿主参数…]，独立 home、不接 mh，测试用（会话不进记忆）")
+    if sys.argv[1:2] == ["unplug"]:                           # 后面的参数原样交给宿主，不经 argparse
+        from .synapse.hosts import unplug
+        unplug.main(sys.argv[2:])
+        return
     args = ap.parse_args(_grouped(sys.argv[1:]))
     if args.cmd == "engram" and args.action == "serve":       # 常驻，不开库
         from .engram import observe
@@ -305,6 +315,9 @@ def main():
         from .synapse.track import cite
         conn = estore.connect(estore.DEFAULT_DB)
         print(f"补成 use：form 内部的拉取 {track.backfill_internal(conn)} 条；引用回填 {'，出错 '.join(map(str, cite.backfill(conn)))} 轮")
+    elif args.cmd == "links":
+        from .links import report
+        sys.exit(report(args.registry, args.errors, args.json))
     elif args.cmd == "quota":
         try:
             from .rhythm import quota

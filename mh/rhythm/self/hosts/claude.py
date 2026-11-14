@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ....engram import store
+from .. import confine
 
 NAME = "claude"
 REPO = Path(__file__).resolve().parents[4]
@@ -27,11 +28,11 @@ def hooks(repo=REPO):
         "SessionStart": [{"hooks": [cmd(f"cd {repo} && python3 -m mh inject")]}],
         "UserPromptSubmit": [{"hooks": [cmd(f"cd {repo} && python3 -m mh.synapse.push.associate"),
                                         cmd(f"{py}/mh/engram/observe/switch/hook.py claude"),
-                                        cmd(f"{py}/mh/synapse/push/elevate/hook.py claude prompt")]}],
+                                        cmd(f"{py}/mh/engram/elevate/hook.py claude prompt")]}],
         "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                        "hooks": [cmd(f"{py}/mh/synapse/push/elevate/hook.py claude pre")]}],
-        "PostToolUse": [{"hooks": [cmd(f"{py}/mh/synapse/push/elevate/hook.py claude post")]}],
-        "Stop": [{"hooks": [cmd(f"{py}/mh/synapse/push/elevate/hook.py claude stop"),
+                        "hooks": [cmd(f"{py}/mh/engram/elevate/hook.py claude pre")]}],
+        "PostToolUse": [{"hooks": [cmd(f"{py}/mh/engram/elevate/hook.py claude post")]}],
+        "Stop": [{"hooks": [cmd(f"{py}/mh/engram/elevate/hook.py claude stop"),
                             cmd(f"{py}/mh/engram/observe/switch/hook.py claude stop")]}]}
 
 
@@ -83,7 +84,7 @@ def launch(root, text, session, resumed, logs):
     args += ["--resume", session] if resumed else ["--session-id", session]
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(h))
     with open(text) as stdin, open(Path(logs) / "run.jsonl", "w") as out, open(Path(logs) / "run.err", "w") as err:
-        return subprocess.Popen(args, stdin=stdin, stdout=out, stderr=err, cwd=root, env=env, start_new_session=True)
+        return subprocess.Popen(confine.wrap(args, root, logs, [h, Path.home() / ".claude/.credentials.json"]), stdin=stdin, stdout=out, stderr=err, cwd=root, env=env, start_new_session=True)
 
 
 def _events(logs):

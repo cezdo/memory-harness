@@ -6,11 +6,21 @@
 记录追加到数据目录的 souhatsu-switch.jsonl：时间、宿主、会话 ID、开还是关、原话。读状态就是找这个会话最后一行（每轮要最新的）；
 观察循环的采集把它收成 turn 进库（observe 的 switch 来源，origin 是用户，2026-10-30 runbook N3），足迹、检查从库里看。
 钩子读不到、写不进都不挡用户：命令文件和 skill 还在，命令照常发给模型，模型只回一句确认。
+
+命令文件在 `mh/skills/<名字>/claude/<名字>.md`、`codex/<名字>/SKILL.md`（2026-11-14 从 `push/switch/` 搬来），
+`install()` 把它们链接到两个宿主（`~/.claude/commands/`、`~/.codex/skills/`），旧位置的链接就地换掉。
 """
 import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ....engram.store import HOME
+
+HERE = Path(__file__).parent
+SKILL = HERE.parents[2] / "skills"      # 命令和 skill 的源文件（2026-11-14 归 mh/skills/）
+OLD = ("mh/synapse/push/switch/",)      # 搬家前的位置：宿主里指向它的链接就地换成新的，不并存（11-14）
+NAMES = ("no-souhatsu", "do-souhatsu")
 
 LOG = HOME / "souhatsu-switch.jsonl"
 COMMANDS = {"/no-souhatsu": "off", "$no-souhatsu": "off", "/do-souhatsu": "on", "$do-souhatsu": "on"}
@@ -62,3 +72,29 @@ def handle(d, host, stdout, stderr, log=None):
         return 2
     json.dump({"decision": "block", "reason": SAID[want]}, stdout, ensure_ascii=False)
     return 0
+
+
+def _link(src, dst, apply):
+    if dst.is_symlink() and dst.resolve() == src.resolve():
+        return None
+    if dst.is_symlink() and any(o in str(Path(os.readlink(dst))) for o in OLD):    # 指向搬家前的位置：换掉
+        if apply:
+            dst.unlink()
+            dst.symlink_to(src)
+        return f"{dst} → {src}（原来指向旧位置）"
+    if dst.exists() or dst.is_symlink():
+        raise FileExistsError(f"{dst} 已存在且不是指向 {src} 的链接，先看清再处理")
+    if apply:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src)
+    return f"{dst} → {src}"
+
+
+def install(home=Path.home(), apply=False):
+    """装联想开关的 Claude Code 命令、codex skill（符号链接到 `mh/skills/`，改仓库即生效）。apply=False 只列要做什么；
+    宿主里指向搬家前位置的链接就地换掉。钩子（`push/associate.py`）由宿主接入单独装，不在这里做。返回做了什么。"""
+    done = []
+    for name in NAMES:
+        done.append(_link(SKILL / name / "claude" / f"{name}.md", home / ".claude/commands" / f"{name}.md", apply))
+        done.append(_link(SKILL / name / "codex" / name, home / ".codex/skills" / name, apply))
+    return [x for x in done if x]

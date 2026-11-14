@@ -63,8 +63,8 @@ Optional tools default to paths under `/usr/local/mh-tools/`: `ltp/venv/bin/pyth
 Install the core-editing command and hooks separately. Preview first, then apply if wanted:
 
 ```sh
-python3 -m mh.synapse.push.elevate
-python3 -m mh.synapse.push.elevate --apply
+python3 -m mh.engram.elevate
+python3 -m mh.engram.elevate --apply
 ```
 
 The installer adds a command or skill and hooks for Claude Code and Codex. Trust new Codex hooks in `/hooks`. Enter `/mhcore <request>` in Claude Code or `$mhcore <request>` in Codex to allow core edits for that turn. The window closes at turn end, on the next input, or after 30 minutes. Changes are logged in `$MH_HOME/kernel-log.jsonl`. Granting and blocking have been tested in Claude Code; Codex host enforcement still needs live verification, and dsh support is pending. Hooks check edit-tool target paths; shell writes are recorded by later comparison. Hook errors allow the operation and write an error log.

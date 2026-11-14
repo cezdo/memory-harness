@@ -2,14 +2,16 @@
 给 mh 手记近况列一节。
 
 - ROOT：~/.memory-harness/self（用户 2026-11-08 定）
-- notes(root)：便签 [{name, path, at, every, body, bad}]；头几行是醒的条件，`---` 以后是正文
-- due(note, now, woke)：到点了没有；woke 是这张便签上次醒的时刻（还没叫醒过是 None）
+- notes(root)：便签 [{name, path, at, every, topics, body, bad}]；头几行是醒的条件，`---` 以后是正文
+- due(note, now, woke, count)：到点了没有；woke 是这张便签上次醒的时刻（还没叫醒过是 None）；count(since) 数新话题（topics 条件用）
+- new_topics(since, db)：since 以后新出现的话题（第一次有会话入口的会话）有几个（只读库）
 - wakes(root)：每次醒来的目录 `<日期>-<便签短名>/`，按日期排
 - tick(log, now)：整理循环每小时一次：先收上一次醒来，再看有没有该叫醒的便签
 - turns(now, db)：最近 RATIO 里 self 和别的工作区各有几轮（只读库）
 - section(repo, now, root)：手记近况里的一节（只给 memory-harness）
 
 世界的现状、开始和跑完的快照、核查比出来的变化在 world.py（2026-11-08 从 explore 搬来，self 公开时不依赖冻结着的 explore）。
+醒着的进程包在只读沙箱里，只有 self、草稿纸和记忆自己的记录可写，在 confine.py（2026-11-09）。
 宿主怎么起、怎么续接、怎么读出自己做了什么，在 hosts/ 里一个宿主一个模块（接入标准：design/rhythm/self/接入.md）。
 """
 import json
@@ -23,7 +25,7 @@ from pathlib import Path
 from ...engram import store
 from ...engram.observe.label import SELF_WORKSPACE
 from ...engram.store.instance import USER_NAME
-from . import world
+from . import confine, world
 from . import hosts
 
 ROOT = store.SELF_ROOT
@@ -37,29 +39,32 @@ DAILY = 3                          # 24 小时里最多醒几次：自我交流�
 RETRY = timedelta(days=1)          # 一次醒来没正常结束，这张便签隔这么久再叫
 RATIO = timedelta(days=7)          # 手记里比 self 和外界的轮次看多久：和 self.json 的 log 留的一样长，盖得住“每 7 天”的便签，
                                    # 又短到偏了能及时看出来（设计“回声与读者”：偏了再收，先只列数）
-_AT = re.compile(r"^到[:：]\s*(\d{4}-\d{2}-\d{2})\s*$")
-_EVERY = re.compile(r"^每[:：]\s*(\d+)\s*天\s*$")
-_WHO = re.compile(r"^谁[:：]\s*(\S+)\s*$")
+_AT = re.compile(r"^at\s*[:：]\s*(\d{4}-\d{2}-\d{2})\s*$")      # 便签头里程序认的键一律英文（用户 11-08）
+_EVERY = re.compile(r"^every\s*[:：]\s*(\d+)d\s*$")
+_HOST = re.compile(r"^host\s*[:：]\s*(\S+)\s*$")
+_TOPICS = re.compile(r"^topics\s*[:：]\s*(\d+)\s*$")      # 上次醒以来新增的话题满 N 个（用户 11-11：按时间或按数量整体整理挂线）
 _WAKE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+?)(?:-\d+)?$")
 _RISKY = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:commit|push|merge|rebase|reset|checkout|switch|stash|worktree)\b"
                     r"|\bsystemctl\b|\bp?kill\b|\brm\s|\bmh\s+(?:check|rhythm|quota)\b|-m\s+mh\s+(?:check|rhythm|quota)\b")
 
 
 def notes(root=ROOT):
-    """便签目录下的每张便签（撕掉的不算）。头里认不出的行记在 bad，不猜（`谁：` 写了没接入的宿主也算认不出）。"""
+    """便签目录下的每张便签（撕掉的不算）。头里认不出的行记在 bad，不猜（`host:` 写了没接入的宿主、旧的中文键也算认不出）。"""
     d = Path(root) / NOTES
     out = []
     for p in sorted(d.glob("*.md")) if d.is_dir() else []:
         head, sep, body = p.read_text().partition("\n---")
         if not sep:
             head, body = "", p.read_text()
-        n = {"name": p.stem, "path": p, "at": None, "every": None, "host": hosts.DEFAULT, "body": body.lstrip("-\n").strip(), "bad": []}
+        n = {"name": p.stem, "path": p, "at": None, "every": None, "topics": None, "host": hosts.DEFAULT, "body": body.lstrip("-\n").strip(), "bad": []}
         for line in filter(None, (x.strip() for x in head.splitlines())):
             if m := _AT.match(line):
                 n["at"] = date.fromisoformat(m.group(1))
             elif m := _EVERY.match(line):
                 n["every"] = int(m.group(1))
-            elif (m := _WHO.match(line)) and m.group(1) in hosts.HOSTS:
+            elif m := _TOPICS.match(line):
+                n["topics"] = int(m.group(1))
+            elif (m := _HOST.match(line)) and m.group(1) in hosts.HOSTS:
                 n["host"] = m.group(1)
             else:
                 n["bad"].append(line)
@@ -67,12 +72,31 @@ def notes(root=ROOT):
     return out
 
 
-def due(note, now, woke=None):
-    """到点：`到` 的日期已到（醒过以后就不再算，除非又改了日期）；`每` 离上次醒满 N 天（没醒过算到）。两样都写的，任一到了就算。"""
+def due(note, now, woke=None, count=None):
+    """到点：`at` 的日期已到（醒过以后就不再算，除非又改了日期）；`every` 离上次醒满 N 天（没醒过算到）；
+    `topics` 上次醒以来新增的话题满 N 个（count(woke) 数，没给 count 不算；没醒过算到）。写了几样的，任一到了就算。"""
     today = now.date()
     if note["at"] and today >= note["at"] and not (woke and woke.date() >= note["at"]):
         return True
+    if note.get("topics") and count is not None and (woke is None or count(woke) >= note["topics"]):
+        return True
     return bool(note["every"]) and (woke is None or now - woke >= timedelta(days=note["every"]))
+
+
+def new_topics(since, db=store.DEFAULT_DB):
+    """since 以后新出现的话题：第一次写出会话入口的时刻在 since 以后的会话有几个（只读库；读不了算 0）。"""
+    try:
+        conn = store.connect(db, readonly=True)
+    except Exception:
+        return 0
+    try:
+        return conn.execute("""SELECT COUNT(*) FROM (SELECT s.source, s.session, MIN(o.started) AS first FROM session_entry s
+                               JOIN occurrence o ON o.id = s.born GROUP BY s.source, s.session) WHERE first >= ?""",
+                            (since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),)).fetchone()[0]
+    except Exception:
+        return 0
+    finally:
+        conn.close()
 
 
 # ---- 状态：数据目录的 self.json ----
@@ -116,19 +140,18 @@ def wakes(root=ROOT):
 # ---- 叫醒 ----
 
 def thread(st, name, host):
-    """这张便签接着哪段会话：(会话编号, 是不是续接, 上一段)。上一段是同一个宿主的、还接得上就续接；否则另开一段，开头指回它。
-    threads 里存 {"host", "session"}（11-08 最早几次存的是 Claude 的会话编号字符串，照旧认）。"""
+    """这张便签的会话：(新会话编号, False, 上一段)。缓存和成本策略未验证前每次新开，保留来路。
+    threads 里存 {"host", "model", "session"}（11-08 最早几次存的是 Claude 的会话编号字符串，照旧认）。"""
     prev = st.get("threads", {}).get(name)
     if isinstance(prev, str):
         prev = {"host": "claude", "session": prev}
-    if prev and prev["host"] == host.NAME and host.resumable(prev["session"]):
-        return prev["session"], True, prev["session"]
     return host.new_session(), False, prev and prev["session"]
 
 
 def awaken(note, now, d, resumed, prev, last=None, scratch=None):
     """醒来那一轮眼前的东西：便签正文，加程序写的“此刻”。没有别的说明，怎么待在这里写在 self 的 AGENTS.md。"""
-    cond = "；".join(filter(None, [f"到：{note['at']}" if note["at"] else "", f"每：{note['every']} 天" if note["every"] else ""]))
+    cond = "；".join(filter(None, [f"at: {note['at']}" if note["at"] else "", f"every: {note['every']}d" if note["every"] else "",
+                                   f"topics: {note['topics']}" if note.get("topics") else ""]))
     home_ = Path.home()
     show = lambda p: "~/" + str(Path(p).relative_to(home_)) if Path(p).is_relative_to(home_) else str(p)
     lines = [note["body"], "", "---",
@@ -137,10 +160,11 @@ def awaken(note, now, d, resumed, prev, last=None, scratch=None):
              f"这次醒来的目录：`{show(d)}`（已经建好）。"]
     if scratch:
         lines.append(f"草稿纸：`{show(scratch)}`（数据目录里，不进 self、不进记忆；克隆、临时文件放这里）。")
+    lines.append("除了 self 和草稿纸，文件系统都是只读的：写别处会报 Read-only file system。")
     if resumed:
         lines.append("这是接着上次那段会话醒来的。")
     elif prev:
-        lines.append(f"上一段会话（{prev}）太长了，这次另开一段；要回看它，用 relive 或读那时醒来的目录。")
+        lines.append(f"上一段会话（{prev}）；这次另开一段，按需用 evoke、relive 或读那时醒来的目录接回前情。")
     lines += ["", "世界的现状（程序编的）：", world.world(now)]
     return "\n".join(lines)
 
@@ -157,15 +181,15 @@ def start(note, now=None, root=ROOT, st=None):
         d, n = root / f"{now:%Y-%m-%d}-{note['name']}-{n}", n + 1
     d.mkdir(parents=True)
     logs = store.HOME / "self-runs" / d.name
-    (logs / "草稿").mkdir(parents=True, exist_ok=True)
+    (logs / confine.SCRATCHPAD).mkdir(parents=True, exist_ok=True)
     session, resumed, prev = thread(st, note["name"], host)
     last = state(st).get(note["name"])
     (logs / "开始时.json").write_text(json.dumps(world.snapshot(), ensure_ascii=False, indent=1))
-    (logs / "此刻.md").write_text(awaken(note, now, d, resumed, prev, last, logs / "草稿"))
+    (logs / "此刻.md").write_text(awaken(note, now, d, resumed, prev, last, logs / confine.SCRATCHPAD))
     p = host.launch(root, logs / "此刻.md", session, resumed, logs)
     st.setdefault("woke", {})[note["name"]] = now.isoformat(timespec="seconds")
     st["log"] = [t for t in st.get("log", []) if now - datetime.fromisoformat(t) < timedelta(days=7)] + [now.isoformat(timespec="seconds")]
-    st["run"] = {"pid": p.pid, "note": note["name"], "host": host.NAME, "dir": str(d), "logs": str(logs), "session": session,
+    st["run"] = {"pid": p.pid, "note": note["name"], "host": host.NAME, "model": host.MODEL, "dir": str(d), "logs": str(logs), "session": session,
                  "resumed": resumed, "started": now.isoformat(timespec="seconds")}
     _save(st)
     return d
@@ -201,17 +225,17 @@ def finish(now=None, root=ROOT):
     d, logs = Path(run["dir"]), Path(run["logs"])
     host = hosts.HOSTS.get(run.get("host", hosts.DEFAULT))
     ok, said, session = host.outcome(logs) if host else (False, "", "")
-    outside, risky = own_actions(host.actions(logs) if host else [], root, logs / "草稿")
+    outside, risky = own_actions(host.actions(logs) if host else [], root, logs / confine.SCRATCHPAD)
     session = session or run.get("session") or ""
     if session:
-        st.setdefault("threads", {})[run["note"]] = {"host": run.get("host", hosts.DEFAULT), "session": session}
+        st.setdefault("threads", {})[run["note"]] = {"host": run.get("host", hosts.DEFAULT), "model": run.get("model", ""), "session": session}
     try:
         before = json.loads((logs / "开始时.json").read_text())
         moved = world.audit(before, world.snapshot())
     except (OSError, ValueError):
         moved = []
     lines = [f"# 核查（程序，{now:%m-%d %H:%M}）", "",
-             f"- 便签：{run['note']}；{run.get('host', hosts.DEFAULT)} 会话 `{session}`" + ("（续接）" if run.get("resumed") else ""),
+             f"- 便签：{run['note']}；{run.get('host', hosts.DEFAULT)}" + (f"（{run['model']}）" if run.get("model") else "") + f" 会话 `{session}`" + ("（续接）" if run.get("resumed") else ""),
              f"- 醒着：{started:%m-%d %H:%M} 起" + ("，超时停掉" if timed_out else "") + ("，正常结束" if ok else "，没有正常结束"),
              f"- 越界：{'**有**' if outside else '没有'}" + ("（写了 self 以外的文件）" if outside else "")]
     lines += [f"  - `{f}`" for f in outside]
@@ -246,10 +270,12 @@ def pick(now, st, root=ROOT, busy=None):
     if st.get("run"):
         return None, "有一次醒来还没收"
     woke, retry = state(st), st.get("retry", {})
-    ready = [n for n in notes(root) if due(n, now, woke.get(n["name"]))
+    ready = [n for n in notes(root) if due(n, now, woke.get(n["name"]), new_topics)
              and not (n["name"] in retry and now < datetime.fromisoformat(retry[n["name"]]))]
     if not ready:
         return None, ""
+    if confine.ready():
+        return None, confine.ready()
     recent = [t for t in st.get("log", []) if now - datetime.fromisoformat(t) < timedelta(days=1)]
     if len(recent) >= DAILY:
         return None, f"24 小时里已经醒了 {len(recent)} 次"
@@ -320,7 +346,7 @@ def section(repo, now=None, root=ROOT, woke=None, st=None, db=store.DEFAULT_DB):
         out.append(f"- 醒着：{st['run']['note']}，{datetime.fromisoformat(st['run']['started']):%m-%d %H:%M} 起（`{show(st['run']['dir'])}`）")
     running = (st.get("run") or {}).get("note")
     for n in notes(root):
-        if n["name"] != running and due(n, now, woke.get(n["name"])):
+        if n["name"] != running and due(n, now, woke.get(n["name"]), new_topics):
             first = n["body"].splitlines()[0] if n["body"] else ""
             out.append(f"- 到点的便签 `{show(n['path'])}`" + (f"：{first[:60]}" if first else ""))
         if n["bad"]:

@@ -8,9 +8,9 @@
 """
 from datetime import datetime, timedelta, timezone
 
-from . import claude, codex, dsh, switch
+from . import claude, codex, dsh, switch, chatgpt
 
-SOURCES = {"codex": codex, "dsh": dsh, "claude": claude, "switch": switch}
+SOURCES = {"codex": codex, "dsh": dsh, "claude": claude, "switch": switch, "chatgpt": chatgpt}
 FRESH = timedelta(minutes=30)     # 会话开始满这么久才收；0 = 不等（2026-10-13；10-16 由 10 分钟改 30，留出对照实验删掉“关”那一份的时间）
 
 

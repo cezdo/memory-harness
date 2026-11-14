@@ -8,12 +8,13 @@
 读日志照 Linux 的内核日志（dmesg，2026-10-30）：一条一行、前缀固定（编号、时刻、级别、谁、种类、会话、摘要），按级别筛，
 连着的同类折成一行；diff、哈希留在原件里，按编号展开（view、detail）。grant 的原话、edit 那一轮本来就在宿主的会话记录里，
 采集已经收进库，日志不再收一遍（runbook N3）。
-设计见 design/synapse/设计.md“内核态”。
+设计见 design/engram/elevate/设计.md（2026-11-13 从 Synapse 搬来：core.md 是正本，改它的门归 Engram）。
 """
 import difflib
 import fcntl
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -275,9 +276,18 @@ EVENTS = {"UserPromptSubmit": ("prompt", None), "PreToolUse": ("pre", {"claude":
           "PostToolUse": ("post", None), "Stop": ("stop", None)}
 
 
+SKILL = HERE.parents[1] / "skills/mhcore"      # 命令和 skill 的源文件（2026-11-13 归 mh/skills/）
+OLD = ("mh/synapse/push/elevate/",)             # 搬家前的位置：宿主里指向它的链接、钩子就地换成新的，不并存（11-13）
+
+
 def _link(src, dst, apply):
     if dst.is_symlink() and dst.resolve() == src.resolve():
         return None
+    if dst.is_symlink() and any(o in str(Path(os.readlink(dst))) for o in OLD):    # 指向搬家前的位置：换掉
+        if apply:
+            dst.unlink()
+            dst.symlink_to(src)
+        return f"{dst} → {src}（原来指向旧位置）"
     if dst.exists() or dst.is_symlink():
         raise FileExistsError(f"{dst} 已存在且不是指向 {src} 的链接，先看清再处理")
     if apply:
@@ -294,6 +304,13 @@ def _hooks(path, host, python, apply):
     added = []
     for name, (event, matchers) in EVENTS.items():
         groups = hooks.setdefault(name, [])
+        for g in groups:                       # 搬家前的路径：就地换成新的
+            for h in g.get("hooks", []):
+                cmd = h.get("command", "")
+                for o in OLD:
+                    if f"{o}hook.py {host} {event}" in cmd:
+                        h["command"] = re.sub(r"\S*" + re.escape(o) + r"hook\.py", str(script), cmd)
+                        added.append(f"{name}（换路径）")
         if any(f"{script} {host} {event}" in h.get("command", "") for g in groups for h in g.get("hooks", [])):
             continue
         g = {"hooks": [{"type": "command", "command": f"{python} -I -S {script} {host} {event}", "timeout": 5}]}
@@ -314,8 +331,8 @@ def _hooks(path, host, python, apply):
 def install(home=Path.home(), python="/usr/bin/python3", apply=False):
     """装 Claude Code 命令、codex skill（符号链接到仓库）和两边的四个钩子；apply=False 只列要做什么。
     codex 的新钩子要用户在 codex 的 /hooks 里信任一次。dsh 还没接。"""
-    done = [_link(HERE / "claude/mhcore.md", home / ".claude/commands/mhcore.md", apply),
-            _link(HERE / "codex/mhcore", home / ".codex/skills/mhcore", apply),
+    done = [_link(SKILL / "claude/mhcore.md", home / ".claude/commands/mhcore.md", apply),
+            _link(SKILL / "codex/mhcore", home / ".codex/skills/mhcore", apply),
             _hooks(home / ".claude/settings.json", "claude", python, apply),
             _hooks(home / ".codex/hooks.json", "codex", python, apply)]
     return [x for x in done if x]

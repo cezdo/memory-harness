@@ -7,12 +7,13 @@
   - Claude Code、codex：UserPromptSubmit 钩子（hook.py）认出命令，记进数据目录的 observe-switch.jsonl，再拦下这次输入；
     同一个 hook.py 挂在 Stop 上叫醒观察循环（observe 设计“叫醒”）；
     这份记录由采集收成 turn（sources/switch.py），判定只看库。
-    命令文件（claude/*.md）和 skill（codex/*/SKILL.md）留着，让命令出现在补全里；钩子失败时命令照常发给模型，
+    命令文件（`mh/skills/<名字>/claude/<名字>.md`、`codex/<名字>/SKILL.md`，2026-11-14 归 `mh/skills/`）留着，让命令出现在补全里；钩子失败时命令照常发给模型，
     会话记录里留下原话（<command-name>/no-observe</command-name>、$no-observe），程序同样认；
   - dsh：插件命令（dsh/，web profile 的 bundle），会话日志里是 command/run，采集记成原话为 /no-observe、没有回复的一轮。
 - 只认整条消息就是命令的写法；讨论里提到 /no-observe 不算。
 """
 import json
+import os
 import re
 import shutil
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from pathlib import Path
 from ..sources.switch import SOURCE
 
 HERE = Path(__file__).parent
+SKILL = HERE.parents[2] / "skills"      # 命令和 skill 的源文件（2026-11-14 归 mh/skills/）
+OLD = ("mh/engram/observe/switch/",)    # 搬家前的位置：宿主里指向它的链接就地换成新的，不并存（11-14）
 _CLAUDE = re.compile(r"<command-name>\s*/(no|do)-observe\s*</command-name>")
 _PLAIN = re.compile(r"[/$](no|do)-observe")
 NAMES = ("no-observe", "do-observe")
@@ -71,43 +74,51 @@ def history(conn):
     return seen
 
 
-def _link(src, dst):
+def _link(src, dst, apply):
     if dst.is_symlink() and dst.resolve() == src.resolve():
         return None
+    if dst.is_symlink() and any(o in str(Path(os.readlink(dst))) for o in OLD):    # 指向搬家前的位置：换掉
+        if apply:
+            dst.unlink()
+            dst.symlink_to(src)
+        return f"{dst} → {src}（原来指向旧位置）"
     if dst.exists() or dst.is_symlink():
         raise FileExistsError(f"{dst} 已存在且不是指向 {src} 的链接，先看清再处理")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.symlink_to(src)
+    if apply:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src)
     return f"{dst} → {src}"
 
 
-def _hook(path, command, host, event="UserPromptSubmit", backed=None):
+def _hook(path, command, host, event="UserPromptSubmit", backed=None, apply=False):
     """把钩子加进宿主的 event（已经有就不动）；改之前留一份备份。backed：这次安装已经备份过的文件，同一个文件只备份一次
-    （开关和叫醒两个钩子改同一份配置，备份名精确到秒，跨秒时会多出一份）。"""
+    （开关和叫醒两个钩子改同一份配置，备份名精确到秒，跨秒时会多出一份）。apply=False 只列要做什么。"""
     data = json.loads(path.read_text()) if path.exists() else {}
     groups = data.setdefault("hooks", {}).setdefault(event, [])
     if any(str(HERE / "hook.py") in h.get("command", "") for g in groups for h in g.get("hooks", [])):
         return None
-    if path.exists() and (backed is None or path not in backed):
-        shutil.copy2(path, path.with_name(f"{path.name}.bak-observe-switch-{datetime.now():%Y%m%d-%H%M%S}"))
-        if backed is not None:
-            backed.add(path)
-    groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    if apply:
+        if path.exists() and (backed is None or path not in backed):
+            shutil.copy2(path, path.with_name(f"{path.name}.bak-observe-switch-{datetime.now():%Y%m%d-%H%M%S}"))
+            if backed is not None:
+                backed.add(path)
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     return f"{path}：{event} 加了 {host} 的{'开关' if event == 'UserPromptSubmit' else '叫醒'}钩子"
 
 
-def install(home=Path.home(), python="/usr/bin/python3"):
-    """装 Claude Code 命令、codex skill（符号链接到仓库，改仓库即生效）和两边的开关钩子、叫醒钩子（Stop）。codex 的新钩子要用户在
-    codex 里信任一次才会运行。dsh 的 bundle 要挂进 web profile、重启 dsh web，不在这里做（宿主由用户重启）。返回做了什么。"""
+def install(home=Path.home(), python="/usr/bin/python3", apply=False):
+    """装 Claude Code 命令、codex skill（符号链接到 `mh/skills/`，改仓库即生效）和两边的开关钩子、叫醒钩子（Stop）。
+    apply=False 只列要做什么；宿主里指向搬家前位置的链接就地换掉。codex 的新钩子要用户在 codex 里信任一次才会运行。
+    dsh 的 bundle 要挂进 web profile、重启 dsh web，不在这里做（宿主由用户重启）。返回做了什么。"""
     done = []
     for name in NAMES:
-        done.append(_link(HERE / "claude" / f"{name}.md", home / ".claude/commands" / f"{name}.md"))
-        done.append(_link(HERE / "codex" / name, home / ".codex/skills" / name))
+        done.append(_link(SKILL / name / "claude" / f"{name}.md", home / ".claude/commands" / f"{name}.md", apply))
+        done.append(_link(SKILL / name / "codex" / name, home / ".codex/skills" / name, apply))
     hook, backed = HERE / "hook.py", set()
-    done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude", "Claude Code", backed=backed))
-    done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex", "codex", backed=backed))
-    done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude stop", "Claude Code", "Stop", backed))
-    done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex stop", "codex", "Stop", backed))
+    done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude", "Claude Code", backed=backed, apply=apply))
+    done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex", "codex", backed=backed, apply=apply))
+    done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude stop", "Claude Code", "Stop", backed, apply))
+    done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex stop", "codex", "Stop", backed, apply))
     return [x for x in done if x]

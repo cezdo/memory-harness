@@ -22,7 +22,7 @@ import re
 
 from . import guard
 from ..store.instance import USER_NAME, USER_ALIASES   # 称呼在实例配置里：写记录用 USER_NAME，匹配时认 USER_ALIASES 里任何一个
-PLATFORMS = {"codex": "Codex", "dsh": "dsh（DeepSeek Harness）", "claude": "Claude Code"}
+PLATFORMS = {"codex": "Codex", "dsh": "dsh（DeepSeek Harness）", "claude": "Claude Code", "chatgpt": "ChatGPT"}
 
 _IDE = re.compile(r"<(ide_opened_file|ide_selection)>(.*?)</\1>\s*", re.S)
 _CMD = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
@@ -129,13 +129,39 @@ SELF_NOTE = (f"这段会话在 self 工作区：“我”自己的地方，只�
              f"“我”在这里定的只是“我打算”“我认为”，等{USER_NAME}在场时才落地。")
 
 
+def source_notes(row):
+    try:
+        source = row["source"]
+    except (KeyError, IndexError):
+        return []
+    if source != "chatgpt":
+        return []
+    notes = ["来源是 ChatGPT 静态导出：未提供工具执行记录和运行时结束标记；本轮最后一条助手正文按回答收录。"]
+    try:
+        address = json.loads(row["address"])
+    except (KeyError, IndexError):
+        address = {}
+    attachments = address.get("attachments") or []
+    if attachments:
+        notes.append("导出只含附件元数据，未取得附件正文：" + "、".join(a.get("name") or a.get("id") or "未命名附件" for a in attachments))
+    return notes
+
+
+def model_note(row):
+    try:
+        models = json.loads(row["models"])
+    except (KeyError, IndexError):
+        models = []
+    return "当时的我：" + (" → ".join(models) if models else "未知模型（来源未提供本轮记录）")
+
+
 def environment(row, model):
     """输入里的“环境”一节：对话平台、工作目录、当时的“我”、回看的“我”（总设计“我是谁”的两层环境）。
     self 工作区的会话再加一段：通篇是“我”的自言自语（SELF_NOTE，2026-11-08）。"""
     unknown = lambda v: not v or str(v).startswith("?")
     return (f"## 环境\n对话平台：{PLATFORMS.get(row['source'], row['source'])}，"
             f"工作目录 {'未知' if unknown(row['cwd']) else row['cwd']}，"
-            f"当时的“我”：{'未知模型' if unknown(row['model']) else row['model']}，"
+            "当时的“我”：各轮分别标注，"
             f"现在回看的“我”：{model.model}（经 {model.platform}）"
             + (f"\n{SELF_NOTE}" if not unknown(row["cwd"]) and self_talk(row["cwd"]) else ""))
 

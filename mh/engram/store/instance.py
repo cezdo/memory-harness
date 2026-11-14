@@ -6,7 +6,8 @@
 import os
 import sys
 import tomllib
-from pathlib import Path
+from fnmatch import fnmatchcase
+from pathlib import Path, PurePosixPath
 
 PATH = Path(os.environ.get("MH_INSTANCE") or Path.home() / ".config/memory-harness/instance.toml")
 
@@ -39,7 +40,39 @@ MANAGING = {w: _dir(d) for w, d in _ws.get("managing", {}).items()}            #
 SESSIONS = {(s["source"], s["session"]): s["workspace"] for s in _ws.get("sessions", ())}   # 按会话更正工作区
 
 QUIET = frozenset(w.lower() for w in _D.get("synapse", {}).get("quiet", ()))   # Synapse 不当“查不到的词”送的词（手动名单）
-SKIP_WORKSPACES = tuple(dict.fromkeys(w for w in _D.get("observe", {}).get("skip_workspaces", ()) if w))   # 默认不观察的工作区：不预览、不读，原文照收（observe，2026-11-07）
+# 会话接 mh 到哪一步（[connect]，用户 2026-11-14 把按位置的开关并到一节）：默认全接；unwatched 接 mh、原文照收、不观察；
+# unplugged 不接 mh、原文也不收。两项都是路径的通配符（见 under）。旧写法 [observe].skip_workspaces 是工作区名，照认成 */名字。
+_connect = _D.get("connect", {})
+
+
+def _patterns(items):
+    return tuple(dict.fromkeys((_dir(p) if p.startswith("~") else p).rstrip("/") or "/" for p in items if p))
+
+
+UNWATCHED = _patterns(_connect.get("unwatched", ["*/" + w for w in _D.get("observe", {}).get("skip_workspaces", ())]))   # 默认不观察（observe，2026-11-07）
+UNPLUGGED = _patterns(_connect.get("unplugged", ()))     # 不接 mh（2026-11-14），见 unplugged
+
+
+def under(cwd, patterns):
+    """路径本身或任何一层上级对得上其中一个通配符（fnmatch：`*` 也跨 `/`，`?`、`[...]`；~ 开头的先展开），子目录因此都算；
+    用户 2026-11-14 要按模式写（`*tmp`）。只看路径，目录删了也一样；没有 cwd 的不算。"""
+    c = (cwd or "").rstrip("/")
+    if not c or not patterns:
+        return False
+    p = PurePosixPath(c)
+    return any(fnmatchcase(str(x), pat) for x in (p, *p.parents) if str(x) != "/" for pat in patterns)
+
+
+def unplugged(cwd):
+    """会话的目录在不在 [connect].unplugged 里：在的话手记、联想、拉取、开关、内核态都不出声，采集不收。"""
+    return under(cwd, UNPLUGGED)
+
+
+PAUSE_SOURCES = frozenset(_D.get("engram", {}).get("pause_sources", ()))   # 暂停的来源：observe 不预览不读，form 全部步骤跳过；已有 E、陈述留在库里但撤下、读不到（2026-11-11，chatgpt 导入）
+
+VIEWS = dict(_D.get("engram", {}).get("views", {}))   # 来源 → 视角：导入的对话带着视角读，observe 先按视角筛 E（observe/select），form 的 pack 加视角要求（2026-11-11）
+
+CHATGPT_EXPORTS = tuple(_D.get("observe", {}).get("chatgpt_exports", ()))  # 显式导出文件与工作目录；不扫描 archive
 
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # mh 专用的 dsh 实例（精读用；不要指到 dsh 升级的测试环境，它会被 teardown）

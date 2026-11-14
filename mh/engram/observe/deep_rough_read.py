@@ -187,6 +187,7 @@ def turn_blocks(row, extra=()):
         notes.append(f"这一轮结束之后，{names(later)}又发来 {len(later)} 条消息，排在 "
                      f"{at(lambda m: '发来消息' in m and '结束之后' in m)}，不是{label.USER_NAME}的话"
                      + (f"；“我”对它们的回答排在 {replied}" if replied else "；“我”没有用文字回答") + "。")
+    notes += [label.model_note(row), *label.source_notes(row)]
     notes += list(extra)
     return table, f"## 第 {n} 轮" + ("\n" + "\n".join(notes) if notes else "") + "\n" + "\n\n".join(lines)
 

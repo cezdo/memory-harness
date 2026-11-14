@@ -50,7 +50,7 @@ def file_kid(ws, path):
 
 
 def read_file(ws, root, filename, heading, overview=None):
-    """mentor README 首例：只读取显式文本树与模块表；不推断层级。返回来源快照和节点。"""
+    """按文件读取的骨架（首例是一个工作区的 README）：只读取显式文本树与模块表；不推断层级。返回来源快照和节点。"""
     root = Path(root).resolve()
     file = (root / filename).resolve()
     relative = file.relative_to(root).as_posix()

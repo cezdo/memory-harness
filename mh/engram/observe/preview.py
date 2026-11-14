@@ -18,7 +18,7 @@ import json
 import re
 
 from ..invoke import Claude, Codex
-from . import label
+from . import label, shiori
 from .label import relayed
 
 # 预览的 Operator 定义；Sol 经隔离的 codex exec，low，工具调用结果作废。
@@ -69,6 +69,8 @@ def _stat(t):
     proc = sum(len(x) for x in json.loads(t["commentary"]))
     stat = f"回复 {len(t['assistant'])} 字，过程中的话 {proc} 字" + (
         "，工具 " + "、".join(f"{k}×{v}" for k, v in tools.most_common(6)) if tools else "，没用工具")
+    if _field(t, "source") == "chatgpt" and not tools:
+        stat = stat.removesuffix("，没用工具") + "，工具记录未提供"
     return stat + ("" if t["closed"] else "，没有正常结束")
 
 
@@ -105,7 +107,7 @@ def turn_line(t, folded=()):
             said = sum(len(a.get("reply") or "") for a in xs)
             peers.append(f"（{where}{'、'.join(sorted({a['who'] for a in xs}))}发来的 {len(xs)} 条消息，不是{label.USER_NAME}的话"
                          + (f"，我回了 {said} 字" if after else "") + "；读的时候附上）")
-    return "\n".join([head, f"{label.USER_NAME}：{user}", f"我这一轮：{_stat(t)}", *peers, *map(fold_line, folded)])
+    return "\n".join([head, f"{label.USER_NAME}：{user}", f"我这一轮：{_stat(t)}", label.model_note(t), *label.source_notes(t), *peers, *map(fold_line, folded)])
 
 
 JUDGE = re.compile(r"判断\s*[:：]\s*(.*)")
@@ -199,6 +201,11 @@ def parse(output, turns):
             used, used_turns = used + s["chars"], used_turns + n
         else:
             s["how"] = "粗读"
-    covered = {k for s in groups for k in range(s["from"], s["to"] + 1)}
+    marks = {t["ordinal"] + 1 for t in turns if shiori.marked(_field(t, "tools"))}
+    for s in groups:                   # 夹了栞的轮（I7）：所在的组程序定成精读，在兜底之后、不占精读的份额
+        got = [k for k in range(s["from"], s["to"] + 1) if k in marks and k not in s["hidden"]]
+        if got and not s.get("program"):
+            s["how"], s["shiori"] = "精读", got
+    covered ={k for s in groups for k in range(s["from"], s["to"] + 1)}
     return groups, {"total": total, "precise": used, "precise_turns": used_turns, "order": order,
                   "missing": [k for k in size if k not in covered], "outside": sorted(set(outside))}

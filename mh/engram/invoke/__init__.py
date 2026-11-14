@@ -518,6 +518,28 @@ class DshWeb(Dsh):
         return f"{call.get('name')}: {cmd[:80]}" if cmd else call.get("name")
 
 
+def _expires(path):
+    try:
+        return json.loads(path.read_text())["claudeAiOauth"]["expiresAt"] or 0
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+
+
+def relink(cred, main):
+    """隔离目录的凭据链回主凭据。claude 刷新令牌时会把链接改写成普通文件：
+    11-03 起改名丢掉再链回，可刷新换出的新令牌也跟着丢了，主凭据的刷新令牌已被换掉、链回后再刷新就失败，CLI 还写回一份空令牌
+    （11-11 08:50 起 OAuth 过期，6ab1fa7d 预览 3 次满次数）。所以副本比主凭据新时先原子写回主凭据，旧的仍留一份 stale。"""
+    if cred.exists() and not cred.is_symlink():
+        if _expires(cred) > _expires(main):
+            tmp = main.with_name(f".credentials.json.mh-{os.getpid()}")
+            tmp.write_text(cred.read_text())
+            tmp.chmod(0o600)
+            os.replace(tmp, main)
+        cred.rename(cred.with_name(f".credentials.json.stale-{int(time.time())}"))
+    if not cred.is_symlink():
+        cred.symlink_to(main)
+
+
 class Claude:
     """Claude（默认 Sonnet），经本机 claude -p；与 Codex 同样的隔离：独立的 CLAUDE_CONFIG_DIR，里面只有指向原认证的
     符号链接，不读全局设置、CLAUDE.md、自动记忆和 MCP；不给任何工具；不留会话文件。"""
@@ -534,11 +556,7 @@ class Claude:
 
     def __call__(self, prompt):
         self.home.mkdir(parents=True, exist_ok=True)
-        cred = self.home / ".credentials.json"
-        if cred.exists() and not cred.is_symlink():          # claude 刷新令牌时会把链接改写成普通文件，副本就停在旧令牌上（11-03 起 OAuth 过期）
-            cred.rename(cred.with_name(f".credentials.json.stale-{int(time.time())}"))
-        if not cred.is_symlink():
-            cred.symlink_to(Path.home() / ".claude/.credentials.json")
+        relink(self.home / ".credentials.json", Path.home() / ".claude/.credentials.json")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.home))
         with tempfile.TemporaryDirectory(prefix="mh-claude-") as tmp:
             p = subprocess.run(
@@ -550,8 +568,9 @@ class Claude:
             d = json.loads(p.stdout)
         except ValueError:
             d = {}
-        if p.returncode != 0 or d.get("is_error") or "result" not in d:
-            raise RuntimeError(f"claude -p 失败（{p.returncode}）：{(p.stderr or p.stdout)[-500:]}")
+        if p.returncode != 0 or d.get("is_error") or "result" not in d:     # JSON 的尾巴是统计，原因在 result（11-11）
+            why = d.get("result") if isinstance(d.get("result"), str) and d.get("result") else (p.stderr or p.stdout)[-500:]
+            raise RuntimeError(f"claude -p 失败（{p.returncode}）：{why[:500]}")
         return d["result"], {"model": self.model, "usage": d.get("usage"), "turns": d.get("num_turns"),
                              "isolation": self.isolation, **({"effort": self.effort} if self.effort else {})}
 

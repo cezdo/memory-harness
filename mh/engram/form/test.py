@@ -97,6 +97,23 @@ class FormTest(unittest.TestCase):
         self.assertIn("我说明已经停了。\n这一轮我换成英文回复", out)
         self.assertNotIn("换成中文", out)                  # 没有 E 的轮次不单独写语言
 
+    def test_pack_view(self):
+        """带视角的来源：pack 提示词末尾接上视角段；别的来源这一段为空（2026-11-11）。"""
+        from unittest import mock
+        info = {"source": "chatgpt", "session": "s", "cwd": "/x", "model": "m", "begin": "2026-09-01T00:00:00Z",
+                "end": "2026-09-01T01:00:00Z", "turns": []}
+        u = {"session": info, "events": [{"id": 1, "ordinal": 0, "speaker": "我", "mode": "告知", "segments": ["A1"], "text": "x", "turn": 0}],
+             "lo": 0, "hi": 0}
+        with mock.patch.object(form.instance, "VIEWS", {"chatgpt": "mh 发展史"}), \
+                mock.patch.object(form.observe, "written", lambda *a: {}), mock.patch.object(form.observe, "languages", lambda *a: {}):
+            text, _ = form.build_pack(self.conn, u, "d")
+            self.assertIn("视角：mh 发展史", text)
+            self.assertLess(text.index("视角：mh 发展史"), text.index("## 环境"))
+            self.assertNotIn("{{视角段}}", text)
+            self.assertEqual(text.count("## 表达规范"), 1)
+            text2, _ = form.build_pack(self.conn, {**u, "session": {**info, "source": "claude"}}, "d")
+            self.assertNotIn("这次的额外要求", text2)
+
     def test_continue_and_insert(self):
         a = self._session("s1", "2026-10-17T08:00:00Z")
         self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], ["挂到：新线 X 升级｜为什么：新的目标"]))
@@ -955,6 +972,17 @@ class FormTest(unittest.TestCase):
                                  "WHERE a.step='attach' ORDER BY o.id").fetchall()
         self.assertEqual([r[0] for r in rows], ["content_error", "ok"])
 
+    def test_attach_skips_deleted_zeron_worktree(self):
+        """删掉的 Zeron worktree：工作区只能按项目名猜，自动挂线跳过，等确认（2026-11-13）。"""
+        cwd = "/home/u/.zeron/worktrees/zeron/gone"
+        a = self._session("s1", "2026-10-17T08:00:00Z", cwd=cwd)
+        self._run(self._fakes([PACK.format(a=a[0], b=a[1])], [LABEL], []))
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM attachment").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step IN ('attach','attach_lines')").fetchone()[0], 0)
+        with patch.dict(st.SESSION_WORKSPACE, {("dsh", "s1"): "zeron"}):          # 确认以后照常挂
+            self._run(self._fakes([], [], ["挂到：新线 X 升级｜为什么：新的"]))
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM attachment").fetchone()[0], 1)
+
     def test_cross_workspace_attach(self):
         """在 proj 开、碰过 other 3 处以上的会话，other 的线进候选、挂得上，输入里写明工作区线索；碰得少的挂上去算错（2026-10-26）。"""
         from unittest import mock
@@ -1003,7 +1031,7 @@ class FormTest(unittest.TestCase):
 
     def test_wake_note(self):
         from ..observe.label import wake_note
-        self.assertEqual(wake_note("正文\n---\n此刻：2026-11-09 00:30。叫醒我的便签：`便签/runbook稿.md`（到：2026-11-09）。"), "runbook稿")
+        self.assertEqual(wake_note("正文\n---\n此刻：2026-11-09 00:30。叫醒我的便签：`便签/runbook稿.md`（at: 2026-11-09）。"), "runbook稿")
         self.assertIsNone(wake_note("把 X 升级一下"))
 
     def test_skeleton(self):
@@ -1138,10 +1166,10 @@ class FileSkeletonTest(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.op = st.main_operator(self.conn, "test")
 
-    def read(self, ws="mentor"):
+    def read(self, ws="proj"):
         return skeleton.read_file(ws, self.root, "README.md", "功能划分", "模块导览")
 
-    def line(self, ws="mentor"):
+    def line(self, ws="proj"):
         aid = st.occurrence(self.conn, "act", self.op, started=st.now(), ended=st.now(), outcome="ok")
         self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (aid, "form", "feedback", "{}", "", "", "{}"))
         return self.conn.execute('INSERT INTO topic_line(born,name,workspace,node,parent,"from") VALUES(?,?,?,?,?,?)',
@@ -1154,9 +1182,9 @@ class FileSkeletonTest(unittest.TestCase):
         self.assertEqual(ns["检查/报告"]["parent"], "检查")
         self.assertEqual(ns["检查/规则"]["topic"], "核对规则")
         self.assertEqual(self.TEXT.splitlines()[ns["检查/规则"]["line"] - 1], "│  ├─ 规则")
-        self.assertEqual(skeleton.node_of("docs/rules.md", "mentor", ns), "检查/规则")
-        self.assertEqual(skeleton.node_of("docs/common.md", "mentor", ns), "检查")
-        self.assertIsNone(skeleton.node_of("lib/shared.vbs", "mentor", ns))
+        self.assertEqual(skeleton.node_of("docs/rules.md", "proj", ns), "检查/规则")
+        self.assertEqual(skeleton.node_of("docs/common.md", "proj", ns), "检查")
+        self.assertIsNone(skeleton.node_of("lib/shared.vbs", "proj", ns))
         self.assertEqual(ns["检查/规则"]["id"], self.read()["nodes"]["检查/规则"]["id"])
 
     def test_adopt_snapshot_namespace_and_existing_lines(self):
@@ -1180,7 +1208,7 @@ class FileSkeletonTest(unittest.TestCase):
         self.assertEqual(tuple(self.conn.execute("SELECT * FROM topic_line WHERE id=?", (lid,)).fetchone()), before)
         pool = form.pool(self.conn)
         self.assertEqual(pool[f"L{lid}"]["parent"], spec["nodes"]["检查/规则"]["id"])
-        self.assertEqual(skeleton.nodes("mentor", self.conn), spec["nodes"])
+        self.assertEqual(skeleton.nodes("proj", self.conn), spec["nodes"])
         with self.assertRaises(ValueError):
             skeleton.adopt(self.conn, rid, mapping)
         self.file.write_text(self.TEXT)
@@ -1189,7 +1217,7 @@ class FileSkeletonTest(unittest.TestCase):
             rid2 = skeleton.request_file(self.conn, second, {}, "另一个工作区", self.op)
             skeleton.adopt(self.conn, rid2, {})
         pool = form.pool(self.conn)
-        self.assertEqual(len([n for n in pool.values() if n["kind"] == "node" and n["ws"] in ("mentor", "other-project")]), 10)
+        self.assertEqual(len([n for n in pool.values() if n["kind"] == "node" and n["ws"] in ("proj", "other-project")]), 10)
         self.assertNotEqual(spec["nodes"][""]["id"], second["nodes"][""]["id"])
         self.assertIn("k-root", pool)
         readonly = st.connect(self.root / "engram.db", readonly=True)
@@ -1205,7 +1233,7 @@ class FileSkeletonTest(unittest.TestCase):
         for mapping in ({}, {f"L{other}": "检查"}, {f"L{lid}": "不存在"}):
             with self.assertRaises(ValueError):
                 skeleton.preview(self.conn, spec, mapping)
-        self.assertNotIn("mentor", skeleton.adopted(self.conn))
+        self.assertNotIn("proj", skeleton.adopted(self.conn))
 
     def test_update_replaces_active_view_with_history(self):
         spec = self.read()
@@ -1216,8 +1244,8 @@ class FileSkeletonTest(unittest.TestCase):
         with self.conn:
             rid2 = skeleton.request_file(self.conn, self.read(), {}, "新版本", self.op)
             aid2 = skeleton.adopt(self.conn, rid2, {})
-        self.assertIn("检验/规则", skeleton.nodes("mentor", self.conn))
-        self.assertNotIn("检查/规则", skeleton.nodes("mentor", self.conn))
+        self.assertIn("检验/规则", skeleton.nodes("proj", self.conn))
+        self.assertNotIn("检查/规则", skeleton.nodes("proj", self.conn))
         self.assertEqual(self.conn.execute("SELECT predecessor FROM occurrence WHERE id=?", (aid2,)).fetchone()[0], aid)
         self.assertEqual(json.loads(self.conn.execute("SELECT meta FROM act_detail WHERE occurrence=?", (aid,)).fetchone()[0])["nodes"], spec["nodes"])
 

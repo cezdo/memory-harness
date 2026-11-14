@@ -16,13 +16,14 @@ design 根目录只放本索引；全局设计、词典与安装配置在 `globa
 | 会话记录、话题、挂线、分层（作用域是会话）与骨架 | [form](engram/form/设计.md) | [`mh/engram/form/`](../mh/engram/form) |
 | 跨会话的认知与版本引用 | [cognize](engram/cognize/设计.md) | [`mh/engram/cognize/`](../mh/engram/cognize) |
 | 申请、纠正与反馈 | [修正机制](engram/申请.md) | Engram 各过程 |
+| 内核态：改内核要用户放行（`/mhcore`） | [elevate](engram/elevate/设计.md) | [`mh/engram/elevate/`](../mh/engram/elevate) |
 | 推送、拉取、足迹与宿主 | [Synapse](synapse/设计.md) | [`mh/synapse/`](../mh/synapse) |
 | 循环、并发与额度 | [rhythm](rhythm/设计.md) | [`mh/rhythm/`](../mh/rhythm) |
 | “我”自己的工作区、便签与叫醒、自言自语 | [rhythm self](rhythm/self/设计.md)、[接入](rhythm/self/接入.md) | [`mh/rhythm/self/`](../mh/rhythm/self) |
 | 展示自己的窗口（只读网页“此刻的我”）与照看 | [rhythm](rhythm/设计.md) | [`mh/rhythm/`](../mh/rhythm)，看板在 [`show/`](../mh/rhythm/show)；照看仍是方向 |
 | 人称、来源视角与实际送达 | [表达](express/设计.md) | [`mh/express/`](../mh/express) |
 | QQ 群里被叫到时回几句 | [reply](reply/设计.md) | [`mh/reply/`](../mh/reply) |
-| 安装、实例配置与可选依赖 | [使用说明](global/使用.md)、[English](global/使用.en.md) | 各模块用法链接到对应设计 |
+| 安装、实例配置与可选依赖 | [使用说明](global/使用.md)、[English](global/usage.en.md) | 各模块用法链接到对应设计 |
 | 公开材料与打包边界 | [公开发布](release/设计.md) | 安装元数据与发布清单 |
 
 安装与命令用法见[使用说明](global/使用.md)，协作要求见 [AGENTS.zh-CN.md](../AGENTS.zh-CN.md)。

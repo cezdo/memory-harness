@@ -16,11 +16,12 @@ from .sources import FRESH, SOURCES, switch, young
 from .. import store as st
 from ..store import NA, UNKNOWN, iso, occurrence, operator
 from ..store.delete import deleted
+from ..store.instance import unplugged
 
 SCRIPT_PREFIX = "（定时任务"          # 脚本、定时任务发起的轮次（见 synapse.hosts.HOST）
 HOST_KINDS = {"通知": "notification", "打断": "interrupt", "命令": "command", "压缩": "compaction", "重启": "restart"}
-COLLECTOR = "observe/collect-v4"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main；
-                                         # v4（2026-11-01）：别的会话发来的消息记在 turn_detail.asides
+COLLECTOR = "observe/collect-v5"         # v2（2026-10-17）：开关记录作为一个来源收进来；v3（2026-10-30）：联想开关、yorimichi 也收，yorimichi 的 origin 是 main；
+                                         # v4（2026-11-01）：别的会话发来的消息记在 turn_detail.asides；v5（2026-11-11）：逐轮模型、解析版本缓存、ChatGPT 静态导出
 
 
 def origin(user):
@@ -43,16 +44,16 @@ def collector(conn):
                                                     "sources": sorted(SOURCES)})
 
 
-def unchanged(conn, path):
+def unchanged(conn, path, parser=COLLECTOR):
     s = path.stat()
-    row = conn.execute("SELECT size, mtime FROM collect_file WHERE path=?", (str(path),)).fetchone()
-    return row is not None and (row[0], row[1]) == (s.st_size, s.st_mtime)
+    row = conn.execute("SELECT size, mtime, parser FROM collect_file WHERE path=?", (str(path),)).fetchone()
+    return row is not None and (row[0], row[1], row[2]) == (s.st_size, s.st_mtime, parser)
 
 
-def mark(conn, path, s=None):
+def mark(conn, path, s=None, parser=COLLECTOR):
     """s：解析之前取的文件状态。解析期间文件又长了，记的是读到的那一份，下次照样再读（审查 02，2026-10-28）。"""
     s = s or path.stat()
-    conn.execute("INSERT OR REPLACE INTO collect_file VALUES(?,?,?)", (str(path), s.st_size, s.st_mtime))
+    conn.execute("INSERT OR REPLACE INTO collect_file(path,size,mtime,parser) VALUES(?,?,?,?)", (str(path), s.st_size, s.st_mtime, parser))
 
 
 def save(conn, op, session, turns, log=None):
@@ -88,9 +89,9 @@ def save(conn, op, session, turns, log=None):
             oid = occurrence(conn, "turn", op, started=iso(t.started), scale="turn", cause=NA, parent=sid)
             org, kind = switch.origin(s) if s.source == switch.SOURCE else origin(t.user)     # 开关记录：用户的命令或“我”的 yorimichi
             conn.execute("INSERT INTO turn_detail(occurrence,text,source,session,ordinal,closed,ending,prev,address,"
-                         "origin,host_kind,asides) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                         "origin,host_kind,asides,models) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                          (oid, t.id, s.source, s.session, i, int(t.closed), ending, prev, st.dumps(t.address), org, kind,
-                          st.dumps(t.asides)))
+                          st.dumps(t.asides), st.dumps(t.models)))
             new += 1
             continue
         if old["text"] != t.id:
@@ -98,6 +99,11 @@ def save(conn, op, session, turns, log=None):
                 print(f"[{s.source}] {s.session} 第 {i} 轮：库里是 {old['text']}，重新解析是 {t.id}，不改", file=log)
             continue
         oid = old["occurrence"]
+        had_models = json.loads(old["models"])
+        if not had_models and t.models:
+            fixed += conn.execute("UPDATE turn_detail SET models=? WHERE occurrence=?", (st.dumps(t.models), oid)).rowcount
+        elif t.models and had_models != t.models and log:
+            print(f"[{s.source}] {s.session} 第 {i} 轮：模型记录不同，不改", file=log)
         if t.closed and not old["closed"]:
             fixed += conn.execute("UPDATE turn_detail SET closed=1 WHERE occurrence=?", (oid,)).rowcount
         if t.prev is not None and old["prev"] in (UNKNOWN, i - 1) and old["prev"] != t.prev:
@@ -121,14 +127,15 @@ def run(conn, sources=tuple(SOURCES), force=False, fresh=FRESH, log=sys.stderr, 
     totals = {}
     for name in sources:
         mod = modules[name]
-        n = {"files": 0, "skipped": 0, "fresh": 0, "failed": 0, "turns": 0, "texts": 0, "fixed": 0}
+        n = {"files": 0, "skipped": 0, "fresh": 0, "failed": 0, "unplugged": 0, "turns": 0, "texts": 0, "fixed": 0}
         for path in mod.files():
-            if not force and unchanged(conn, path):
-                n["skipped"] += 1
-                continue
-            before = path.stat()
             try:
-                many = hasattr(mod, "parse_all")             # 一个文件里有几个会话（开关记录）：有意的命令，不等 FRESH
+                parser = COLLECTOR + (":" + mod.signature(path) if hasattr(mod, "signature") else "")
+                if not force and unchanged(conn, path, parser):
+                    n["skipped"] += 1
+                    continue
+                before = path.stat()
+                many = hasattr(mod, "parse_all")             # 一个文件里有几个会话（静态导出、开关记录）
                 found = mod.parse_all(path) if many else [mod.parse(path)]
             except Exception as e:          # 单个文件坏了不影响其余
                 n["failed"] += 1
@@ -137,12 +144,16 @@ def run(conn, sources=tuple(SOURCES), force=False, fresh=FRESH, log=sys.stderr, 
             if not many and young(found[0][0], now, fresh):
                 n["fresh"] += 1
                 continue
-            for session, turns in found:
+            kept = [(s, t) for s, t in found if not unplugged(s.cwd)]       # 不接 mh 的目录（[connect].unplugged）：一轮都不收
+            n["unplugged"] += len(found) - len(kept)
+            if found and not kept:
+                continue                    # 不打标记：以后从名单里拿掉，下一轮照常补采
+            for session, turns in kept:
                 t, x, f = save(conn, op, session, turns, log)
                 n["turns"] += t
                 n["texts"] += x
                 n["fixed"] += f
-            mark(conn, path, before)
+            mark(conn, path, before, parser)
             n["files"] += 1
         conn.commit()
         totals[name] = n

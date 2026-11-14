@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from ...engram.store.instance import PROJECTS, SYNAPSE_DIRS as WORKSPACES    # 改名、删除、别名的目录，放项目的目录：实例配置（重构 H）
-from ...engram.store.instance import resource
+from ...engram.store.instance import resource, unplugged
 
 HOME = Path.home()
 
@@ -37,13 +37,13 @@ def workspace(path):
 
 
 def _core():
-    """内核的源文件：实例配置的 [resources].core（旧名 standing）；开发仓库是 design/synapse/core.md；发行包读实例配置旁的
+    """内核的源文件：实例配置的 [resources].core（旧名 standing）；开发仓库是 design/engram/core.md（2026-11-13 从 design/synapse/ 搬来：正本归 Engram）；发行包读实例配置旁的
     core.md，没有就读旧的 standing.md（2026-10-24 改名前的叫法）。"""
     from ...engram.store import instance
     configured = instance._D.get("resources", {})
     if "core" not in configured and "standing" in configured:
         return resource("standing", Path(), "standing.md")
-    got = resource("core", Path(__file__).resolve().parents[3] / "design/synapse/core.md", "core.md")
+    got = resource("core", Path(__file__).resolve().parents[3] / "design/engram/core.md", "core.md")
     old = instance.PATH.parent / "standing.md"
     return old if not got.exists() and old.exists() else got
 
@@ -53,7 +53,7 @@ STANDING = CORE          # 旧名：内核态（elevate）和测试还在用
 
 
 def _text(path):
-    """内核的文本（design/synapse/core.md，2026-10-24 前叫常态记忆）：源文件就是推送版；以前编译留下的第一行指纹照样跳过。"""
+    """内核的文本（design/engram/core.md，2026-10-24 前叫常态记忆）：源文件就是推送版；以前编译留下的第一行指纹照样跳过。"""
     lines = path.read_text().splitlines() if path.exists() else []
     return "\n".join(l for l in lines if not l.startswith(("<!--", ">"))).strip()     # 开头的引用说明是给维护的人看的，不推
 
@@ -116,7 +116,7 @@ def entry(L, cwd):
                       f"- `{TOOL}relive`（handles）：按句柄读下去，需要时一直走到原话；",
                       f"- `{TOOL}roam`（node）：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
                       f"- `{TOOL}yorimichi`（width）：告诉记忆现在给联想留几条；",
-                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J。括号里是主参数，其余参数见各工具的说明。"])
+                      "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J、认知 C8（也认名字）。括号里是主参数，其余参数见各工具的说明。"])
 
 
 def render(cwd, host="claude", session="", start="", model=""):
@@ -142,6 +142,8 @@ def hook(conn, payload):
     from ..track import pushes
     from ..pull import VERSION
     host, session, cwd = payload.get("host") or "claude", payload.get("session_id", ""), payload.get("cwd", "")
+    if unplugged(cwd):                       # 不接 mh 的目录（[connect].unplugged）：不推、不记
+        return {}
     if host == "claude":
         try:                                 # /clear 以后 MCP 按这个认会话；出错不影响推送
             from ..hosts import claude

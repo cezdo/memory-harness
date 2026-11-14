@@ -1,9 +1,9 @@
-"""python3 -m mh.synapse.push.elevate [--apply]：装 /mhcore 的命令、skill 和钩子；不带 --apply 只列要做什么。
-python3 -m mh.synapse.push.elevate log [-l info|notice|warn] [#编号]：看内核日志（dmesg 式，一条一行；给编号展开那一条）。"""
+"""python3 -m mh.engram.elevate [--apply]：装 /mhcore 的命令、skill 和钩子；不带 --apply 只列要做什么。
+python3 -m mh.engram.elevate log [-l info|notice|warn] [#编号]：看内核日志（dmesg 式，一条一行；给编号展开那一条）。"""
 import sys
 
 from . import LEVELS, detail, install, view
-from ....engram.store import HOME
+from ..store import HOME
 
 argv = sys.argv[1:]
 if argv[:1] == ["log"]:

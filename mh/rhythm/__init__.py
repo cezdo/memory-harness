@@ -92,7 +92,7 @@ def _clean(conn, log):
 
 def _self(conn, log):
     """self 工作区（用户 2026-11-08）：先收上一次醒来，再看有没有到点的便签，有就在后台起 claude -p 叫醒“我”，不挡整理循环
-    （rhythm/self）。每周的方向探索是其中一张便签（“每：7 天”）。"""
+    （rhythm/self）。每周的方向探索是其中一张便签（`every: 7d`）。"""
     from . import self as own
     return own.tick(log)
 

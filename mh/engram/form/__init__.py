@@ -47,7 +47,8 @@ from . import attach, glossary, induce, label, pack, restate as _restate, skelet
 
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数
-CURRENT = {"pack": ("sol-low", "pack-v0.9.4"), # v0.9.4：写进文件的细节合并掉，结论（选了什么、为什么、关键数值）留在陈述里（用户 11-04）
+CURRENT = {"pack": ("sol-low", "pack-v0.9.5"), # v0.9.5：末尾留视角段的位置，导入的来源填 VIEW_PACK（用户 2026-11-11），别的来源为空、提示词同 v0.9.4
+                                               # v0.9.4：写进文件的细节合并掉，结论（选了什么、为什么、关键数值）留在陈述里（用户 11-04）
                                                # v0.9.3：「」只括专名和照引的原话，概念、说法、讨论的主题不括（用户 11-04）
                                                # v0.9.2：陈述写到能用、展开只为查证；一件事 = 读的人会一起用的东西，写细不拆；去掉来源上限（依据哪几条改由程序对）；
                                                # 示例一轮一条写全；不给判断加“当时”，只有会话最后定下又没验证的结论才说明（G6，2026-11-04，tmp/expand-why/）
@@ -61,6 +62,7 @@ CURRENT = {"pack": ("sol-low", "pack-v0.9.4"), # v0.9.4：写进文件的细节�
            "attach_lines": ("sol-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
            "restate": ("sol-low", "restate-v0.1"),             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
            "structure": ("sol-low", "structure-v0.1")}         # 会话结构：问题—决定（D4，用户 2026-11-05：跟着 form 做，relive 超窗先给它）
+VIEW_PACK = "pack-view-v0.1"                                   # 带视角的来源（instance.VIEWS）pack 时接在提示词末尾的要求；它的摘要进 pack 的 Operator（window_params）
 STEP_OF = {"attach_lines": "attach"}                           # act 里记的 step
 MODELS = {"sol-low": lambda: invoke.whole(Codex("gpt-6.1-sol", "low"))}
 DESC = {"sol-low": "gpt-6.1-sol low（经 codex exec）"}          # 环境里“现在回看的我”
@@ -78,7 +80,8 @@ def window_params(step):
     if step == "pack":
         return {"idle": IDLE, "max_chars": MAX_CHARS, "written": "observe.written", "redact": "store.SECRET",
                 "check": ["pack.check-v3", pack.LONG, pack.DROP_SHARE], "rewrite": [REWRITES, "follow-v1"],
-                "languages": ["observe.languages", observe.label.RECORD_LANGUAGE, "skeleton-v1", observe.label.SKELETON_MIN, observe.label.SKELETON_LEAD]}
+                "languages": ["observe.languages", observe.label.RECORD_LANGUAGE, "skeleton-v1", observe.label.SKELETON_MIN, observe.label.SKELETON_LEAD],
+                "view": [VIEW_PACK, hashlib.sha256((PROMPTS / f"{VIEW_PACK}.md").read_bytes()).hexdigest()[:8]]}   # 视角段改了也是新的 Operator
     if step == "induce":
         return {"kind": "排查", "input": "pack 的陈述（现在的）+ 轮次", "check": ["induce.check-v1", induce.LIMIT, induce.HARD],
                 "measure": "induce.measure-v1", "redact": "store.SECRET"}
@@ -132,7 +135,7 @@ def redact(text):
 
 # ---- 形成史（只读 form 自己的 act）----
 
-ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, a.output FROM act_detail a
+ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, a.output, o.error FROM act_detail a
           JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','induce','label','attach','structure') ORDER BY o.id"""
 
 
@@ -214,7 +217,7 @@ def history(conn):
         for r in rs:
             for x in REDO_STEPS[_level_of(r["inputs"], r["from"])]:
                 cut[k][x] = max(cut[k][x], r["id"])
-    for oid, op, result, inputs, step, window, meta, output in conn.execute(ACTS):
+    for oid, op, result, inputs, step, window, meta, output, error in conn.execute(ACTS):
         w = json.loads(window)
         if "unit" not in w:
             continue                         # 旧做法导进来的整理、打包（逐轮记录、会话记录），不是这里的单位
@@ -232,7 +235,7 @@ def history(conn):
                 induced[w.get("pack")] = oid
             if step == "label" and json.loads(meta or "{}").get("carry") is not None and oid >= cut.get(unit[:2], {}).get("attach", 0):
                 carried[unit] = oid          # 沿用的挂线，要晚于最近一张挂线级的申请才算数
-        elif result in ("timeout", "content_error"):
+        elif st.counted(result, error):
             fails[(step, unit, op)][result] += 1
     return types.SimpleNamespace(ok=ok, fails=fails, last=last, packed=packed, empty=empty, carried=carried, induced=induced)
 
@@ -289,9 +292,13 @@ def units(conn, now=None, session=None):
     infos = sorted((_session(conn, source, sess) for source, sess in conn.execute(sql, args).fetchall()),
                    key=lambda i: (absent(i["end"]), i["end"]))
     claimed = set()                        # 这一次已经排进单位、还没整理的 E（分叉的共用轮次）
+    from ..observe import select as _select
+    unselected = _select.pending(conn) if instance.VIEWS else set()     # 带视角的来源：还没筛完的会话先不整理
     ctx = observe.frame_context(conn)      # 全库的部分只算一次
     for info in infos:
         source, sess = info["source"], info["session"]
+        if source in instance.PAUSE_SOURCES or (source, sess) in unselected:
+            continue                       # 暂停的来源（[engram].pause_sources）：pack、label、attach 都不做；没筛完的等 observe 筛
         # 纠正写的 E 不当新 E：它们只经修订提示进来，改写依据旧 E 的那几条陈述（restate）；当新 E 会按中间插入整段重做，
         # 越过了这次纠正所在的那一级（2026-10-21：01a10aa7、f5cdabd1、session-1cf6 被这样整段重做过）
         evs = [e for e in observe.frame(conn, source, sess, ctx=ctx)["events"] if e["scale"] in NEW_SCALES and e.get("step") != "correct"]
@@ -476,7 +483,7 @@ def entries(conn, h=None):
         review[r["entry"]] = r["why"] if (r["why"] or "").startswith("待审视：") else ""     # 最后一次挂线还标着待审视的（J6）
     ws = {(r["source"], r["session"]): st.session_workspace(r["source"], r["session"], r["cwd"])
           for r in conn.execute("SELECT source, session, cwd FROM session_detail")}
-    off = {k for k, v in observe.switch.states(conn).items() if v == "off"}      # 关着观察的会话读不到（J5，2026-10-27）
+    off = observe.hidden_sessions(conn)      # 关着观察的会话读不到（J5，2026-10-27）；暂停的来源同样（2026-11-11）
     latest = {}
     for f in conn.execute("SELECT * FROM session_entry ORDER BY id"):
         if (f["source"], f["session"]) not in off:
@@ -666,7 +673,10 @@ def build_pack(conn, u, model_desc):
     got = observe.written(conn, info["source"], info["session"])
     written = {turn_ord[t]: lines for t, lines in got.items() if t in turn_ord and u["lo"] <= turn_ord[t] <= u["hi"]}
     langs = {turn_ord[t]: note for t, note in observe.languages(conn, info["source"], info["session"]).items() if t in turn_ord}
-    text = "\n\n".join([prompt("pack").replace("{{条数}}", str(len(evs))), pack.env(info, model_desc, evs),
+    view = instance.VIEWS.get(info["source"])
+    extra = (PROMPTS / f"{VIEW_PACK}.md").read_text().rstrip().replace("{{用户}}", USER_NAME).replace("{{视角}}", view) if view else ""   # 表达规范由 pack 提示词带一次
+    head = prompt("pack").replace("{{条数}}", str(len(evs))).replace("{{视角段}}", extra)
+    text = "\n\n".join([head, pack.env(info, model_desc, evs),
                         "## 事件", pack.e_block(evs, written, langs)])
     return redact(text), written           # 写进的文件和 E 在同一份文本里一起打码
 
@@ -806,7 +816,7 @@ def structure_todo(conn, h, ops, session=None):
     swap = replacements(conn)
     out = []
     for k in sorted(keys, key=lambda k: -latest[k][1]):
-        if session and not k[1].startswith(session):
+        if session and not k[1].startswith(session) or k[0] in instance.PAUSE_SOURCES:
             continue
         unit = latest[k][0]
         if _failed(h, "structure", unit, ops["structure"]):
@@ -909,7 +919,7 @@ def auto_repack(conn, log=sys.stderr):
         asked[key] = [r for r in rs if r["from"] == "form"]
     wrote = 0
     for (step, unit), act in sorted(h.ok.items(), key=lambda x: x[1]):
-        if step != "pack":
+        if step != "pack" or unit[0] in instance.PAUSE_SOURCES:
             continue
         meta = json.loads(conn.execute("SELECT meta FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0] or "{}")
         hard = [(n, w) for n, w in meta.get("violations", []) if not pack.soft(w)]       # 正文长度是软的：确认过还长就保持
@@ -1347,7 +1357,8 @@ def induce_todo(conn, h, ops, session=None):
     """要归纳的单位：最后一次成功的 pack 是现行 pack Operator 写的、有陈述、还没归纳过、没失败满。→ [{"unit", "pack", "session"}]。"""
     out = []
     for (step, unit), pa in sorted(h.ok.items(), key=lambda x: x[1]):
-        if step != "pack" or unit in h.empty or pa in h.induced or (session and not unit[1].startswith(session)):
+        if step != "pack" or unit in h.empty or pa in h.induced or (session and not unit[1].startswith(session)) \
+                or unit[0] in instance.PAUSE_SOURCES:
             continue
         if conn.execute("SELECT operator FROM occurrence WHERE id=?", (pa,)).fetchone()[0] != ops["pack"]:
             continue
@@ -1434,6 +1445,9 @@ def run(conn, limit=10, workers=4, session=None, cause="new_text", log=sys.stder
             if _failed(h, "pack", unit, ops["pack"]) or _failed(h, "label", unit, ops["label"]):
                 continue
             break
+        if st.worktree_uncertain(u["session"]["cwd"]) and (u["session"]["source"], u["session"]["session"]) not in st.SESSION_WORKSPACE:
+            print(f"[挂线] {unit[1][:12]}：跳过，工作树已删、工作区待确认", file=log, flush=True)
+            continue                                                   # 等模型或用户确认归类；确认前不自动挂线
         step = "attach" if skeleton.nodes(u["session"]["workspace"], conn) else "attach_lines"
         if _failed(h, "attach", unit, ops[step]):
             continue

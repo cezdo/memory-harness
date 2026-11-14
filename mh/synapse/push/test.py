@@ -1,5 +1,8 @@
 """推送自己的送达去重；不调用模型、词性服务或正式库。"""
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -94,6 +97,18 @@ class SentWordsTest(unittest.TestCase):
 
 
 class HookOutputTest(unittest.TestCase):
+    def test_unplugged_dir_is_silent(self):
+        """不接 mh 的目录（[connect].unplugged，2026-11-14）：手记不推，联想不出声，开关命令也不认（照常发给模型）。"""
+        import io
+        from ...engram.store import instance
+        from .. import push
+        with patch.object(instance, "UNPLUGGED", ("/t/x",)), patch("mh.synapse.library", lambda: 1 / 0):
+            self.assertEqual(push.hook(None, {"cwd": "/t/x", "session_id": "s"}), {})
+            for prompt in ("随便聊聊", "/no-souhatsu"):
+                out = io.StringIO()
+                self.assertIsNone(a.hook(io.StringIO(json.dumps({"prompt": prompt, "session_id": "s", "cwd": "/t/x/a"})), out))
+                self.assertEqual(out.getvalue(), "")
+
     def test_message_on_its_own_line(self):
         """Claude Code 显示 systemMessage 时前面加“UserPromptSubmit says:”：另起一行；codex 不加（用户 10-30）。"""
         import io
@@ -184,6 +199,21 @@ class RecentTest(unittest.TestCase):
         self.assertEqual(len(got), 2)
         self.assertTrue(got[0].startswith("- a.md、b.md：Claude Code（在 other 开的）「那边」（L1:T1）"))
         self.assertEqual(got[1], f"- c.md：近 {recent.DAYS} 天的会话都没{recent.TOUCHED}")   # 目录是仓库根本身：不算
+
+    def test_reflex_section(self):
+        """手写文件里的“## 反射”摘出来放近况最前，条目行不混进目录说明（runbook I9，2026-11-12）。"""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from . import status
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "mh.md").write_text(
+                "- 仓库：/nowhere\n\n## 反射\n\n说明行不收。\n\n- 发文件：scp 到 vps（L1:T1:S1）\n\n## 目录\n\n- design/：设计\n")
+            with mock.patch.object(status, "SOURCES", Path(d)):
+                cfg = status.source("mh")
+        self.assertEqual(cfg["reflex"], ["- 发文件：scp 到 vps（L1:T1:S1）"])
+        self.assertEqual(cfg["notes"], {"design/": "设计"})
+        self.assertNotIn("发文件", str(cfg["notes"]))
 
     def test_host_given_section_keeps_sources(self):
         from . import status
@@ -388,6 +418,22 @@ class SwitchTest(unittest.TestCase):
         self.assertIn('联想', err.getvalue())
         self.assertEqual(state('s1', self.log), 'on')
         self.assertIsNone(handle({'prompt': '随便说句话', 'session_id': 's1'}, 'claude', out, err, self.log))
+
+    def test_install_links_commands(self):
+        """2026-11-14 命令文件搬到 mh/skills/：装的是新位置；指向旧位置的链接就地换掉，不并存。"""
+        from .switch import SKILL, install
+        home = Path(self.tmp.name) / 'home'
+        (home / '.claude/commands').mkdir(parents=True)
+        (home / '.claude/commands/no-souhatsu.md').symlink_to('/r/mh/synapse/push/switch/claude/no-souhatsu.md')
+        (home / '.codex/skills').mkdir(parents=True)
+        self.assertEqual(len(install(home)), 4)                        # 默认只列，不动宿主
+        self.assertFalse((home / '.codex/skills/no-souhatsu').is_symlink())
+        install(home, apply=True)
+        self.assertEqual(os.readlink(home / '.claude/commands/no-souhatsu.md'),
+                         str(SKILL / 'no-souhatsu/claude/no-souhatsu.md'))
+        self.assertEqual(os.readlink(home / '.codex/skills/do-souhatsu'),
+                         str(SKILL / 'do-souhatsu/codex/do-souhatsu'))
+        self.assertEqual(install(home, apply=True), [])
 
     def test_off_skips_souhatsu_but_keeps_missing_words(self):
         from . import switch
@@ -621,3 +667,44 @@ class RunbookTest(unittest.TestCase):
         (self.repo / "runbook.md").write_text("- [ ] B2 还在做\n")
         self.git("commit", "-qam", "清理")
         self.assertFalse(runbook.draft("ws", self.repo, "runbook.md", lambda p: 1 / 0, home=self.home))
+
+
+class ShioriSectionTest(unittest.TestCase):
+    def test_pending_lines(self):
+        """近况“未落库”（I7，2026-11-13）：一轮一行，时间、宿主、第几轮、理由、你说的话；没有就不给这一节；读库出错也不给。"""
+        from ...engram.observe import shiori
+        from . import status
+        row = {"source": "claude", "session": "abcdef123456", "ordinal": 4, "started": "2026-11-13T14:05:00+09:00",
+               "user": "I7 就叫\nshiori", "why": "定名", "file": ""}
+        with patch.object(shiori, "pending", lambda conn, ws: [row]):
+            self.assertEqual(status._shiori("memory-harness", conn=object()),
+                             ["- 11-13 14:05 · Claude Code · 第 5 轮（abcdef12）：定名；你说：I7 就叫 shiori"])
+        with patch.object(shiori, "pending", lambda conn, ws: []):
+            self.assertEqual(status._shiori("memory-harness", conn=object()), [])
+        with patch.object(shiori, "pending", lambda conn, ws: 1 / 0):
+            self.assertEqual(status._shiori("memory-harness", conn=object()), [])
+
+
+class WorktreeStatusTest(unittest.TestCase):
+    def test_dir_gone_is_marked(self):
+        """worktree 目录删了但没 prune：状态里说目录已不在，不再当活的工作树（2026-11-13）。"""
+        from . import status
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d, "repo")
+            repo.mkdir()
+            env = {"PATH": "/usr/bin:/bin", "HOME": d, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+            def git(*a):
+                return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True, env=env)
+
+            git("init", "-q")
+            (repo / "a").write_text("a")
+            git("add", "a")
+            git("commit", "-qm", "one")
+            wt = Path(d, "wt")
+            git("worktree", "add", "-q", "-b", "side", str(wt))
+            self.assertTrue(any("side" in x for x in status._worktrees(repo)))
+            shutil.rmtree(wt)
+            got = status._worktrees(repo)
+            self.assertTrue(any("目录已不在" in x for x in got), got)

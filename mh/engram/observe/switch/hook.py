@@ -21,6 +21,16 @@ SAID = {"off": "memory-harness: 已关闭对本会话的观察，本会话的信
         "on": "memory-harness: 已恢复对本会话的观察。"}
 
 
+def unplugged(cwd):
+    """[connect].unplugged 的判断在实例配置里（store/instance.unplugged）；只在真是开关命令时才去读，读不了当没配。"""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+        from mh.engram.store.instance import unplugged as check
+        return check(cwd)
+    except Exception:
+        return False
+
+
 def wake(path=WAKE):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +50,7 @@ def main(argv):
     except ValueError:
         return 0
     state = COMMANDS.get((d.get("prompt") or "").strip())
-    if not state:
+    if not state or unplugged(d.get("cwd")):  # 不接 mh 的目录（[connect].unplugged）：不记开关，命令照常发给模型
         return 0
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:

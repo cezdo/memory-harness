@@ -438,6 +438,50 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual([(t.user, t.assistant) for t in turns], [("修正设计", "改好了"), ("再写测试", "写好了")])
         self.assertEqual(turns[0].commentary, ["先读报告"])
 
+    def test_codex_mcp_tools(self):
+        """codex 的 MCP 调用记在 event_msg 的 item_completed（McpToolCall），不走 function_call（2026-11-13）：工具名补成 mcp__服务__工具。"""
+        from .sources import codex
+        lines = [{"type": "session_meta", "payload": {"id": "m1", "timestamp": "2026-11-13T00:00:00Z", "cwd": "/w"}},
+                 {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "定了"}]}},
+                 {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "McpToolCall", "server": "mh", "tool": "shiori",
+                                                                                     "arguments": {"why": "定名"}}}},
+                 {"type": "response_item", "payload": {"type": "function_call", "name": "exec"}},
+                 {"type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": "final_answer",
+                                                       "content": [{"type": "output_text", "text": "好"}]}}]
+        path = self.dir / "mcp.jsonl"
+        path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        _, turns = codex.parse(path)
+        self.assertEqual(turns[0].tools, ["mcp__mh__shiori", "exec"])
+        from . import shiori
+        self.assertTrue(shiori.marked(turns[0].tools))
+        self.assertEqual(shiori.why(str(path), turns[0].address), "定名")
+
+    def test_shiori_precise(self):
+        """夹了栞的轮（I7，2026-11-13）：所在的组程序定成精读，不占精读兜底的份额；程序判不读的组（宿主消息）不动。"""
+        row = lambda i, tools="[]": {"ordinal": i, "assistant": "回" * 100, "commentary": "[]", "tools": tools}
+        turns = [row(0), row(1), row(2, '["Read", "mcp__mh__shiori"]'), row(3)]
+        groups, info = preview.parse("### 第 1–2 轮\n读法：精读\n\n### 第 3 轮\n读法：不读\n\n### 第 4 轮\n读法：粗读\n", turns)
+        self.assertEqual([(g["from"], g["how"], g.get("shiori")) for g in groups],
+                         [(1, "精读", None), (3, "精读", [3]), (4, "粗读", None)])
+        self.assertEqual(info["precise_turns"], 2)               # 份额只算预览自己判的精读
+
+    def test_shiori_pending(self):
+        """未落库：夹了栞、还没产出陈述的轮次；产出陈述就不列（2026-11-13）。理由从会话日志那几行里取。"""
+        from . import shiori
+        self.file.write_text('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__mh__shiori","input":{"why":"定名 shiori"}}]}}\n')
+        marked = Turn("I7 就叫 shiori", "好", tools=["mcp__mh__shiori"], closed=True, address={"line": [1, 1]})
+        self._collect([Turn("先看看", "嗯", closed=True), marked])
+        got = shiori.pending(self.conn)
+        self.assertEqual([(r["ordinal"], r["user"], r["why"]) for r in got], [(1, "I7 就叫 shiori", "定名 shiori")])
+        self.assertEqual(shiori.pending(self.conn, "别的工作区"), [])
+        turn = self.conn.execute("SELECT occurrence FROM turn_detail WHERE ordinal=1").fetchone()[0]
+        eid = self.conn.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved) "
+                                "VALUES(0, 1, ?, 'x', 'x', 'x', 'x', '[]', '[]')", (turn,)).lastrowid
+        self.assertEqual(len(shiori.pending(self.conn)), 1)       # 有 E 还不算，要形成陈述
+        self.conn.execute("INSERT INTO form_record(born, idx, kind, text, refs, labels, structures, unresolved) "
+                          "VALUES(0, 1, 'turn', 'x', ?, '[]', '{}', '[]')", (json.dumps({"event": [eid]}),))
+        self.assertEqual(shiori.pending(self.conn), [])
+
     def test_zeron_title(self):
         """Zeron 起标题另起的调用（2026-11-07）：唯一一轮是起标题的提示词，记成 kind = title，采集不收。"""
         from .sources import claude
@@ -453,6 +497,22 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual((sess.kind, len(turns)), ("title", 1))
         self.assertEqual(collect.save(self.conn, collect.collector(self.conn), sess, turns), (0, 0, 0))
         lines[0]["message"]["content"] = "帮我 generate session titles"           # 只认开头
+        path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        self.assertEqual(claude.parse(path)[0].kind, "user")
+
+    def test_headless(self):
+        """主配置目录里的 claude -p（entrypoint = sdk-cli，11-10 测 cc switch）记成 kind = headless，采集不收；self 目录里的照常收。"""
+        from .sources import claude
+        lines = [{"type": "user", "uuid": "u1", "cwd": "/tmp", "entrypoint": "sdk-cli",
+                  "message": {"role": "user", "content": "只回答两个字：北京"}},
+                 {"type": "assistant", "uuid": "a1", "message": {"id": "m1", "role": "assistant", "stop_reason": "end_turn",
+                                                                  "content": [{"type": "text", "text": "北京"}]}}]
+        path = self.dir / "headless.jsonl"
+        path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+        sess, turns = claude.parse(path)
+        self.assertEqual((sess.kind, len(turns)), ("headless", 1))
+        self.assertEqual(collect.save(self.conn, collect.collector(self.conn), sess, turns), (0, 0, 0))
+        lines[0]["entrypoint"] = "cli"
         path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
         self.assertEqual(claude.parse(path)[0].kind, "user")
 
@@ -1031,11 +1091,11 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
 
     def test_unwatched_workspace(self):
-        """工作区默认不观察（2026-11-07）：[observe].skip_workspaces 里的工作区不预览、不读，原文照收；进度记 unwatched、
+        """工作区默认不观察（2026-11-07）：[connect].unwatched 里的工作区不预览、不读，原文照收；进度记 unwatched、
         不算待观测（不挡 form 的门槛）；会话里显式的 /do-observe 压过工作区默认。"""
         from ..store import instance
-        old = instance.SKIP_WORKSPACES
-        instance.SKIP_WORKSPACES = ("w",)
+        old = instance.UNWATCHED
+        instance.UNWATCHED = ("*w",)
         try:
             self._collect([Turn("一", "答", closed=True), Turn("二", "答", closed=True)])
             self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
@@ -1048,7 +1108,20 @@ class ObserveTest(unittest.TestCase):
             self.assertIn(0, got)                          # 打开的会话照常排进预览
             self.assertEqual({p["state"] for p in observe.progress(self.conn, session="s2")}, {"not_previewed", "switch"})
         finally:
-            instance.SKIP_WORKSPACES = old
+            instance.UNWATCHED = old
+
+    def test_unplugged_dirs_not_collected(self):
+        """不接 mh 的目录（[connect].unplugged，2026-11-14）：会话一轮都不收，文件不打标记；从名单里拿掉，下一轮补采。"""
+        from unittest import mock
+        from ..store import instance
+        sess = Session("dsh", "s1", str(self.file), started="2026-01-01T00:00:00Z", cwd="/t/x/sub")
+        src = lambda: {"dsh": FakeSource(self.file, sess, [Turn("一", "答", closed=True)])}
+        with mock.patch.object(instance, "UNPLUGGED", ("/t/x",)):
+            got = collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules=src())["dsh"]
+            self.assertEqual((got["unplugged"], got["turns"], got["files"]), (1, 0, 0))
+            self.assertFalse(instance.unplugged("/t/xy"))                  # 只认整段路径
+        got = collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules=src())["dsh"]
+        self.assertEqual((got["unplugged"], got["turns"]), (0, 1))
 
     def test_redo(self):
         self._collect([Turn("一", "答", closed=True), Turn("二", "答" * 10, closed=True)])
@@ -1250,3 +1323,223 @@ class SelfTalkTest(unittest.TestCase):
         self.assertNotIn(label.SELF_NOTE, label.environment({**row, "cwd": "/w"}, FakeModel([])))
         self.assertNotIn(label.SELF_NOTE, label.environment({**row, "cwd": "?n/a"}, FakeModel([])))
         self.assertTrue(str(claude.SELF_ROOT).startswith(str(st.HOME)))           # 采集多读 self 的配置目录
+
+
+class SourceModelsTest(unittest.TestCase):
+    def test_claude_models_and_text_stay_in_their_turn(self):
+        from .sources import claude
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            events = []
+            for n, model in enumerate(("m1", "m2")):
+                events += [
+                    {"type": "user", "message": {"content": f"问{n}"}},
+                    {"type": "assistant", "message": {"id": str(n), "model": model,
+                     "content": [{"type": "text", "text": f"答{n}"}], "stop_reason": "end_turn"}},
+                ]
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            session, turns = claude.parse(path)
+            self.assertEqual([t.models for t in turns], [["m1"], ["m2"]])
+            self.assertEqual([t.assistant for t in turns], ["答0", "答1"])
+            self.assertEqual(session.model, "m2")
+
+    def test_codex_context_switch_and_mid_turn_switch(self):
+        from .sources import codex
+        def ev(kind, payload):
+            return {"type": kind, "payload": payload}
+        def msg(role, text):
+            return ev("response_item", {"type": "message", "role": role,
+                      "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": text}]})
+        events = [ev("turn_context", {"model": "m1"}), msg("user", "甲"), msg("assistant", "过程"),
+                  ev("event_msg", {"type": "thread_settings_applied", "thread_settings": {"model": "m2"}}),
+                  msg("assistant", "答甲"), ev("event_msg", {"type": "task_complete"}),
+                  ev("turn_context", {"model": "m3"}), msg("user", "乙"), msg("assistant", "答乙"),
+                  ev("event_msg", {"type": "task_complete"})]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in events))
+            _, turns = codex.parse(path)
+            self.assertEqual([t.models for t in turns], [["m1", "m2"], ["m3"]])
+            self.assertEqual(turns[0].commentary, ["过程"])
+
+    def test_dsh_switch_before_and_inside_turn(self):
+        from unittest.mock import patch
+        from .sources import dsh
+        def ev(kind, data):
+            return {"type": kind, "data": data}
+        def user(text):
+            return ev("user/message", {"source": {"kind": "user"}, "content": [{"type": "text", "text": text}]})
+        def reply(text):
+            return ev("assistant/message", {"message": {"content": [{"type": "text", "text": text}]}})
+        events = [ev("request/context", {"model": "m1"}), user("甲"), reply("过程"),
+                  ev("model/selection", {"model": "m2"}), reply("答甲"), ev("turn/end", {}),
+                  ev("request/context", {"model": "m3"}), user("乙"), reply("答乙"), ev("turn/end", {})]
+        with patch.object(dsh, "_events", return_value=iter(events)):
+            _, turns = dsh.parse(Path("/tmp/work/s/session.jsonl.zstd"))
+        self.assertEqual([t.models for t in turns], [["m1", "m2"], ["m3"]])
+        self.assertEqual(turns[0].assistant, "答甲")
+
+    def test_backfill_models_without_changing_text_or_existing_record(self):
+        from . import label, deep_rough_read
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = st.connect(Path(tmp) / "e.db")
+            session = Session("claude", "s", "file", model="wrong-session-model", cwd="/w")
+            op = collect.collector(conn)
+            turns = [Turn("甲", "答甲", closed=True), Turn("乙", "答乙", closed=True)]
+            collect.save(conn, op, session, turns)
+            before = [tuple(r) for r in conn.execute("SELECT * FROM turn_text")]
+            turns[0].models, turns[1].models = ["m1"], ["m2", "m3"]
+            self.assertEqual(collect.save(conn, op, session, turns), (0, 0, 2))
+            self.assertEqual(before, [tuple(r) for r in conn.execute("SELECT * FROM turn_text")])
+            self.assertEqual(collect.save(conn, op, session, turns), (0, 0, 0))
+            turns[0].models = ["wrong"]
+            log = io.StringIO()
+            collect.save(conn, op, session, turns, log)
+            self.assertIn("模型记录不同", log.getvalue())
+            rows = conn.execute(observe.TURNS + " ORDER BY ordinal").fetchall()
+            _, first = deep_rough_read.turn_blocks(rows[0])
+            _, second = deep_rough_read.turn_blocks(rows[1])
+            self.assertIn("当时的我：m1", first)
+            self.assertIn("当时的我：m2 → m3", second)
+            self.assertNotIn("wrong-session-model", label.environment(rows[0], FakeModel([])))
+            self.assertIn("当时的我：m1", preview.turn_line(rows[0]))
+            self.assertNotIn("m2", preview.turn_line(rows[0]))
+            self.assertIn("未知模型", label.model_note({"models": "[]", "model": "wrong-session-model"}))
+            conn.close()
+
+    def test_old_schema_migration_keeps_turns_and_invalidates_cache(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            conn = sqlite3.connect(path)
+            old_schema = st.SCHEMA.replace("  models TEXT NOT NULL DEFAULT '[]',   -- 本轮实际输出的模型顺序；空 = 来源未提供，不从 session.model 倒推\n", "")
+            old_schema = old_schema.replace("mtime REAL NOT NULL,\n  parser TEXT NOT NULL DEFAULT ''", "mtime REAL NOT NULL")
+            conn.executescript(old_schema)
+            conn.execute("INSERT INTO collect_file VALUES('old',1,2)")
+            conn.execute("INSERT INTO turn_detail(occurrence,text,source,session,ordinal,closed,ending,prev,address,origin,host_kind) "
+                         "VALUES(1,'hash','claude','s',0,1,'normal',-1,'{}','human','?n/a')")
+            conn.commit(); conn.close()
+            conn = st.connect(path)
+            self.assertEqual(conn.execute("SELECT models FROM turn_detail").fetchone()[0], "[]")
+            self.assertEqual(conn.execute("SELECT text FROM turn_detail").fetchone()[0], "hash")
+            self.assertEqual(conn.execute("SELECT parser FROM collect_file").fetchone()[0], "")
+            conn.close()
+
+
+class ChatgptSourceTest(unittest.TestCase):
+    def conversation(self, cid="s"):
+        def msg(mid, role, kind, **extra):
+            content = {"content_type": kind, **extra}
+            return {"id": mid, "author": {"role": role}, "content": content,
+                    "create_time": 1700000000, "metadata": {"model_slug": "m1"} if role == "assistant" else {}}
+        messages = [msg("u", "user", "text", parts=["甲"]),
+                    msg("p", "assistant", "text", parts=["过程"]),
+                    msg("r", "assistant", "thoughts", thoughts=[{"summary": "摘要", "content": "推理"}]),
+                    msg("a", "assistant", "text", parts=["答甲"]),
+                    msg("v", "user", "text", parts=[]),
+                    msg("b", "assistant", "text", parts=["答乙"])]
+        messages[3]["metadata"]["model_slug"] = "m2"
+        messages[4]["metadata"]["attachments"] = [{"id": "file1", "name": "input.pdf"}]
+        mapping = {str(i): {"message": m, "parent": str(i-1) if i else None} for i, m in enumerate(messages)}
+        mapping["side"] = {"message": msg("side", "assistant", "text", parts=["旁路"]), "parent": "0"}
+        return {"id": cid, "title": "测试", "mapping": mapping, "current_node": "5", "create_time": 1700000000}
+
+    def test_branch_order_provenance_missing_assets_and_models(self):
+        from .sources import chatgpt
+        from . import label, deep_rough_read
+        conv = self.conversation()
+        session, turns = chatgpt.parse_conversation(conv, Path("/raw.json"), "/w")
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].models, ["m1", "m2"])
+        self.assertEqual(turns[0].commentary, ["过程"])
+        self.assertEqual(turns[0].reasoning, ["摘要\n\n推理"])
+        self.assertEqual(turns[0].address["messages"], ["u", "p", "r", "a"])
+        self.assertEqual(turns[1].user, "")
+        self.assertEqual(turns[1].tools, [])
+        self.assertTrue(all(t.closed for t in turns))
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = st.connect(Path(tmp) / "e.db")
+            op = collect.collector(conn)
+            self.assertEqual(collect.save(conn, op, session, turns), (2, 2, 0))
+            self.assertEqual(collect.save(conn, op, session, turns), (0, 0, 0))
+            session.session = "clone"
+            self.assertEqual(collect.save(conn, op, session, turns), (2, 0, 0))
+            row = conn.execute(observe.TURNS + " WHERE d.session='s' AND d.ordinal=1").fetchone()
+            _, prompt = deep_rough_read.turn_blocks(row)
+            self.assertIn("input.pdf", prompt)
+            self.assertIn("未取得附件正文", prompt)
+            self.assertIn("ChatGPT 静态导出", preview.turn_line(row))
+            self.assertIn("工具记录未提供", preview.turn_line(row))
+            self.assertNotIn("没用工具", preview.turn_line(row))
+            conn.close()
+
+    def test_invalid_branch_and_unsupported_content_fail_explicitly(self):
+        from .sources import chatgpt
+        for mutation in ("cycle", "missing", "unsupported"):
+            with self.subTest(mutation=mutation):
+                conv = self.conversation()
+                if mutation == "cycle": conv["mapping"]["0"]["parent"] = "5"
+                elif mutation == "missing": conv["mapping"]["0"]["parent"] = "lost"
+                else: conv["mapping"]["0"]["message"]["content"]["content_type"] = "future"
+                with self.assertRaises(ValueError):
+                    chatgpt.parse_conversation(conv, Path("raw.json"), "/w")
+
+    def test_explicit_configuration_incremental_and_workspace_change(self):
+        from unittest.mock import patch
+        from .sources import chatgpt
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "input.json"
+            path.write_text(json.dumps([self.conversation()]))
+            conn = st.connect(Path(tmp) / "e.db")
+            config = [{"file": str(path), "cwd": "/first"}]
+            with patch.object(chatgpt.instance, "CHATGPT_EXPORTS", config):
+                first = collect.run(conn, sources=("chatgpt",))
+                self.assertEqual(first["chatgpt"]["turns"], 2)
+                self.assertEqual(collect.run(conn, sources=("chatgpt",))["chatgpt"]["skipped"], 1)
+                config[0]["cwd"] = "/second"
+                self.assertEqual(collect.run(conn, sources=("chatgpt",))["chatgpt"]["files"], 1)
+                self.assertEqual(conn.execute("SELECT cwd FROM session_detail").fetchone()[0], "/second")
+            conn.close()
+
+    def test_missing_export_does_not_block_another_export(self):
+        from unittest.mock import patch
+        from .sources import chatgpt
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "input.json"
+            path.write_text(json.dumps([self.conversation()]))
+            config = [{"file": str(path.with_name("missing.json")), "cwd": "/w"},
+                      {"file": str(path), "cwd": "/w"}]
+            conn = st.connect(Path(tmp) / "e.db")
+            with patch.object(chatgpt.instance, "CHATGPT_EXPORTS", config):
+                got = collect.run(conn, sources=("chatgpt",), log=io.StringIO())["chatgpt"]
+            self.assertEqual((got["failed"], got["turns"]), (1, 2))
+            conn.close()
+
+    def test_snapshot_keeps_unanswered_internal_turn_but_not_unfinished_tail(self):
+        from .sources import chatgpt
+        conv = self.conversation()
+        conv["mapping"]["4"]["parent"] = "0"
+        # 第一个用户输入后没有回答，仍保存；最后一个输入没有回答，留在导出里、不入库。
+        conv["current_node"] = "4"
+        session, turns = chatgpt.parse_conversation(conv, Path("raw.json"), "/w")
+        self.assertEqual([t.closed for t in turns], [True, False])
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = st.connect(Path(tmp) / "e.db")
+            collect.save(conn, collect.collector(conn), session, turns)
+            self.assertEqual(conn.execute("SELECT count(*) FROM turn_detail").fetchone()[0], 1)
+            self.assertEqual(observe.progress(conn)[0]["state"], "no_answer")
+            conn.close()
+
+
+class SelectTest(unittest.TestCase):
+    """带视角筛 E 的解析（2026-11-11）：只认这次给的 E；出处里有用户原话的保底留下。"""
+
+    def test_parse(self):
+        from . import select
+        evs = [{"id": 1, "segments": ["0:U1"]}, {"id": 2, "segments": ["0:A1"]}, {"id": 3, "segments": json.dumps(["1:A2"])}]
+        out = "删 第1轮：E1、E2｜复述\n删 第2轮：E3、E99｜解释\n"
+        drop, reasons, guard = select.parse(out, evs)
+        self.assertEqual(drop, [2, 3])                   # E99 不是这次的，不认
+        self.assertEqual(guard, [1])                     # 用户原话保底留下
+        self.assertEqual(len(reasons), 2)
+        self.assertEqual(select.parse("全留", evs), ([], [], []))

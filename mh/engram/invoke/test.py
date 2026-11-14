@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from . import Claude, Codex, DshWeb, call, catalog
+from . import Claude, Codex, DshWeb, call, catalog, relink
 
 
 class InvokeTest(unittest.TestCase):
@@ -29,6 +29,22 @@ class InvokeTest(unittest.TestCase):
         self.assertEqual(tagged.isolation, one.isolation + "-allow-t")
         self.assertEqual(Claude().isolation, "claude-home-v1")
         self.assertEqual(Codex("gpt", "high", isolation="codex-home-v1-high").isolation, "codex-home-v1-high")
+
+    def test_relink(self):
+        d = self.a.parent
+        main, cred = d / "main.json", d / "home.json"
+        put = lambda path, exp, tok: path.write_text(json.dumps({"claudeAiOauth": {"expiresAt": exp, "accessToken": tok}}))
+        put(main, 100, "old")
+        relink(cred, main)                                   # 没有副本：链上
+        self.assertTrue(cred.is_symlink())
+        cred.unlink(); put(cred, 200, "new")                 # claude 刷新后把链接写成普通文件，副本更新：写回主凭据
+        relink(cred, main)
+        self.assertTrue(cred.is_symlink())
+        self.assertEqual(json.loads(main.read_text())["claudeAiOauth"]["accessToken"], "new")
+        cred.unlink(); put(cred, 0, "")                      # 刷新失败写回的空令牌：不覆盖主凭据
+        relink(cred, main)
+        self.assertEqual(json.loads(main.read_text())["claudeAiOauth"]["accessToken"], "new")
+        self.assertTrue(cred.is_symlink())
 
     def test_allowed(self):
         w = DshWeb("m", port=39005, box=self.a.parent / "box", allow=lambda c: c.startswith("count "))

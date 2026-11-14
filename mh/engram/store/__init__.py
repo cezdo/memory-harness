@@ -27,7 +27,8 @@ DEFAULT_DB = HOME / "engram.db"
 # 两种都沾的（超时的字样加上额度、限流）按环境错误算。
 ENVIRONMENTAL = re.compile(r"quota|insufficient|balance|rate.?limit|usage limit|too many requests|\b40[23]\b|\b429\b|\b50[23]\b"
                            r"|overloaded|\bmodel is at capacity\b|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
-                           r"|waiting for service|did not activate|can.t find source path|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅", re.I)
+                           r"|waiting for service|did not activate|can.t find source path|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅"
+                           r"|failed to authenticate|OAuth|\b401\b|登录过期", re.I)     # 认证失败（11-11 claude -p 刷新失败被当成内容错误，25 轮满次数）
 # 内容过滤：服务商按内容拦下（如 ark 的 finish_reason: content_filter）。重试不会变，这一份就不要了（2026-10-17）
 FILTERED = re.compile(r"content_filter|content.?(policy|moderation)|内容过滤|内容安全|敏感内容", re.I)
 
@@ -44,6 +45,11 @@ def restyle(text):
 
 def environmental(error):
     return bool(error) and bool(ENVIRONMENTAL.search(error))
+
+
+def counted(result, error):
+    """这次失败算不算进失败次数：按现在的规则重判记下的 error，act 只追加、不改（11-11：当时没认出的环境错误，规则补上后不再挡着）。"""
+    return result in ("timeout", "content_error") and outcome(error)[0] in ("timeout", "content_error")
 
 
 def filtered(error):
@@ -110,9 +116,11 @@ CREATE TABLE IF NOT EXISTS turn_detail(
   origin TEXT NOT NULL,           -- human | host | script | main（主会话，开关记录里的 yorimichi）：这一轮开头是谁
   host_kind TEXT NOT NULL,        -- notification | interrupt | command | compaction | restart（origin = host 时）
   asides TEXT NOT NULL DEFAULT '[]',   -- 别的会话发来、不成轮的消息 [{"who", "text"}，轮后的加 "after", "reply"]（2026-11-01）
+  models TEXT NOT NULL DEFAULT '[]',   -- 本轮实际输出的模型顺序；空 = 来源未提供，不从 session.model 倒推
   UNIQUE(source, session, ordinal));
 CREATE INDEX IF NOT EXISTS turn_detail_text ON turn_detail(text);
-CREATE TABLE IF NOT EXISTS collect_file(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS collect_file(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL,
+  parser TEXT NOT NULL DEFAULT '');
 
 CREATE TABLE IF NOT EXISTS act_detail(
   occurrence INTEGER PRIMARY KEY,
@@ -253,6 +261,13 @@ def _migrate(conn):
     if cols and "asides" not in cols:                  # 别的会话发来的消息（2026-11-01）
         conn.execute("ALTER TABLE turn_detail ADD COLUMN asides TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
+    if cols and "models" not in cols:
+        conn.execute("ALTER TABLE turn_detail ADD COLUMN models TEXT NOT NULL DEFAULT '[]'")
+        conn.commit()
+    cache_cols = [r[1] for r in conn.execute("PRAGMA table_info(collect_file)")]
+    if cache_cols and "parser" not in cache_cols:
+        conn.execute("ALTER TABLE collect_file ADD COLUMN parser TEXT NOT NULL DEFAULT ''")
+        conn.commit()
     cols = [r[1] for r in conn.execute("PRAGMA table_info(request_detail)")]
     if "target" in cols:
         if conn.execute("SELECT COUNT(*) FROM request_detail").fetchone()[0]:
@@ -353,6 +368,13 @@ def workspace(cwd):
         if c == d or c.startswith(d + "/"):
             return WORKSPACE_DIRS[d]
     return c.split("/")[-1] if c else ""
+
+
+def worktree_uncertain(cwd):
+    """Zeron 的 worktree 删了、读不出主仓库：工作区只能按项目名猜，等模型或用户确认（form 挂线时跳过，2026-11-13）。
+    tmp/worktrees、.claude/worktrees 按路径就能算回仓库，不算不确定。"""
+    m = _ZERON.match((cwd or "").rstrip("/"))
+    return bool(m) and worktree_main(m.group(1)) is None
 
 
 def canonical(ws):

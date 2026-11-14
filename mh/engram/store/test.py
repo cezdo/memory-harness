@@ -2,6 +2,7 @@
 
 python3 -m unittest mh.engram.store.test
 """
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -24,6 +25,20 @@ class ResourceTest(unittest.TestCase):
                 self.assertEqual(instance.resource("standing", development, "standing.md"), development)
             with mock.patch.object(instance, "_D", {"resources": {"standing": str(root / "explicit.md")}}):
                 self.assertEqual(instance.resource("standing", development, "standing.md"), root / "explicit.md")
+
+
+class ConnectTest(unittest.TestCase):
+    def test_under_wildcards(self):
+        """[connect] 的两项是路径的通配符（用户 2026-11-14：`*tmp`）：路径本身或任一上级对上就算，~ 先展开。"""
+        from . import instance as i
+        with mock.patch.dict(os.environ, {"HOME": "/home/user"}):     # 家目录不能在 /tmp 下，不然 *tmp 会盖住反例
+            home = "/home/user"
+            pats = i._patterns(["*tmp", "~/bench"])
+            self.assertEqual(pats, ("*tmp", home + "/bench"))
+            for cwd, want in ((home + "/projects/dsh/tmp", True), (home + "/tmp/a/b", True), ("/tmp/x", True),
+                              (home + "/bench/sub", True), (home + "/benchmark", False), (home + "/attempt", False), ("", False)):
+                self.assertEqual(i.under(cwd, pats), want, cwd)
+            self.assertFalse(i.under(st.unworktree(home + "/memory-harness/tmp/worktrees/x"), pats))   # 先算回仓库：mh 的 worktree 不算 tmp
 
 
 class StoreTest(unittest.TestCase):
@@ -82,6 +97,18 @@ class StoreTest(unittest.TestCase):
             with mock.patch.dict(st.WORKSPACE_DIRS, dirs, clear=True):               # 换名按这台机器的映射；公开包里没有映射，自带一份
                 self.assertEqual([st.canonical(w) for w in ("mobile-ui", "memory-system", ".dsh", "dsh", "x")],
                                  ["dsh", ".memory", "dsh", "dsh", "x"])
+
+    def test_worktree_uncertain(self):
+        """Zeron 的 worktree 删了才算不确定；tmp/.claude 按路径能算回仓库（2026-11-13）。"""
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d, ".zeron/worktrees/proj/aspen")
+            live.mkdir(parents=True)
+            (live / ".git").write_text(f"gitdir: {d}/repo/.git/worktrees/aspen\n")
+            self.assertFalse(st.worktree_uncertain(str(live)))
+            self.assertTrue(st.worktree_uncertain(f"{d}/.zeron/worktrees/proj/gone"))
+            self.assertFalse(st.worktree_uncertain(f"{d}/repo/tmp/worktrees/gone"))
+            self.assertFalse(st.worktree_uncertain(f"{d}/repo/.claude/worktrees/gone"))
+            self.assertFalse(st.worktree_uncertain(""))
 
     def test_delete_sessions(self):
         """删除（2026-10-22）：只属于这段会话的发生和 Claim 删掉，混着别的会话的留下；删除留记录，触发器装回去。"""
@@ -198,6 +225,12 @@ class StoreTest(unittest.TestCase):
                                  "\\', \\'code\\': \\'RATE_LIMIT\\'}}')")[0], "env_error")
         # 2026-11-06：dsh 实例目录被删，bwrap 找不到程序目录，是环境不是内容
         self.assertEqual(outcome("RuntimeError(\"dsh web 没有起来：bwrap: Can't find source path /x/env-next: No such file or directory\\n\")")[0], "env_error")
+        # 2026-11-11：claude -p 刷新令牌失败，认证是环境；当时记成 content_error 的，按现在的规则不再计次
+        auth = "RuntimeError('claude -p 失败（1）：Failed to authenticate: OAuth session expired and could not be refreshed')"
+        self.assertEqual(outcome(auth)[0], "env_error")
+        self.assertFalse(st.counted("content_error", auth))
+        self.assertTrue(st.counted("content_error", "content_error: 没有解析出事件，也没写“无”"))
+        self.assertFalse(st.counted("env_error", "HTTP 429"))
         self.assertEqual(outcome("finish_reason: content_filter")[0], "filtered")
         self.assertEqual(outcome("解析失败")[0], "content_error")
         self.assertEqual(st.restyle("合并成一句「引用：三个风险」，写进「文件：docs/a.md」，名字「dsh」不动"),

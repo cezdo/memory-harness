@@ -824,10 +824,13 @@ def hook(stdin=sys.stdin, stdout=sys.stdout):
     整句是联想开关命令（`push/switch`）时记下、拦下，返回退出码（codex 拦输入是 2）。"""
     from .. import library
     from . import switch
+    from ...engram.store.instance import unplugged
     d = {}
     conn = None
     try:
         d = json.load(stdin)
+        if unplugged(d.get("cwd")):          # 不接 mh 的目录（[connect].unplugged）：开关命令也照常发给模型，不记
+            return None
         code = switch.handle(d, d.get("host") or "claude", stdout, sys.stderr)       # 开关命令：记下、拦下，不联想
         if code is not None:
             return code

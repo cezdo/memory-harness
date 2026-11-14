@@ -8,8 +8,9 @@
 - 进程常驻于一段会话：pull 的读视图按库的变化缓存，get、map 不用每次重建。
 - 出错不让会话断：返回 isError 和错误文字，进程继续。
 - observe-now（2026-10-30 加，2026-11-06 撤，v0.41）：“我”让观察现在把尾巴读掉；用户 11-06：快不该放在 SSD 层，连同快道一起撤。
-  以后改成当场写进内存、调用即标记，另起名字（runbook I7）。
+  以后改成调用即标记，11-13 定名 shiori（见下）。
 - yorimichi（2026-10-28）：“我”在对话阶段变了时记一次允许联想拐几次（1 平常，0 只在一被打断就容易出错时，2–3 发散；2026-11-02 改成以 1 为常态），联想的钩子读它；实现在 push/yorimichi。
+- shiori（2026-11-13，runbook I7）：“我”给这一轮夹栞；调用本身留在会话日志里就是标记，服务这边不写任何东西（engram/observe/shiori）。
 - feedback（2026-10-19 加，2026-11-02 撤，v0.36）：现阶段反馈少、集中、用户在场，主会话没用过这个工具（130 次反馈都是开发中直接调
   form 写的），撤出 MCP；form 的反馈函数和命令行 `mh engram feedback` 留着，以后阶段变了再接（Engram 设计“反馈”）。
 注册（用户级，所有工作区都能用；观察者的 claude -p 带 --strict-mcp-config 和独立配置目录，不会加载它）：
@@ -25,7 +26,7 @@ import traceback
 from pathlib import Path
 
 from .. import library
-from ...engram.store.instance import USER_NAME
+from ...engram.store.instance import USER_NAME, unplugged
 
 NAME, PROTOCOL = "mh", "2025-06-18"
 
@@ -45,14 +46,12 @@ TOOLS = [
          "required": ["words"]}},
     {"name": "relive",
      "description": "按句柄读记忆库（不是文件），不按相关度：陈述给它自己，话题从头按顺序读（超过一页先给这段对话的结构），线、骨架给下一层，E、J 给正文。"
-                    "句柄：线 L3，话题 L3:T5 或 T5，陈述 L3:T5:S1 或 T5:S1（一段 L3:T5:S1-S8），骨架 k-，E5，J5；名字逐字唯一也认。",
+                    "句柄：线 L3，话题 L3:T5 或 T5，陈述 L3:T5:S1 或 T5:S1（一段 L3:T5:S1-S8），骨架 k-，E5，J5，认知 C5；名字逐字唯一也认。",
      "inputSchema": {"type": "object", "properties": {
          "handles": {"type": "array", "items": {"type": "string"}, "description": "句柄，一个或几个"},
          "source": {"type": "boolean", "description": "来源：陈述依据的 E；J 的旧会话"},
          "said": {"type": "boolean", "description": "走到原话"},
-         "files": {"type": "boolean", "description": "陈述里『文件：』指向的 E（默认不给，和来源分开）"},
          "near": {"type": "boolean", "description": "陈述：连同所在话题里前后各 3 条（▶ 是要的那条）"},
-         "recall": {"type": "string", "description": "历史：all 或 N（陈述何时写出、还在不在；话题的旧版；J 的关系链）"},
          **WINDOW},
          "required": ["handles"]}},
     {"name": "roam",
@@ -66,6 +65,12 @@ TOOLS = [
          "width": {"type": "integer", "description": "0 不给联想，1 平常，2–3 发散"},
          "why": {"type": "string", "description": "一句话：为什么这么判"}},
          "required": ["width"]}},
+    {"name": "shiori",
+     "description": "栞：在这一轮夹一枚书签，标出它要紧、以后要能想起来（定下的事、纠正、只在这里说过的理由）。"
+                    "调用本身留在会话记录里就是标记：观察会精读这一轮；落库以前，手记近况的“未落库”一节列着它。不搬运内容，不用写正文。",
+     "inputSchema": {"type": "object", "properties": {
+         "why": {"type": "string", "description": "一句话：这一轮为什么要紧"}},
+         "required": ["why"]}},
 ]
 
 
@@ -102,9 +107,14 @@ def check_args(name, args):
         raise ArgError(f"{name} 参数不对：{bad}。参数有：{want}")
 
 
+UNPLUGGED_SAID = "这个目录不接 mh（实例配置 [connect].unplugged），记忆工具在这里不用。"
+
+
 def call(conn, name, args):
     """执行一个工具，返回文字。"""
     check_args(name, args)
+    if unplugged(args.get("cwd") or os.getcwd()):
+        return UNPLUGGED_SAID
     kw = dict(session=_session(args), purpose="interactive", cwd=args.get("cwd") or os.getcwd(), note=args.get("note") or "")
     if name in ("evoke", "relive", "roam"):
         return _call_new(conn, name, args, kw)
@@ -112,6 +122,8 @@ def call(conn, name, args):
         from ..push import yorimichi
         return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "",
                            host="claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
+    if name == "shiori":        # 栞（I7，2026-11-13）：调用本身就是标记，这里什么都不写（engram/observe/shiori）
+        return "夹好了。这一轮会被精读；落库以前，手记近况的“未落库”里看得到它。"
     raise ValueError(f"没有工具 {name}")
 
 
@@ -145,7 +157,7 @@ def handle(conn, msg):
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": tools()}
+        result = {"tools": [] if unplugged(os.getcwd()) else tools()}     # 不接 mh 的目录里起的（Claude Code、codex 按会话起）：不给工具
     elif method == "tools/call":
         p = msg.get("params") or {}
         try:

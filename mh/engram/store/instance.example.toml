@@ -21,8 +21,18 @@ aliases = []                                     # 另外的称呼：识别与�
 # session = "<会话 id>"
 # workspace = "<工作区>"
 
-[observe]                                        # 观察（2026-11-07）：工作区级的默认
-# skip_workspaces = ["tmp"]                      # 这些工作区的会话默认不观察：不预览、不读，原文照收；已有 E 不动；会话里 /do-observe 可临时打开
+[engram]
+# pause_sources = ["chatgpt"]                  # 暂停的来源：observe 不预览不读，form 全部步骤跳过；原文照收，已有 E、陈述不动
+# views = { chatgpt = "mh 发展史" }             # 来源 → 视角：observe 读完先按视角筛 E，form 的 pack 加视角要求
+
+[connect]                                        # 会话接 mh 到哪一步，按路径的通配符（cwd 本身或任一上级对上就算，含子目录；`*` 也跨 /）；不在下面的全接（2026-11-14）
+# unwatched = ["*/tmp"]                          # 接 mh（手记、联想、记忆工具照常），原文照收，不观察（不预览、不读）；已有 E 不动；会话里 /do-observe 可临时打开（2026-11-07，旧写法 [observe].skip_workspaces 照认）
+# unplugged = ["~/projects/sandbox"]             # 不接 mh（没有手记、联想、记忆工具，开关和内核态不管），原文也不收（2026-11-14，测试环境）
+
+[observe]
+
+# chatgpt_exports = [{file = "~/exports/conversations-mh.json", cwd = "~/projects/memory-harness"}]
+# 只收显式列出的会话对象数组；cwd 指明内容归属，不按 ChatGPT 项目标签推断。
 
 [synapse]
 quiet = []                                       # 不当“查不到的词”送的词（手动名单）

@@ -301,7 +301,7 @@ def page(conn, source, session, focus=None, title=None, note=""):
 <p class="lede">原话是 turn；observe 先预览{e(label.USER_NAME)}的话、把轮次分组定读法，再精读、粗读，写下 event（E）；旧版本的 E 是逐轮观察的。
 逐轮记录、会话记录是 form 的内部数据，judgment（J）是判断，旧认识 K 是旧版本 J（编号不变）。每一步都是一次 act。{e(note)}</p>
 <dl class="meta"><dt>会话</dt><dd>{e(s['source'])} · <span class="h">{e(s['session'])}</span></dd>
-<dt>工作区</dt><dd>{v(s['cwd'])}</dd><dt>当时的我</dt><dd>{v(s['model'])}</dd>
+<dt>工作区</dt><dd>{v(s['cwd'])}</dd><dt>当时的我</dt><dd>各轮分别标注</dd>
 <dt>开始</dt><dd>{e(conn.execute('SELECT started FROM occurrence WHERE id=?', (sid,)).fetchone()[0])}</dd>
 <dt>这一片</dt><dd>{len(turns)} 轮 · {len(turn_acts) + len(previews) + len(group_acts) + len(packs) + len(judges) + len(relates)} 次 act · {n_ev} 条 E · {len(js)} 条 J（当前一版）· {n_rel} 条关系 · {len(uses)} 次 use</dd></dl>
 </header>""")
@@ -359,7 +359,7 @@ def page(conn, source, session, focus=None, title=None, note=""):
     if not turn_acts:
         out.append("<section><h2>逐轮的原话</h2>")
         for t in turns:
-            out.append(f'<h3>第 {t["ordinal"] + 1} 轮 · {e(t["started"][:16])} · 开头是 {e(t["origin"])}</h3>')
+            out.append(f'<h3>第 {t["ordinal"] + 1} 轮 · {e(t["started"][:16])} · 开头是 {e(t["origin"])} · {e(label.model_note(t))}</h3>')
             out.append(f'<div class="turn-user">{e(label.user_text(t["user"])[0][:600])}{"…" if len(t["user"]) > 600 else ""}</div>')
         turns = []
     else:
@@ -367,7 +367,7 @@ def page(conn, source, session, focus=None, title=None, note=""):
     for t in turns:
         mine = [a for a in turn_acts if json.loads(a["window"])["turn"] == t["occurrence"]]
         split, org = _latest_ok([a for a in mine if a["step"] == "split"]), _latest_ok([a for a in mine if a["step"] == "organize"])
-        out.append(f'<h3>第 {t["ordinal"] + 1} 轮 · {e(t["started"][:16])} · 开头是 {e(t["origin"])}</h3>')
+        out.append(f'<h3>第 {t["ordinal"] + 1} 轮 · {e(t["started"][:16])} · 开头是 {e(t["origin"])} · {e(label.model_note(t))}</h3>')
         out.append(f'<div class="turn-user">{e(label.user_text(t["user"])[0][:600])}{"…" if len(t["user"]) > 600 else ""}</div>')
         segs = segments(conn, t["occurrence"])          # 旧版本逐轮观察（split）：读过压缩总结全文
         if split:

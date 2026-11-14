@@ -23,7 +23,8 @@ def alive(pid):
         return os.waitpid(pid, os.WNOHANG) == (0, 0)
     except ChildProcessError:               # 整理循环重启过：不是自己的子进程了，按 /proc 认，pid 被复用的不算
         try:
-            return (b"claude" in Path(f"/proc/{pid}/cmdline").read_bytes()
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return (any(name in cmd for name in (b"claude", b"codex"))
                     and "zombie" not in Path(f"/proc/{pid}/status").read_text().lower())
         except OSError:
             return False

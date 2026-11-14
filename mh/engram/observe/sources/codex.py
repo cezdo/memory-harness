@@ -4,8 +4,11 @@ import re
 from pathlib import Path
 
 from .turn import Session, Turn
+from ...store import HOME
 
-ROOTS = [Path.home() / ".codex/sessions", Path.home() / ".codex/archived_sessions"]
+SELF_ROOT = HOME / "codex-self-home"
+ROOTS = [Path.home() / ".codex/sessions", Path.home() / ".codex/archived_sessions",
+         SELF_ROOT / "sessions", SELF_ROOT / "archived_sessions"]
 KINDS = {"user": "user", "subagent": "subagent", "guardian_review": "review"}
 
 # 宿主注入而非用户输入的块：整块包在一个 <tag>…</tag> 里，或是 AGENTS.md 注入
@@ -41,6 +44,7 @@ def _out_text(content):
 def parse(path):
     session = Session("codex", path.stem, str(path))
     turns, cur = [], None
+    active_model = ""
     goal, said = None, None         # 用户设的目标；已经作为用户的话起过一轮的那个目标
 
     def close():
@@ -69,10 +73,12 @@ def parse(path):
                 session.kind = KINDS.get(p.get("thread_source"), p.get("thread_source") or "user")
                 session.cwd = p.get("cwd", "")
                 session.started = p.get("timestamp", "")
-            elif t == "turn_context" and not session.model:
-                session.model = p.get("model", "")
+            elif t == "turn_context":
+                active_model = p.get("model", "")
+                session.model = active_model
             elif t == "event_msg" and p.get("type") == "thread_settings_applied":
-                session.model = (p.get("thread_settings") or {}).get("model", session.model)
+                active_model = (p.get("thread_settings") or {}).get("model", active_model)
+                session.model = active_model
             elif t == "event_msg" and p.get("type") == "thread_goal_updated":
                 goal = ((p.get("goal") or {}).get("objective") or "").strip() or goal
             elif t == "event_msg" and p.get("type") == "task_complete" and cur is not None:
@@ -92,6 +98,7 @@ def parse(path):
                     cur = {"turn": Turn(user=text, started=o.get("timestamp", ""),
                                         address={"line": [lineno, lineno]}), "_final": []}
                 elif role == "assistant" and cur is not None:
+                    cur["turn"].note_model(p.get("model") or active_model)
                     text = _out_text(p.get("content"))
                     if text:
                         target = cur["_final"] if p.get("phase") == "final_answer" else cur["turn"].commentary
@@ -99,6 +106,10 @@ def parse(path):
             elif t == "response_item" and cur is not None and p.get("type") in (
                     "function_call", "custom_tool_call"):
                 cur["turn"].tools.append(p.get("name", "?"))
+            elif t == "event_msg" and p.get("type") == "item_completed" and cur is not None \
+                    and (p.get("item") or {}).get("type") == "McpToolCall":     # MCP 调用不走 function_call（2026-11-13 查到，之前漏记）
+                item = p["item"]
+                cur["turn"].tools.append(f"mcp__{item.get('server', '?')}__{item.get('tool', '?')}")
             if cur is not None:
                 cur["turn"].address["line"][1] = lineno
     close()

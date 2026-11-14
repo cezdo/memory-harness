@@ -5,18 +5,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .turn import Session, Turn
+from ...store import HOME
 
 ROOT = Path.home() / ".dsh/sessions"
+SELF_ROOT = HOME / "dsh-self-home/sessions"   # self 工作区的会话（2026-11-08，design/rhythm/self）：独立 DSH_HOME，由 hosts/dsh.py 照代码重写
 _RANK = {"session.v4.jsonl.zstd": 4, "session.v3.jsonl.zstd": 3, "session.jsonl.zstd": 1}
 SWITCHES = ("no-observe", "do-observe")
 
 
-def files():
+def _files(root):
     """每个会话目录只取最高版本的日志；旧版本是迁移前的副本。"""
-    for d in sorted(p for p in ROOT.glob("*/*") if p.is_dir()):
+    for d in sorted(p for p in root.glob("*/*") if p.is_dir()):
         logs = [p for p in d.iterdir() if p.name in _RANK]
         if logs:
             yield max(logs, key=lambda p: _RANK[p.name])
+
+
+def files():
+    yield from _files(ROOT)
+    yield from _files(SELF_ROOT)
 
 
 def _iso(ms):
@@ -41,6 +48,7 @@ def _texts(content, kind):
 def parse(path):
     session = Session("dsh", path.parent.name, str(path))
     turns, cur, texts, waiting = [], None, [], []
+    active_model = ""
 
     def close(closed):
         if cur is None:
@@ -63,8 +71,9 @@ def parse(path):
         elif t == "subagent/descriptor":
             session.kind = "subagent"
             session.model = d.get("agentModel", session.model)
-        elif t in ("request/context", "model/selection") and not session.model:
-            session.model = d.get("model", "")
+        elif t in ("request/context", "model/selection"):
+            active_model = d.get("model", "")
+            session.model = active_model
         elif t == "session/title":
             session.title = d.get("title", session.title)
         elif t == "command/run" and d.get("name") in SWITCHES and not (d.get("args") or "").strip():
@@ -87,6 +96,7 @@ def parse(path):
             cur, texts = Turn(user=text, started=_iso(e.get("time")), address={"seq": [seq, seq]}), []
         elif t == "assistant/message" and cur is not None:
             msg = d.get("message") or {}
+            cur.note_model(msg.get("model") or active_model)
             text = "\n".join(_texts(msg.get("content"), "text")).strip()
             if text:
                 texts.append(text)
