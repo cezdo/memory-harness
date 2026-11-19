@@ -12,6 +12,7 @@ def main():
     if action == "mcp":
         # 会话来自每次 PreToolUse 的参数；启动 Codex 的外层会话环境不能拿来归属足迹。
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ["MH_HOST"] = "codex"
         from ...pull.mcp import serve
         serve()
         return

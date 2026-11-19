@@ -44,8 +44,14 @@ _EVERY = re.compile(r"^every\s*[:：]\s*(\d+)d\s*$")
 _HOST = re.compile(r"^host\s*[:：]\s*(\S+)\s*$")
 _TOPICS = re.compile(r"^topics\s*[:：]\s*(\d+)\s*$")      # 上次醒以来新增的话题满 N 个（用户 11-11：按时间或按数量整体整理挂线）
 _WAKE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+?)(?:-\d+)?$")
-_RISKY = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:commit|push|merge|rebase|reset|checkout|switch|stash|worktree)\b"
+_RISKY = re.compile(r"\bgit\s+(?:-[Cc]\s+\S+\s+)*(?:commit|push|merge|rebase|reset|checkout|switch|stash|worktree|clean|restore"
+                    r"|branch\s+-[dD])\b"
                     r"|\bsystemctl\b|\bp?kill\b|\brm\s|\bmh\s+(?:check|rhythm|quota)\b|-m\s+mh\s+(?:check|rhythm|quota)\b")
+# 沙箱给记忆自己的记录开着写（confine.MIND），Bash、python 写进去核查认不出路径，只能列命令（方向探索第 4 轮，11-15）：
+# 命令里碰到这些记录、sqlite3 或 store.connect(，又没写只读打开的，列出来看一眼
+_MIND = re.compile(r"\bsqlite3\b|\bstore\.connect\(|" + re.escape(store.HOME.name) + r"/(?:"
+                   + "|".join(map(re.escape, confine.MIND)) + r")\b")
+_RO = re.compile(r"mode=ro\b|readonly=True|immutable=1")
 
 
 def notes(root=ROOT):
@@ -100,7 +106,7 @@ def new_topics(since, db=store.DEFAULT_DB):
 
 
 # ---- 状态：数据目录的 self.json ----
-# {"woke": {便签: 时刻}, "retry": {便签: 时刻}, "threads": {便签: 会话}, "log": [醒的时刻…], "run": {pid, note, dir, logs, session, started}}
+# {"woke": {便签: 时刻}, "retry": {便签: 时刻}, "unfinished": {便签: {dir, logs, said, timed_out, at}}, "threads": {便签: 会话}, "log": [醒的时刻…], "run": {pid, note, dir, logs, session, started}}
 
 def _state_path():
     return store.HOME / "self.json"
@@ -148,8 +154,9 @@ def thread(st, name, host):
     return host.new_session(), False, prev and prev["session"]
 
 
-def awaken(note, now, d, resumed, prev, last=None, scratch=None):
-    """醒来那一轮眼前的东西：便签正文，加程序写的“此刻”。没有别的说明，怎么待在这里写在 self 的 AGENTS.md。"""
+def awaken(note, now, d, resumed, prev, last=None, scratch=None, broken=None):
+    """醒来那一轮眼前的东西：便签正文，加程序写的“此刻”。没有别的说明，怎么待在这里写在 self 的 AGENTS.md。
+    broken：这张便签上一次醒来没正常结束时 finish 留下的（目录、草稿纸、最后一句）。每次另开会话，不说就会从头重做（11-15 第 4 轮被额度截断）。"""
     cond = "；".join(filter(None, [f"at: {note['at']}" if note["at"] else "", f"every: {note['every']}d" if note["every"] else "",
                                    f"topics: {note['topics']}" if note.get("topics") else ""]))
     home_ = Path.home()
@@ -165,6 +172,14 @@ def awaken(note, now, d, resumed, prev, last=None, scratch=None):
         lines.append("这是接着上次那段会话醒来的。")
     elif prev:
         lines.append(f"上一段会话（{prev}）；这次另开一段，按需用 evoke、relive 或读那时醒来的目录接回前情。")
+    if broken:
+        lines += ["", f"这张便签上一次醒来（{broken.get('at', '')[:16].replace('T', ' ')}）没有正常结束"
+                  + ("，是超时停掉的" if broken.get("timed_out") else "") + "；这次是接着它重开，不是从头来。",
+                  f"- 那次的目录：`{show(broken['dir'])}`（已经提交在 self 里，写到一半的都在）。",
+                  f"- 那次的草稿纸：`{show(Path(broken['logs']) / confine.SCRATCHPAD)}`（现在只读；要接着用的复制到这次的草稿纸）。"]
+        if broken.get("said"):
+            lines.append(f"- 那次最后一句：{broken['said']}")
+        lines.append("先读那两处，看做到了哪、哪些已经落了盘，接着做剩下的；接着写的放进这次的目录，开头指回那次的。")
     lines += ["", "世界的现状（程序编的）：", world.world(now)]
     return "\n".join(lines)
 
@@ -185,7 +200,8 @@ def start(note, now=None, root=ROOT, st=None):
     session, resumed, prev = thread(st, note["name"], host)
     last = state(st).get(note["name"])
     (logs / "开始时.json").write_text(json.dumps(world.snapshot(), ensure_ascii=False, indent=1))
-    (logs / "此刻.md").write_text(awaken(note, now, d, resumed, prev, last, logs / confine.SCRATCHPAD))
+    (logs / "此刻.md").write_text(awaken(note, now, d, resumed, prev, last, logs / confine.SCRATCHPAD,
+                                         st.get("unfinished", {}).get(note["name"])))
     p = host.launch(root, logs / "此刻.md", session, resumed, logs)
     st.setdefault("woke", {})[note["name"]] = now.isoformat(timespec="seconds")
     st["log"] = [t for t in st.get("log", []) if now - datetime.fromisoformat(t) < timedelta(days=7)] + [now.isoformat(timespec="seconds")]
@@ -200,8 +216,31 @@ def own_actions(acts, root=ROOT, scratch=None):
     只看这次会话（含子代理）自己做的，不拿仓库前后的快照比：用户和别的会话同时也在改。"""
     roots = [Path(x).resolve() for x in (root, scratch) if x]
     outside = [f for kind, f in acts if kind == "write" and not any(Path(f).expanduser().resolve().is_relative_to(r) for r in roots)]
-    risky = [" ".join(c.split())[:200] for kind, c in acts if kind == "run" and _RISKY.search(c)]
+    risky = [" ".join(c.split())[:200] for kind, c in acts
+             if kind == "run" and (_RISKY.search(c) or (_MIND.search(c) and not _RO.search(c)))]
     return list(dict.fromkeys(outside)), list(dict.fromkeys(risky))
+
+
+def others(root, d, since):
+    """self 里没提交的改动中，不是这次醒来写的：醒来目录 d 以外、文件还在、而且醒来开始（since）以前就改过的（看 ctime：
+    mv、改内容都会更新它）。在场的会话留便签常常不提交，收尾的 `git add -A` 原来会把它们算进这次醒来（方向探索第 4 轮，11-15）。
+    删掉、移走的（文件不在了）算这次醒来的。"""
+    out = subprocess.run(["git", "status", "--porcelain", "-z", "-uall"], cwd=root, capture_output=True, text=True).stdout
+    items, got, skip = out.split("\0"), [], False
+    for it in items:
+        if skip or len(it) < 4:
+            skip = False
+            continue
+        skip = it[0] in "RC"                # 已暂存的改名：下一项是原名
+        p = Path(root) / it[3:]
+        if p.resolve().is_relative_to(Path(d).resolve()):
+            continue
+        try:
+            if p.stat().st_ctime < since.timestamp():
+                got.append(it[3:])
+        except OSError:
+            pass
+    return got
 
 
 def finish(now=None, root=ROOT):
@@ -245,22 +284,48 @@ def finish(now=None, root=ROOT):
     if moved:
         lines.append(f"- 同一段时间 mh 那边的变化（快照比的，不一定是我，{USER_NAME}和别的会话也在改）：")
         lines += ["  - " + m.replace("\n", "\n    ") for m in moved]
+    before_wake = others(root, d, started)
+    if before_wake:
+        lines.append("- 醒来以前 self 里就有、没提交的改动，单独提交了，不算这次醒来的：")
+        lines += [f"  - `{f}`" for f in before_wake]
     if said:
         lines += ["", "最后一句：", "", said[:2000]]
     d.mkdir(parents=True, exist_ok=True)
     (d / "核查.md").write_text("\n".join(lines) + "\n")
+    commit = ["git", "-c", "user.name=self", "-c", "user.email=self@localhost", "commit", "-q", "-m"]
+    if before_wake:
+        subprocess.run(["git", "add", "-A", "--", *before_wake], cwd=root, capture_output=True)
+        subprocess.run([*commit, "收进醒来以前没提交的改动（程序）：" + "、".join(before_wake)[:300]], cwd=root, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True)
-    subprocess.run(["git", "-c", "user.name=self", "-c", "user.email=self@localhost", "commit", "-q", "-m",
-                    f"醒来收尾：{d.name}（程序）"], cwd=root, capture_output=True)
+    subprocess.run([*commit, f"醒来收尾：{d.name}（程序）"], cwd=root, capture_output=True)
     if not ok:
         st.setdefault("retry", {})[run["note"]] = (now + RETRY).isoformat(timespec="seconds")
         st.get("woke", {}).pop(run["note"], None)
+        # 出错保存：留下那次的目录、草稿纸、最后一句，重叫时写进“此刻”，接着做（11-15）
+        st.setdefault("unfinished", {})[run["note"]] = {"dir": str(d), "logs": str(logs), "said": " ".join(said.split())[:300],
+                                                        "timed_out": timed_out, "at": run["started"]}
     else:
         st.get("retry", {}).pop(run["note"], None)
+        st.get("unfinished", {}).pop(run["note"], None)
     st["last"] = {**run, "finished": now.isoformat(timespec="seconds"), "ok": ok, "outside": len(outside)}
     st.pop("run")
     _save(st)
     return f"收了 {d.name}：" + ("正常结束" if ok else "没有正常结束，隔一天再叫") + ("；越界，看核查.md" if outside else "")
+
+
+def settle(name, st=None):
+    """一次没正常结束的醒来已经由在场的会话接着收完了：这张便签当作那一次醒过，不再重叫、不再提“上次没结束”。
+    返回一句说明。11-15 第 4 轮是手改 self.json 做的，这里收成一个动作。"""
+    own = st is None
+    st = load() if own else st
+    left = st.get("unfinished", {}).pop(name, None)
+    st.get("retry", {}).pop(name, None)
+    if not left:
+        return f"{name}：没有没收完的醒来"
+    st.setdefault("woke", {})[name] = left["at"]
+    if own:
+        _save(st)
+    return f"{name}：{Path(left['dir']).name} 记成收完了，下次照便签的条件再叫"
 
 
 def pick(now, st, root=ROOT, busy=None):

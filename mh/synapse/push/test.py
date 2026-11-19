@@ -139,7 +139,7 @@ class RecentTest(unittest.TestCase):
 
     def test_workspace_long_segment(self):
         from .. import push
-        long = push.HOME / "x" / ("A" * 300) / "b"            # dsh run_code 里的 base64 被认成路径（2026-11-08）：不抛 Errno 36
+        long = Path.home() / "x" / ("A" * 300) / "b"            # dsh run_code 里的 base64 被认成路径（2026-11-08）：不抛 Errno 36
         self.assertIsInstance(push.workspace(long), str)
 
     def test_short_session(self):
@@ -214,6 +214,20 @@ class RecentTest(unittest.TestCase):
         self.assertEqual(cfg["reflex"], ["- 发文件：scp 到 vps（L1:T1:S1）"])
         self.assertEqual(cfg["notes"], {"design/": "设计"})
         self.assertNotIn("发文件", str(cfg["notes"]))
+
+    def test_services_behind(self):
+        """常驻循环不重新加载代码：起来以后 mh/ 又有提交的服务列一行（方向探索第 4 轮，2026-11-15）。"""
+        from unittest import mock
+        from ...rhythm import register
+        from . import status
+        up = {"a": 100, "b": 300, "c": None}
+        with mock.patch.object(register, "state", lambda n: "active"), mock.patch.object(register, "lines", lambda n, h: []), \
+                mock.patch.object(register, "since", lambda n: up[n]), mock.patch.object(status, "_run", lambda a, cwd=None: "200 abc1234 11-14 21:18"):
+            got = status._services(["a", "b", "c"], "/repo")
+            self.assertEqual(len(got), 2)
+            self.assertIn("- a 起来以后 `mh/` 又有提交（最新 abc1234，11-14 21:18）", got[1])   # b 比提交晚起、c 读不到时刻：不列
+            self.assertEqual(len(status._services(["b"], "/repo")), 1)
+            self.assertEqual(len(status._services(["a"])), 1)                                  # 不给仓库就不比
 
     def test_host_given_section_keeps_sources(self):
         from . import status
@@ -426,12 +440,14 @@ class SwitchTest(unittest.TestCase):
         (home / '.claude/commands').mkdir(parents=True)
         (home / '.claude/commands/no-souhatsu.md').symlink_to('/r/mh/synapse/push/switch/claude/no-souhatsu.md')
         (home / '.codex/skills').mkdir(parents=True)
-        self.assertEqual(len(install(home)), 4)                        # 默认只列，不动宿主
+        self.assertEqual(len(install(home)), 6)                        # 默认只列，不动宿主
         self.assertFalse((home / '.codex/skills/no-souhatsu').is_symlink())
         install(home, apply=True)
         self.assertEqual(os.readlink(home / '.claude/commands/no-souhatsu.md'),
                          str(SKILL / 'no-souhatsu/claude/no-souhatsu.md'))
         self.assertEqual(os.readlink(home / '.codex/skills/do-souhatsu'),
+                         str(SKILL / 'do-souhatsu/codex/do-souhatsu'))
+        self.assertEqual(os.readlink(home / '.gemini/config/skills/do-souhatsu'),
                          str(SKILL / 'do-souhatsu/codex/do-souhatsu'))
         self.assertEqual(install(home, apply=True), [])
 
@@ -467,6 +483,13 @@ class MissingNamesTest(unittest.TestCase):
             self.assertEqual(a.missing(data, toks, text, lambda w: {}), ["Souhatsu", "Yorimichi", "新服务"])   # 拆开，不带标点
         with patch.object(glossary, "entries", return_value=entries):
             self.assertEqual(a.missing(data, toks, text, lambda w: {}), ["新服务"])                          # 词典里有的不列（不分大小写）
+        with tempfile.TemporaryDirectory() as d:                 # 按当前工作区读词典（D6，11-19；GPT 验收查出漏接）
+            g = Path(d) / "docs" / "词典.md"
+            g.parent.mkdir()
+            g.write_text("**新服务 / Xpedition**\n- 指代：x。\n")
+            from ...engram import store as st
+            with patch.dict(st.WORKSPACE_DIRS, {d: "ext-ws"}):
+                self.assertEqual(a.missing(data, toks, text, lambda w: {}, ws="ext-ws"), ["Souhatsu", "Yorimichi"])
 
 
 class YorimichiTest(unittest.TestCase):
@@ -515,7 +538,7 @@ class YorimichiTest(unittest.TestCase):
         for target, value in (
             ('mh.synapse.push.pos.tag', lambda texts: [[(w, 'nz', 0, 0) for w in texts[0].split()]]),
             ('mh.synapse.push.associate.cached', lambda c: {'idx': SimpleNamespace(k={}), 'stmts': '', 'nodes': ''}),
-            ('mh.synapse.push.associate.missing', lambda *args: []),
+            ('mh.synapse.push.associate.missing', lambda *args, **kw: []),
             ('mh.synapse.push.switch.LOG', Path(self.tmp.name) / 'switch.jsonl'),
             ('mh.synapse.push.yorimichi.LOG', self.log),
             ('mh.synapse.push.associate.spans', lambda *args: ([], {}, {'level': None}, {})),
@@ -571,6 +594,8 @@ class RunbookTest(unittest.TestCase):
         self.git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=self.repo,
                                              capture_output=True, text=True, check=True)
         self.git("init", "-q")
+        self.git("config", "--local", "--replace-all", "user.name", "t")
+        self.git("config", "--local", "--replace-all", "user.email", "t@t")
         (self.repo / "runbook.md").write_text("# runbook\n\n- [x] A1 做完了\n- [ ] B2 还在做\n- [ ] C3 " + "长" * 1600 + "\n")
         self.git("add", "."), self.git("commit", "-qm", "runbook")
 
@@ -625,6 +650,49 @@ class RunbookTest(unittest.TestCase):
         from . import runbook
         self.commit("synapse：修一个小问题")
         self.assertNotIn("提交", "\n".join(runbook.behind(self.repo, "runbook.md")))
+
+    def test_auto_updates_only_supported_facts_and_completion(self):
+        from . import runbook
+        path = self.repo / "runbook.md"
+        self.commit("B2：首批已上线")
+        fact = self.git("rev-parse", "--short", "HEAD").stdout.strip()
+        self.commit("C3 已完成")
+        done = self.git("rev-parse", "--short", "HEAD").stdout.strip()
+        self.commit("B2 完成第二步")
+        partial = self.git("rev-parse", "--short", "HEAD").stdout.strip()
+        (self.repo / "x.txt").write_text("现场改动")
+        output = (f"- [事实] B2 首批已上线（依据：{fact}）\n"
+                  f"- [事实] B2 全部已上线（依据：{fact}）\n"
+                  f"- [完结] B2 完成第二步（依据：{partial}）\n"
+                  f"- [完结] C3 已完成（依据：{done}）")
+        self.assertTrue(runbook.draft("ws", self.repo, "runbook.md", lambda p: (output, {}), self.home, auto=True))
+        self.assertIn(f"- [ ] B2 还在做\n  - 首批已上线（{fact}）", path.read_text())
+        self.assertIn("- [x] C3 ", path.read_text())
+        self.assertNotIn("全部已上线", path.read_text())
+        self.assertEqual("runbook.md", self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").stdout.strip())
+        self.assertEqual("现场改动", (self.repo / "x.txt").read_text())
+        pending = runbook.pending("ws", self.repo, "runbook.md", self.home).read_text()
+        self.assertIn("完成第二步", pending)
+        self.assertNotIn("C3 已完成", pending)
+        self.assertFalse(runbook.draft("ws", self.repo, "runbook.md", lambda p: self.fail(p), self.home, auto=True))
+
+    def test_auto_stale_draft_keeps_edit_and_retries_evidence(self):
+        from . import runbook
+        path = self.repo / "runbook.md"
+        before = path.read_text()
+        self.commit("B2：首批已上线")
+        sha = self.git("rev-parse", "--short", "HEAD").stdout.strip()
+        proposal = f"- [事实] B2 首批已上线（依据：{sha}）"
+
+        def changed(prompt):
+            path.write_text(before + "\n现场加了一句\n")
+            self.git("commit", "-qam", "现场更新")
+            return proposal, {}
+
+        self.assertTrue(runbook.draft("ws", self.repo, "runbook.md", changed, self.home, auto=True))
+        self.assertEqual(before + "\n现场加了一句\n", path.read_text())
+        self.assertTrue(runbook.draft("ws", self.repo, "runbook.md", lambda p: (proposal, {}), self.home, auto=True))
+        self.assertIn(proposal.split("（", 1)[0].split("B2 ", 1)[1], path.read_text())
 
     def test_empty_draft_not_shown(self):
         from . import runbook
@@ -684,6 +752,31 @@ class ShioriSectionTest(unittest.TestCase):
         with patch.object(shiori, "pending", lambda conn, ws: 1 / 0):
             self.assertEqual(status._shiori("memory-harness", conn=object()), [])
 
+    def test_fallback_reflex_and_shiori(self):
+        """没有手写近况源的工作区（如 zeron、self）：照常送达环境级反射（I9）和未落库栞（I7）（2026-11-19）。"""
+        from ...engram.observe import shiori
+        from .. import reflex
+        from . import render, status
+        row = {"source": "dsh", "session": "12345678abcd", "ordinal": 1, "started": "2026-11-19T10:00:00+08:00",
+               "user": "记一下", "why": "要紧", "file": ""}
+        with tempfile.TemporaryDirectory() as d:
+            env_f = Path(d) / "env.md"
+            env_f.write_text("## 反射\n\n- 发文件：scp 到 vps（L1:T1:S1）\n")
+            with patch.object(reflex, "ENV", env_f), patch.object(shiori, "pending", lambda conn, ws: [row] if ws == "self" else []):
+                fb_self = status.fallback("self", conn=object())
+                self.assertIn("## 近况（self）", fb_self)
+                self.assertIn("### 反射", fb_self)
+                self.assertIn("- 发文件：scp 到 vps（L1:T1:S1）", fb_self)
+                self.assertIn("### 未落库", fb_self)
+                self.assertIn("第 2 轮（12345678）：要紧", fb_self)
+                fb_other = status.fallback("zeron", conn=object())
+                self.assertIn("### 反射", fb_other)
+                self.assertNotIn("### 未落库", fb_other)
+                with patch.object(status, "read", lambda ws, **k: ""):
+                    rendered = render("/home/u/.memory-harness/self", host="dsh", conn=object())
+                    self.assertIn("### 反射", rendered)
+                    self.assertIn("### 未落库", rendered)
+
 
 class WorktreeStatusTest(unittest.TestCase):
     def test_dir_gone_is_marked(self):
@@ -708,3 +801,35 @@ class WorktreeStatusTest(unittest.TestCase):
             shutil.rmtree(wt)
             got = status._worktrees(repo)
             self.assertTrue(any("目录已不在" in x for x in got), got)
+
+
+class CacheOnlineTest(unittest.TestCase):
+    """联想数据在线只读（runbook N5，2026-11-20）：签名对不上不在钩子里同步建，先用最近一份、后台起一个进程建。"""
+
+    def setUp(self):
+        import sqlite3
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = sqlite3.connect(Path(self.tmp.name) / "engram.db")
+        for t in ("form_record(id INTEGER, kind TEXT)", "attachment(id INTEGER)", "session_entry(id INTEGER)"):
+            self.conn.execute(f"CREATE TABLE {t}")
+        self.addCleanup(self.conn.close)
+        self.folder = Path(self.tmp.name) / "assoc-cache-engram"
+
+    def test_miss_uses_latest_and_starts_one_build(self):
+        import pickle
+        with patch.object(a.subprocess, "Popen") as popen:
+            self.assertIsNone(a.cached(self.conn))              # 一份都没有：这一轮不联想
+            self.assertEqual(popen.call_count, 1)
+            self.assertIsNone(a.cached(self.conn))              # 已经有一个在建：不再起
+            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(popen.call_args.kwargs["env"]["MH_DB"], str(Path(self.tmp.name) / "engram.db"))
+            (self.folder / "old.pkl").write_bytes(pickle.dumps({"v": a.CACHE_V, "idx": "旧的"}))
+            (self.folder / "older.pkl").write_bytes(pickle.dumps({"v": a.CACHE_V - 1, "idx": "格式不对"}))
+            os.utime(self.folder / "older.pkl", (1, 1))
+            self.assertEqual(a.cached(self.conn)["idx"], "旧的")
+            (self.folder / "build.lock").unlink()
+            os.utime(self.folder / "old.pkl", (1, 1))
+            os.utime(self.folder / "older.pkl", None)           # 最新的一份格式不对：跳过，用下一份
+            self.assertEqual(a.cached(self.conn)["idx"], "旧的")
+            self.assertEqual(popen.call_count, 2)

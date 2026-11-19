@@ -1117,6 +1117,7 @@ class FormTest(unittest.TestCase):
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
             **({"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when} if when else {})})
         git("init", "-q")
+        git("config", "user.email", "t@t")
         for msg, when in (("先", "2026-10-17T08:10:00Z"), ("后", "2026-10-17T08:20:00Z"), ("别", "2026-10-17T08:40:00Z")):
             git("commit", "-q", "--allow-empty", "-m", msg, when=when)
         log.write_text("\n".join(json.dumps({"timestamp": t, "message": {"content": [
@@ -1136,6 +1137,16 @@ class FormTest(unittest.TestCase):
         self.assertEqual(said(f"{other} 别\nabc1234 后"), [])                    # git log 列出的别人的提交不算（2026-11-08）
         self.assertEqual(said(f"[main {other}] 别\n 1 file changed"), ["别"])    # git commit 自己打的那行算
         self.assertEqual(said(f"OK\n{other} 别", "make test && git commit -q -m 别 && git log --oneline -1"), ["别"])  # 同一次调用：先测后提交，超过 120 秒也算
+        # 只靠时间窗认的要是这个仓库自己的身份、按提交者时间（方向探索第 4 轮，2026-11-15）
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.dir), "GIT_AUTHOR_NAME": "o", "GIT_AUTHOR_EMAIL": "o@o"}
+        commit = lambda msg, ad, cd, ce: subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", msg], check=True, capture_output=True,
+            env={**env, "GIT_COMMITTER_NAME": "c", "GIT_COMMITTER_EMAIL": ce, "GIT_AUTHOR_DATE": ad, "GIT_COMMITTER_DATE": cd})
+        commit("人", "2026-10-17T08:50:30Z", "2026-10-17T08:50:30Z", "noreply@github.com")      # 别人的合并正好落进窗口：不认
+        commit("搬", "2026-10-10T00:00:00Z", "2026-10-17T08:50:40Z", "t@t")                    # cherry-pick 的副本，作者时间早：按提交者时间认
+        log.write_text(json.dumps({"timestamp": "2026-10-17T08:50:00Z", "message": {"content": [
+            {"type": "tool_use", "id": "p", "name": "Bash", "input": {"command": "git commit -q -m x"}}]}}))
+        got = written.written("claude", str(log), str(repo), ["2026-10-17T08:00:00Z"])
+        self.assertEqual([x.split("「")[1][0] for x in got[0]], ["搬"])
 
 
 class FileSkeletonTest(unittest.TestCase):
@@ -1287,6 +1298,30 @@ class GlossaryIndexTest(unittest.TestCase):
             self.assertEqual(glossary.fuller(["search", "evoke"], path), [])
             self.assertEqual(glossary.fuller(["回想"], path), [])
             self.assertEqual(glossary.home(path), "")
+
+    def test_workspace_glossary_and_target_workspace(self):
+        """按工作区读词典（runbook D6，2026-11-19）与开错工作区新线归位。"""
+        from unittest import mock
+        from . import glossary
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "docs" / "词典.md"
+            p.parent.mkdir(parents=True)
+            p.write_text("**Xpedition / Mentor Xpedition**\n- 指代：目标工具。\n")
+            with mock.patch.dict(st.WORKSPACE_DIRS, {tmp: "ext-ws"}, clear=False):
+                self.assertEqual(glossary.path_for("ext-ws"), p)
+                self.assertEqual(glossary.fuller(["Mentor Xpedition"], glossary.path_for("ext-ws")),
+                                 [["Mentor Xpedition", "Xpedition"]])
+        self.assertEqual(form.target_workspace("wrong", None, {"real": 5}), "real")
+        self.assertEqual(form.target_workspace("wrong", None, {"wrong": 2, "real": 5}), "wrong")
+        self.assertEqual(form.target_workspace("wrong", {"kind": "line", "ws": "parent-ws"}, {"real": 5}), "parent-ws")
+        u = {"session": {"workspace": "mh"}}                  # 有骨架的工作区：开对了不跨，开错了（一处没碰本区）才跨到触及的
+        with mock.patch.object(form.skeleton, "nodes", lambda ws, conn=None, *a: {"": {}}), \
+                mock.patch.object(form.st, "reachable", lambda conn, ws: {ws}):
+            self.assertEqual(form.reach_of(None, u, {"mh": 4, "dsh": 5}), {"mh"})
+            self.assertEqual(form.reach_of(None, u, {"dsh": 5}), {"mh", "dsh"})
+        with mock.patch.object(form.skeleton, "nodes", lambda ws, conn=None, *a: {}), \
+                mock.patch.object(form.st, "reachable", lambda conn, ws: {ws}):   # 没骨架的照旧跨
+            self.assertEqual(form.reach_of(None, u, {"mh": 4, "dsh": 5}), {"mh", "dsh"})
 
 
 if __name__ == "__main__":

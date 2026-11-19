@@ -456,6 +456,97 @@ class ObserveTest(unittest.TestCase):
         self.assertTrue(shiori.marked(turns[0].tools))
         self.assertEqual(shiori.why(str(path), turns[0].address), "定名")
 
+    def test_agy_parse_and_written_files(self):
+        """agy 的 transcript_full.jsonl 与 conversation_summaries.db：剥掉 <USER_REQUEST>、收集 thinking/tool_calls/models、
+        识别读写文件与夹栞，末尾正在跑工具的一轮算未结束（closed=False）。"""
+        import sqlite3
+        from .sources import agy
+        from . import shiori, written_files
+        root = self.dir / "agy-root"
+        logs = root / "brain/conv-1/.system_generated/logs"
+        logs.mkdir(parents=True)
+        db = sqlite3.connect(root / "conversation_summaries.db")
+        db.execute("CREATE TABLE conversation_summaries ("
+                   "conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, created_at TEXT, updated_at TEXT, "
+                   "status TEXT, workspace_uris TEXT, parent_conversation_id TEXT, nesting_depth INTEGER, agent_name TEXT)")
+        db.execute("INSERT INTO conversation_summaries VALUES ('conv-1', '接入 agy', 4, '', '', '', '[\"file:///home/u/p\"]', '', 0, '')")
+        db.commit()
+        db.close()
+        steps = [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-19T12:00:00Z",
+             "content": "<USER_REQUEST>\n改一下 a.py\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:00:05Z",
+             "model": "gemini-4-argon-medium", "thinking": "先读再改", "content": "我先看看",
+             "tool_calls": [{"name": "read_file", "args": {"Path": "/home/u/p/mh/r.py"}},
+                            {"name": "edit_file", "args": {"Path": "/home/u/p/mh/a.py"}},
+                            {"name": "replace_file_content", "args": {"TargetFile": "/home/u/p/mh/c.py"}},
+                            {"name": "call_mcp_tool", "args": {"ServerName": "mh", "ToolName": "shiori", "Arguments": {"why": "agy 夹栞"}}}]},
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T12:00:06Z", "content": "ok"},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:00:10Z",
+             "model": "gemini-4-argon-medium", "content": "改好了"},
+            {"step_index": 4, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-19T12:01:00Z",
+             "content": "<USER_REQUEST>\n跑一下命令\n</USER_REQUEST>"},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:01:02Z",
+             "model": "gemini-4-argon-medium", "content": "正在跑",
+             "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cat /home/u/p/design/b.md"}}]},
+        ]
+        path = logs / "transcript_full.jsonl"
+        path.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in steps) + "\n", encoding="utf-8")
+        sess, turns = agy.parse(path)
+        self.assertEqual((sess.source, sess.session, sess.cwd, sess.title, sess.kind),
+                         ("agy", "conv-1", "/home/u/p", "接入 agy", "user"))
+        self.assertEqual(len(turns), 2)
+        self.assertEqual((turns[0].user, turns[0].assistant, turns[0].commentary, turns[0].reasoning, turns[0].closed),
+                         ("改一下 a.py", "改好了", ["我先看看"], ["先读再改"], True))
+        self.assertEqual(turns[0].models, ["gemini-4-argon-medium"])
+        self.assertIn("mcp_mh_shiori", turns[0].tools)
+        self.assertTrue(shiori.marked(turns[0].tools))
+        self.assertEqual(shiori.why(str(path), turns[0].address), "agy 夹栞")
+        self.assertFalse(turns[1].closed)      # 末尾还在跑工具调用：未结束
+        self.assertIn(Path.home() / ".gemini/antigravity-acp", agy.ROOTS)
+        starts = [t.started for t in turns]
+        self.assertEqual(written_files.read("agy", str(path), "/home/u/p", starts), {0: ["mh/r.py"], 1: ["design/b.md"]})
+        self.assertEqual(written_files.written("agy", str(path), "/home/u/p", starts), {0: ["写了 mh/a.py", "写了 mh/c.py"]})
+        self.assertEqual(written_files.touched("agy", str(path), "/home/u/p"),
+                         {"/home/u/p/mh/r.py", "/home/u/p/mh/a.py", "/home/u/p/mh/c.py", "/home/u/p/design/b.md"})
+        # ACP 没有 conversation_summaries.db：从 conversations/<id>.meta 读 cwd；连 .meta 也没有时由工具路径兜底不报错
+        acp_root = self.dir / "agy-acp-root"
+        acp_logs = acp_root / "brain/conv-acp/.system_generated/logs"
+        acp_logs.mkdir(parents=True)
+        (acp_root / "conversations").mkdir(parents=True)
+        (acp_root / "conversations/conv-acp.meta").write_text(json.dumps({"cwd": "/home/u/proj"}), encoding="utf-8")
+        acp_path = acp_logs / "transcript_full.jsonl"
+        acp_path.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-19T12:00:00Z",
+             "content": "<USER_REQUEST>\n看下文件\n</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:00:05Z",
+             "content": "好的", "tool_calls": [{"name": "run_command", "args": {"Cwd": "/home/u/fallback", "CommandLine": "ls"}}]},
+        ]) + "\n", encoding="utf-8")
+        sess_acp, _ = agy.parse(acp_path)
+        self.assertEqual(sess_acp.cwd, "/home/u/proj")
+        self.assertTrue(agy.signature(acp_path))
+        (acp_root / "conversations/conv-acp.meta").unlink()
+        sess_fallback, _ = agy.parse(acp_path)
+        self.assertEqual(sess_fallback.cwd, "/home/u/fallback")
+        # ACP：Zeron 加在用户输入前的 <memory-harness> 段不算用户的话；工具输出按 RUN_COMMAND 等读（提交哈希靠它认）；
+        # Zeron 起标题的内部会话整段不收
+        acp_path.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-19T12:00:00Z",
+             "content": "<USER_REQUEST>\n<memory-harness>\n[Souhatsu] 旧事\n</memory-harness>\n\n提交一下\n</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:00:05Z",
+             "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git commit -m x"}}]},
+            {"step_index": 2, "type": "RUN_COMMAND", "status": "DONE", "created_at": "2026-11-19T12:00:06Z",
+             "content": "[main abc1234] x"},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-19T12:00:09Z", "content": "好了"},
+        ]) + "\n", encoding="utf-8")
+        _, acp_turns = agy.parse(acp_path)
+        self.assertEqual([t.user for t in acp_turns], ["提交一下"])
+        uses, results = written_files._agy(acp_path)
+        self.assertEqual(list(results.values()), ["[main abc1234] x"])
+        acp_path.write_text(json.dumps({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-19T12:00:00Z",
+                                        "content": "<USER_REQUEST>\nYou generate session titles. Treat …\n</USER_REQUEST>"}) + "\n")
+        self.assertEqual(agy.parse(acp_path)[1], [])
+
     def test_shiori_precise(self):
         """夹了栞的轮（I7，2026-11-13）：所在的组程序定成精读，不占精读兜底的份额；程序判不读的组（宿主消息）不动。"""
         row = lambda i, tools="[]": {"ordinal": i, "assistant": "回" * 100, "commentary": "[]", "tools": tools}
@@ -1109,6 +1200,31 @@ class ObserveTest(unittest.TestCase):
             self.assertEqual({p["state"] for p in observe.progress(self.conn, session="s2")}, {"not_previewed", "switch"})
         finally:
             instance.UNWATCHED = old
+
+    def test_home_session_unwatched_unless_attached_to_project(self):
+        """家目录（~）直接开的会话（2026-11-19）：碰过具体项目工作区或夹了栞的照常观察，挂不回任何项目工作区的按默认不观察处理。"""
+        from unittest import mock
+        home = str(Path.home())
+        s_idle = Session("dsh", "h-idle", str(self.file), started="2026-01-01T00:00:00Z", cwd=home)
+        s_proj = Session("dsh", "h-proj", str(self.file), started="2026-01-01T00:00:00Z", cwd=home)
+        s_mark = Session("dsh", "h-mark", str(self.file), started="2026-01-01T00:00:00Z", cwd=home)
+        for s, tools in ((s_idle, []), (s_proj, []), (s_mark, ["mcp__mh__shiori"])):
+            src = {"dsh": FakeSource(self.file, s, [Turn("问一句", "答", tools=tools, closed=True)])}
+            collect.run(self.conn, sources=("dsh",), log=io.StringIO(), modules=src)
+        with mock.patch("mh.engram.observe.written_files.touches", lambda src, f, cwd=None: ["/dev/null"] if f == str(self.file) else []), \
+                mock.patch.object(st, "project_workspace", lambda p: "my-proj" if p == "/proj/a.py" else ""):
+            self.assertIn(("dsh", "h-idle"), observe.unwatched(self.conn))
+            self.assertNotIn(("dsh", "h-mark"), observe.unwatched(self.conn))
+        with mock.patch("mh.engram.observe.written_files.touches", lambda src, f, cwd=None: ["/proj/a.py"]), \
+                mock.patch.object(st, "project_workspace", lambda p: "my-proj" if p == "/proj/a.py" else ""):
+            self.assertNotIn(("dsh", "h-proj"), observe.unwatched(self.conn))
+        read, asked = [], []                  # 热路径（案例 11-19：逐段查把开场手记拖到 10 秒）：挂线映射一次查完，只问的会话才读原始记录
+        with mock.patch.object(observe, "_touches_project", lambda src, f, cwd: read.append(src) or False), \
+                mock.patch.object(st, "attached_workspaces", lambda conn: asked.append(1) or {}):
+            self.assertEqual(observe.unwatched(self.conn, sessions={("dsh", "h-idle")}), {("dsh", "h-idle")})
+            self.assertEqual(len(read), 1)
+            observe.unwatched(self.conn)
+            self.assertEqual(len(asked), 2)
 
     def test_unplugged_dirs_not_collected(self):
         """不接 mh 的目录（[connect].unplugged，2026-11-14）：会话一轮都不收，文件不打标记；从名单里拿掉，下一轮补采。"""

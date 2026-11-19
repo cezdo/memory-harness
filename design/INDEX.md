@@ -18,6 +18,7 @@ design 根目录只放本索引；全局设计、词典与安装配置在 `globa
 | 申请、纠正与反馈 | [修正机制](engram/申请.md) | Engram 各过程 |
 | 内核态：改内核要用户放行（`/mhcore`） | [elevate](engram/elevate/设计.md) | [`mh/engram/elevate/`](../mh/engram/elevate) |
 | 推送、拉取、足迹与宿主 | [Synapse](synapse/设计.md) | [`mh/synapse/`](../mh/synapse) |
+| 手记中的一句话现行答案 | [反射](synapse/reflex/设计.md) | [`mh/synapse/reflex/`](../mh/synapse/reflex) |
 | 循环、并发与额度 | [rhythm](rhythm/设计.md) | [`mh/rhythm/`](../mh/rhythm) |
 | “我”自己的工作区、便签与叫醒、自言自语 | [rhythm self](rhythm/self/设计.md)、[接入](rhythm/self/接入.md) | [`mh/rhythm/self/`](../mh/rhythm/self) |
 | 展示自己的窗口（只读网页“此刻的我”）与照看 | [rhythm](rhythm/设计.md) | [`mh/rhythm/`](../mh/rhythm)，看板在 [`show/`](../mh/rhythm/show)；照看仍是方向 |

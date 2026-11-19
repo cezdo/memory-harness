@@ -123,6 +123,22 @@ class SelfTest(unittest.TestCase):
         self.assertNotIn("不会被采进记忆", got)                                                 # 那句只属于旧的方向探索
         from ...engram.observe.label import wake_note
         self.assertEqual(wake_note(got), "探索")                                               # form 按它把会话挂到便签那条线
+        # 上一次没正常结束：此刻里写明接着哪次、目录和草稿纸在哪，不从头来（2026-11-15）
+        broken = {"dir": str(self.root / "2026-11-14-探索"), "logs": "/data/self-runs/2026-11-14-探索", "said": "hit your limit",
+                  "timed_out": False, "at": "2026-11-14T01:52:48"}
+        got = awaken(n, datetime(2026, 11, 15, 10), self.root / "2026-11-15-探索", False, "abc", None, self.root / "草稿", broken)
+        self.assertIn("上一次醒来（2026-11-14 01:52）没有正常结束", got)
+        self.assertIn("/data/self-runs/2026-11-14-探索/", got)
+        self.assertIn("hit your limit", got)
+        self.assertEqual(wake_note(got), "探索")
+
+    def test_settle(self):
+        """没正常结束的醒来由在场的会话收完：记成那次醒过，不再重叫（2026-11-15）。"""
+        from . import settle
+        st = {"retry": {"探索": "2026-11-16T03:53:44"}, "unfinished": {"探索": {"dir": "/s/2026-11-15-探索", "logs": "/l", "at": "2026-11-15T01:52:48"}}}
+        self.assertIn("记成收完了", settle("探索", st))
+        self.assertEqual(st, {"retry": {}, "unfinished": {}, "woke": {"探索": "2026-11-15T01:52:48"}})
+        self.assertIn("没有没收完的", settle("探索", st))
 
     def test_own_actions(self):
         scratch = Path(self.tmp.name) / "草稿"
@@ -132,6 +148,33 @@ class SelfTest(unittest.TestCase):
         outside, risky = own_actions(acts, self.root, scratch)
         self.assertEqual(outside, [str(REPO / "AGENTS.md")])
         self.assertEqual(len(risky), 2)
+        # 沙箱开着写的记忆记录、带 -c 的 git、clean：Bash 里写的认不出路径，列命令（方向探索第 4 轮）
+        listed = ["sqlite3 ~/.local/share/memory-harness/engram.db 'DELETE FROM attachment WHERE id=1'",
+                  "cd ~/memory-harness && python3 -c 'from mh.engram import store; store.connect()'",
+                  f"echo off >> {store.HOME}/observe-switch.jsonl",
+                  "git -c user.name=x commit -qm y", "git -C a -c k=v push", "git clean -fdx", "git branch -D x"]
+        quiet = [f"sqlite3 'file:{store.DEFAULT_DB}?mode=ro' 'SELECT 1'",
+                 "python3 -c 'from mh.engram import store; store.connect(db, readonly=True)'",
+                 "ls ~/memory-harness/design", "git -C ~/memory-harness log -3", "git branch -a"]
+        _, risky = own_actions([("run", c) for c in listed + quiet], self.root, scratch)
+        self.assertEqual(risky, listed)
+
+    def test_others(self):
+        """收尾时 self 里醒来以前就有的、没提交的改动，单独认出来（方向探索第 4 轮：在场时留的便签被算进醒来）。"""
+        from . import others
+        import time
+        git = lambda *a: subprocess.run(["git", *a], cwd=self.root, capture_output=True, check=True)
+        git("init", "-q")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "0")
+        self.note("在场留的", "at: 2026-12-01\n---\n在场时留的。")
+        time.sleep(0.05)
+        since = datetime.now()
+        time.sleep(0.05)
+        d = self.root / "2026-11-15-探索"
+        d.mkdir()
+        (d / "结果.md").write_text("x")
+        self.note("醒来留的", "every: 7d\n---\n醒来时留的。")
+        self.assertEqual(others(self.root, d, since), ["便签/在场留的.md"])
 
     def test_claude_log(self):
         """Claude Code 的运行记录（stream-json）→ 自己做了什么、怎么结束的。"""

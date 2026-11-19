@@ -22,7 +22,7 @@ import re
 
 from . import guard
 from ..store.instance import USER_NAME, USER_ALIASES   # 称呼在实例配置里：写记录用 USER_NAME，匹配时认 USER_ALIASES 里任何一个
-PLATFORMS = {"codex": "Codex", "dsh": "dsh（DeepSeek Harness）", "claude": "Claude Code", "chatgpt": "ChatGPT"}
+PLATFORMS = {"codex": "Codex", "dsh": "dsh（DeepSeek Harness）", "claude": "Claude Code", "agy": "agy", "chatgpt": "ChatGPT"}
 
 _IDE = re.compile(r"<(ide_opened_file|ide_selection)>(.*?)</\1>\s*", re.S)
 _CMD = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)

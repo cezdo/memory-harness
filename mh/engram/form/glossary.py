@@ -15,13 +15,16 @@ from ..store.instance import resource
 
 _REPO = Path(__file__).resolve().parents[3]
 PATH = resource("glossary", _REPO / "design/global/词典.md", "glossary.md")
+CANDIDATES = ("docs/词典.md", "design/global/词典.md", "词典.md", "GLOSSARY.md", "docs/glossary.md", "glossary.md")
 _cache = {}
 
 
 def entries(path=PATH):
+    if not path:
+        return []
     path = Path(path)
-    stamp = (str(path), path.stat().st_mtime if path.exists() else 0)
-    if stamp not in _cache:
+    key, mtime = str(path), path.stat().st_mtime if path.exists() else 0
+    if _cache.get(key, (None, None))[0] != mtime:
         out = []
         for line in (path.read_text().splitlines() if path.exists() else []):
             m = re.match(r"^\*\*(.+)\*\*\s*$", line.strip())
@@ -42,9 +45,8 @@ def entries(path=PATH):
                     names = [n for n in names if n and len(n) <= 30]
                     if names:
                         out.append({"full": names[0], "names": names, "head": m.group(1)})
-        _cache.clear()
-        _cache[stamp] = out
-    return _cache[stamp]
+        _cache[key] = (mtime, out)
+    return _cache[key][1]
 
 
 def _hit(name, text):
@@ -82,8 +84,45 @@ def aliases(word, path=PATH):
 
 
 def home(path=PATH):
-    """这份词典属于哪个工作区：开发目录里的是这个仓库的；实例另配的说不准，返回 ""（D6 按工作区读词典时再改）。"""
-    return workspace(str(_REPO)) if Path(path) == _REPO / "design/global/词典.md" else ""
+    """这份词典属于哪个工作区：开发目录里的是这个仓库的；按工作区配置的或工作区目录下的返回那个工作区（runbook D6，2026-11-19）。"""
+    p = Path(path)
+    if p == _REPO / "design/global/词典.md":
+        return workspace(str(_REPO))
+    for w, gp in instance.GLOSSARIES.items():
+        if p == Path(gp):
+            return w
+    return ""
+
+
+def path_for(ws=None):
+    """这个工作区的词典路径（runbook D6，2026-11-19）：先查实例配置的 [resources.glossaries] / [workspace.glossaries]；
+    再看 mh 本仓的 PATH；再在工作区目录（WORKSPACE_DIRS、PROJECTS/<ws>、~/<ws>）下找现成的词典文件。找不到返回 None。"""
+    if not ws:
+        return PATH
+    if ws in instance.GLOSSARIES:
+        p = Path(instance.GLOSSARIES[ws])
+        return p if p.is_file() else None
+    if ws == home(PATH):
+        return PATH if Path(PATH).is_file() else None
+    from ..store import WORKSPACE_DIRS
+    roots = [Path(d) for d, w in WORKSPACE_DIRS.items() if w == ws]
+    if instance.PROJECTS:
+        roots.append(instance.PROJECTS / ws)
+    roots.append(Path.home() / ws)
+    for r in dict.fromkeys(roots):
+        for rel in CANDIDATES:
+            p = r / rel
+            try:
+                if p.is_file():
+                    return p
+            except OSError:
+                pass
+    return None
+
+
+def for_workspace(ws=None):
+    """form 读取词典用：这个工作区有自己的词典就读它的，没有就回退到默认 PATH。"""
+    return path_for(ws) or PATH
 
 
 def fuller(terms, path=PATH):

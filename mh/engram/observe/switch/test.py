@@ -114,9 +114,25 @@ class SwitchTest(unittest.TestCase):
         code, out, err = self._hook("codex", "$do-observe", log)
         self.assertEqual((code, out), (2, ""))                              # codex：退出码 2 拦下，理由在 stderr
         self.assertEqual(err.strip(), "memory-harness: 已恢复对本会话的观察。")
+        code, out, _ = self._hook("agy", "<USER_REQUEST>\n/no-observe\n</USER_REQUEST>", log)
+        self.assertEqual((code, json.loads(out)["terminationBehavior"]), (0, "terminate"))
+        # ACP（transcriptPath 是 .db）：钩子拿不到原话，开关交给 Zeron 调的 acp-prompt（decide）；钩子本身不记、不拦
+        db = self.dir / "acp/conversations/s10.db"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"SQLite format 3\n123\n\"str\"\n")
+        p = subprocess.run([sys.executable, "-I", "-S", str(HERE / "hook.py"), "agy", str(log)],
+                           input=json.dumps({"conversationId": "s10", "transcriptPath": str(db), "invocationNum": 1,
+                                             "lastUserInput": "<USER_REQUEST>\n/do-observe\n</USER_REQUEST>"}),
+                           text=True, capture_output=True, env={"MH_HOME": str(self.dir / "home")})
+        self.assertEqual((p.returncode, json.loads(p.stdout)), (0, {}))
+        from . import hook
+        self.assertEqual(hook.decide("agy", "/do-observe", "s10", "/t.jsonl", "/tmp", log), "on")
+        self.assertIsNone(hook.decide("agy", "普通话", "s10", "", "/tmp", log))
         self.assertEqual(self._hook("claude", "比如 /no-observe", log), (0, "", ""))    # 别的输入什么都不做
-        rows = [json.loads(l) for l in open(log)]
-        self.assertEqual([(r["source"], r["session"], r["state"]) for r in rows], [("claude", "s9", "off"), ("codex", "s9", "on")])
+        rows = [json.loads(l) for l in log.read_text().splitlines()]
+        self.assertEqual([(r["source"], r["session"], r["state"]) for r in rows],
+                         [("claude", "s9", "off"), ("codex", "s9", "on"), ("agy", "s9", "off"), ("agy", "s10", "on")])
+        self.assertEqual(rows[-1]["file"], "/t.jsonl")
 
     def test_states_log(self):
         self._collect(a=[turn("你好"), turn("再问一句")], b=[turn("开始"), turn("/no-observe", "好，这个会话不观察了。")])
@@ -170,18 +186,20 @@ class SwitchTest(unittest.TestCase):
         (home / ".claude").mkdir(parents=True)
         (home / ".claude/settings.json").write_text(json.dumps({"model": "x", "hooks": {"UserPromptSubmit": [
             {"hooks": [{"type": "command", "command": "synapse"}]}]}}))
-        self.assertEqual(len(install(home)), 8)                            # 默认只列，不动宿主
+        self.assertEqual(len(install(home)), 12)                           # 默认只列，不动宿主
         self.assertFalse((home / ".claude/commands/no-observe.md").exists())
         done = install(home, apply=True)
-        self.assertEqual(len(done), 8)
+        self.assertEqual(len(done), 12)
         self.assertTrue((home / ".claude/commands/no-observe.md").read_text().startswith("---"))
         self.assertTrue((home / ".codex/skills/do-observe/SKILL.md").exists())
+        self.assertTrue((home / ".gemini/config/skills/do-observe/SKILL.md").exists())
         cfg = json.loads((home / ".claude/settings.json").read_text())
         self.assertEqual(cfg["model"], "x")                                  # 别的设置原样留着
         self.assertEqual([g["hooks"][0]["command"].split()[-1] for g in cfg["hooks"]["UserPromptSubmit"]], ["synapse", "claude"])
         self.assertEqual(len(list((home / ".claude").glob("settings.json.bak-observe-switch-*"))), 1)
         self.assertEqual(cfg["hooks"]["Stop"][0]["hooks"][0]["command"].split()[-2:], ["claude", "stop"])   # 叫醒
         self.assertEqual(set(json.loads((home / ".codex/hooks.json").read_text())["hooks"]), {"UserPromptSubmit", "Stop"})
+        self.assertEqual(set(json.loads((home / ".gemini/config/hooks.json").read_text())["memory-harness"]), {"PreInvocation", "Stop"})
         self.assertEqual(install(home, apply=True), [])                     # 再装一次什么都不做
         (home / ".claude/commands/do-observe.md").unlink()
         (home / ".claude/commands/do-observe.md").write_text("别人的")

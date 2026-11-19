@@ -24,9 +24,11 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 WINDOW = 30 * 60                     # 窗口最长多久（秒）：Stop 丢了的兜底
-EDIT_TOOLS = re.compile(r"(Edit|Write|MultiEdit|NotebookEdit|apply_patch)")
+EDIT_TOOLS = re.compile(r"(Edit|Write|MultiEdit|NotebookEdit|apply_patch|edit_file|write_file|replace_file_content|write_to_file|multi_replace_file_content)")
 _RAW = re.compile(r"[/$]mhcore(?:\s+(.*))?", re.S)
 _CLAUDE = re.compile(r"<command-name>\s*/mhcore\s*</command-name>.*?(?:<command-args>(.*?)</command-args>|$)", re.S)
+_USER_REQUEST = re.compile(r"<USER_REQUEST>\n?(.*?)\n?</USER_REQUEST>", re.S)
+_INJECTED = re.compile(r"<memory-harness>.*?</memory-harness>\s*", re.S)
 
 GRANTED = ("〔内核态〕这一轮由用户用 /mhcore 临时提权：可以改内核（core.md）{path}。"
            "只改要求涉及的句子，改完告诉用户改了哪句（改前、改后）；这一轮结束回到用户态，改动由程序记进内核日志。")
@@ -240,29 +242,96 @@ def request(prompt):
     return None if not m else (m.group(1) or "").strip()
 
 
+def _extract_user(text):
+    s = text or ""
+    m = _USER_REQUEST.search(s)
+    return _INJECTED.sub("", m.group(1) if m else s).strip()
+
+
+def _is_acp(path):
+    """同 synapse/hosts/agy.is_acp（内核态的钩子只 import 标准库）。"""
+    p = Path(path or "")
+    return p.suffix == ".db" or (p.parent.name == "conversations" and p.suffix != ".jsonl")
+
+
+def _agy_first_invocation(d):
+    path = d.get("transcriptPath") or d.get("transcript_path") or ""
+    if path:
+        p = Path(path)
+        target = None
+        if _is_acp(p):
+            cid = d.get("conversationId") or d.get("session_id") or p.stem
+            logs = p.parent.parent / "brain" / cid / ".system_generated/logs"
+            for name in ("transcript_full.jsonl", "transcript.jsonl"):
+                cand = logs / name
+                if cand.exists():
+                    target = cand
+                    break
+        else:
+            full = p.with_name("transcript_full.jsonl") if p.name == "transcript.jsonl" else p
+            target = full if full.exists() else (p if p.exists() else None)
+        if target is not None:
+            last_user, after = False, False
+            try:
+                with target.open(encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        t = row.get("type")
+                        if t == "USER_INPUT":
+                            last_user, after = True, False
+                        elif last_user and t in ("PLANNER_RESPONSE", "GENERIC", "RUN_COMMAND", "VIEW_FILE", "CODE_ACTION", "MCP_TOOL"):
+                            after = True
+                if last_user:
+                    return not after
+            except OSError:
+                pass
+    return d.get("invocationNum") in (None, 0, 1)
+
+
 def handle(kernel, host, event, d):
     """一个钩子事件 → (宿主要的 JSON 或 None, 退出码)。"""
-    session, cwd = d.get("session_id") or "", d.get("cwd") or ""
+    session = d.get("session_id") or d.get("conversationId") or ""
+    cwd = d.get("cwd") or (d.get("workspacePaths") or [""])[0] or ""
+    tc = d.get("toolCall") if isinstance(d.get("toolCall"), dict) else {}
+    tool = d.get("tool_name") or tc.get("name") or ""
+    tool_input = d.get("tool_input") if "tool_input" in d else tc.get("args") or {}
     if event == "prompt":
-        want = request(d.get("prompt"))
+        if host == "agy" and _is_acp(d.get("transcriptPath") or d.get("transcript_path") or ""):
+            return None, 0          # ACP 不给用户原话：/mhcore 由 Zeron 调 acp-prompt 判；在这里会把它刚开的窗口当“下一次输入”关掉
+        if host == "agy" and not _agy_first_invocation(d):
+            return None, 0
+        raw_prompt = d.get("prompt") if "prompt" in d else d.get("lastUserInput")
+        want = request(_extract_user(raw_prompt) if host == "agy" else raw_prompt)
         if want is None:
             kernel.close(host, session, "下一次输入")
             return None, 0
         if not want:
+            if host == "agy":
+                return {"injectSteps": [{"errorMessage": {"userMessage": USAGE}}],
+                        "terminationBehavior": "terminate"}, 0
             return {"decision": "block", "reason": USAGE}, 0
         kernel.compare(host, session, cwd=cwd)          # 提权前先把手改的认出来，免得记到这一轮头上
         kernel.open(host, session, want, cwd)
+        if host == "agy":
+            # 不带 metadata.user_markdown：带了 agy CLI 整条丢掉（2026-11-20 探针，见 synapse/hosts/agy）
+            return {"injectSteps": [{"systemMessage": {"systemMessage": GRANTED.format(path=kernel.path)}}]}, 0
         return {"systemMessage": "memory-harness：本轮内核态（/mhcore）",
                 "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                        "additionalContext": GRANTED.format(path=kernel.path)}}, 0
     if event == "pre":
-        tool = d.get("tool_name") or ""
-        if EDIT_TOOLS.search(tool) and kernel.targets(d.get("tool_input") or {}, cwd) and not kernel.opened(host, session):
+        if EDIT_TOOLS.search(tool) and kernel.targets(tool_input, cwd) and not kernel.opened(host, session):
+            if host == "agy":
+                return {"decision": "deny", "reason": DENIED.format(path=kernel.path)}, 0
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                            "permissionDecisionReason": DENIED.format(path=kernel.path)}}, 0
         return None, 0
     if event == "post":
-        kernel.compare(host, session, d.get("tool_name") or "", cwd)
+        kernel.compare(host, session, tool, cwd)
         return None, 0
     if event == "stop":
         kernel.compare(host, session, cwd=cwd)
@@ -274,6 +343,9 @@ def handle(kernel, host, event, d):
 # —— 安装 ——
 EVENTS = {"UserPromptSubmit": ("prompt", None), "PreToolUse": ("pre", {"claude": "Edit|Write|MultiEdit|NotebookEdit"}),
           "PostToolUse": ("post", None), "Stop": ("stop", None)}
+AGY_EVENTS = {"PreInvocation": ("prompt", None),
+              "PreToolUse": ("pre", "edit_file|write_file|replace_file_content|write_to_file|multi_replace_file_content"),
+              "PostToolUse": ("post", "*"), "Stop": ("stop", None)}
 
 
 SKILL = HERE.parents[1] / "skills/mhcore"      # 命令和 skill 的源文件（2026-11-13 归 mh/skills/）
@@ -328,11 +400,48 @@ def _hooks(path, host, python, apply):
     return f"{path}：加 {'、'.join(added)}"
 
 
+def _agy_hooks(path, python, apply):
+    """把四个事件的钩子加进 agy 的 ~/.gemini/config/hooks.json（memory-harness 组）。"""
+    data = json.loads(path.read_text()) if path.exists() else {}
+    group = data.setdefault("memory-harness", {})
+    script = HERE / "hook.py"
+    added = []
+    for name, (event, matcher) in AGY_EVENTS.items():
+        entries = group.setdefault(name, [])
+        cmd = f"{python} -I -S {script} agy {event}"
+        handler = {"type": "command", "command": cmd, "timeout": 5}
+        if matcher is None:
+            if any(cmd == h.get("command", "") for h in entries):
+                continue
+            entries.append(handler)
+            added.append(name)
+        else:
+            existing = [g for g in entries if any(cmd == h.get("command", "") for h in g.get("hooks", []))]
+            if existing:
+                if any(g.get("matcher") != matcher for g in existing):
+                    for g in existing:
+                        g["matcher"] = matcher
+                    added.append(f"{name}（更新 matcher）")
+                continue
+            entries.append({"matcher": matcher, "hooks": [handler]})
+            added.append(name)
+    if not added:
+        return None
+    if apply:
+        if path.exists():
+            shutil.copy2(path, path.with_name(f"{path.name}.bak-mhcore-{datetime.now():%Y%m%d-%H%M%S}"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return f"{path}：加 {'、'.join(added)}"
+
+
 def install(home=Path.home(), python="/usr/bin/python3", apply=False):
-    """装 Claude Code 命令、codex skill（符号链接到仓库）和两边的四个钩子；apply=False 只列要做什么。
+    """装 Claude Code 命令、codex / agy skill（符号链接到仓库）和各宿主的四个钩子；apply=False 只列要做什么。
     codex 的新钩子要用户在 codex 的 /hooks 里信任一次。dsh 还没接。"""
     done = [_link(SKILL / "claude/mhcore.md", home / ".claude/commands/mhcore.md", apply),
             _link(SKILL / "codex/mhcore", home / ".codex/skills/mhcore", apply),
+            _link(SKILL / "codex/mhcore", home / ".gemini/config/skills/mhcore", apply),
             _hooks(home / ".claude/settings.json", "claude", python, apply),
-            _hooks(home / ".codex/hooks.json", "codex", python, apply)]
+            _hooks(home / ".codex/hooks.json", "codex", python, apply),
+            _agy_hooks(home / ".gemini/config/hooks.json", python, apply)]
     return [x for x in done if x]

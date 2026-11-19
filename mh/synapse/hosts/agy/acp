@@ -1,0 +1,4 @@
+#!/bin/sh
+# 给 Zeron 调的入口（ZERON_AGY_MH_COMMAND 指向这个文件）：acp-session | acp-prompt，stdin/stdout 各一个 JSON。
+# 约定见 design/synapse/设计.md“宿主接入 · agy · 经 Zeron 的 ACP”。
+exec env PYTHONPATH="$(dirname "$(readlink -f "$0")")/../../../.." /usr/bin/python3 -m mh.synapse.hosts.agy "$@"

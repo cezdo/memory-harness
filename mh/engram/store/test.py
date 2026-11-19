@@ -97,6 +97,22 @@ class StoreTest(unittest.TestCase):
             with mock.patch.dict(st.WORKSPACE_DIRS, dirs, clear=True):               # 换名按这台机器的映射；公开包里没有映射，自带一份
                 self.assertEqual([st.canonical(w) for w in ("mobile-ui", "memory-system", ".dsh", "dsh", "x")],
                                  ["dsh", ".memory", "dsh", "dsh", "x"])
+            home = Path(d, "u")
+            repo = home / "my-repo"
+            (repo / ".git").mkdir(parents=True)
+            (repo / "sub/dir").mkdir(parents=True)
+            proj = home / "projects"
+            (proj / "alpha/src").mkdir(parents=True)
+            with mock.patch.dict(st.WORKSPACE_DIRS, {}, clear=True), mock.patch.object(Path, "home", lambda: home), \
+                    mock.patch.object(st.instance, "PROJECTS", proj), mock.patch.dict(st.MANAGING, {"u": str(home), "projects": str(proj)}, clear=True):
+                self.assertEqual(st.workspace(str(repo / "sub/dir")), "my-repo")
+                self.assertEqual(st.workspace(str(proj / "alpha/src")), "alpha")
+                self.assertEqual(st.project_workspace(str(repo / "sub/dir/a.py")), "my-repo")
+                self.assertEqual(st.project_workspace(str(proj / "alpha/src/b.py")), "alpha")
+                self.assertEqual(st.project_workspace("/dev/null"), "")
+                self.assertEqual(st.project_workspace("/etc/hosts"), "")
+                self.assertEqual(st.project_workspace(str(home / ".ssh/config")), "")
+                self.assertEqual(st.project_workspace(str(home)), "")
 
     def test_worktree_uncertain(self):
         """Zeron 的 worktree 删了才算不确定；tmp/.claude 按路径能算回仓库（2026-11-13）。"""
@@ -109,6 +125,28 @@ class StoreTest(unittest.TestCase):
             self.assertFalse(st.worktree_uncertain(f"{d}/repo/tmp/worktrees/gone"))
             self.assertFalse(st.worktree_uncertain(f"{d}/repo/.claude/worktrees/gone"))
             self.assertFalse(st.worktree_uncertain(""))
+
+    def test_worktree_remembered(self):
+        """采集时 worktree 还在就记下主仓库；删了以后照记录算回、不再算不确定（2026-11-18）。"""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(st, "DEFAULT_DB", Path(d, "engram.db")):
+            wt = Path(d, ".zeron/worktrees/proj/willow")
+            wt.mkdir(parents=True)
+            (wt / ".git").write_text(f"gitdir: {d}/src/real-repo/.git/worktrees/willow\n")
+            conn = connect(st.DEFAULT_DB)
+            st.remember_worktree(conn, f"{wt}/sub")
+            st.remember_worktree(conn, f"{d}/.zeron/worktrees/proj/never")          # 没见过还在的：不记
+            st.remember_worktree(conn, f"{d}/repo/tmp/worktrees/x")                  # 不是 Zeron 的：不记
+            conn.commit()
+            self.assertEqual([tuple(r)[:2] for r in conn.execute("SELECT root, main FROM worktree_repo")],
+                             [(str(wt), f"{d}/src/real-repo")])
+            conn.close()
+            (wt / ".git").unlink()
+            wt.rmdir()
+            st._zeron_main.cache_clear()
+            self.assertFalse(st.worktree_uncertain(str(wt)))
+            self.assertEqual(st.unworktree(f"{wt}/mh"), f"{d}/src/real-repo/mh")
+            self.assertTrue(st.worktree_uncertain(f"{d}/.zeron/worktrees/proj/never"))
+            st._zeron_main.cache_clear()
 
     def test_delete_sessions(self):
         """删除（2026-10-22）：只属于这段会话的发生和 Claim 删掉，混着别的会话的留下；删除留记录，触发器装回去。"""

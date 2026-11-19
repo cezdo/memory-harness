@@ -113,6 +113,11 @@ UNPLUGGED_SAID = "这个目录不接 mh（实例配置 [connect].unplugged），
 def call(conn, name, args):
     """执行一个工具，返回文字。"""
     check_args(name, args)
+    if os.environ.get("MH_HOST") == "agy":     # ACP 不认 bind 的 overwrite：按旁路认会话（hosts/agy，2026-11-20）
+        from ..hosts.agy import take
+        got = take(name, args)
+        if got and not args.get("session"):
+            args = dict(args, session=got.get("session") or "", cwd=args.get("cwd") or got.get("cwd") or "")
     if unplugged(args.get("cwd") or os.getcwd()):
         return UNPLUGGED_SAID
     kw = dict(session=_session(args), purpose="interactive", cwd=args.get("cwd") or os.getcwd(), note=args.get("note") or "")
@@ -120,8 +125,8 @@ def call(conn, name, args):
         return _call_new(conn, name, args, kw)
     if name == "yorimichi":     # 允许联想拐几次（push/yorimichi，2026-10-28）：联想的钩子按它给不给、给几条
         from ..push import yorimichi
-        return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "",
-                           host="claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
+        host = os.environ.get("MH_HOST") or ("claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
+        return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "", host=host)
     if name == "shiori":        # 栞（I7，2026-11-13）：调用本身就是标记，这里什么都不写（engram/observe/shiori）
         return "夹好了。这一轮会被精读；落库以前，手记近况的“未落库”里看得到它。"
     raise ValueError(f"没有工具 {name}")

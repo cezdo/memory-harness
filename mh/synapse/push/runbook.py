@@ -1,11 +1,14 @@
 """runbook 跟上（design/synapse/设计.md 项目现状“runbook”，用户 2026-10-29）：runbook 靠交互会话做完一项顺手打勾、移走经过，
 常常落后。两半：程序认出哪里落后了（编近况时算，进“runbook”一节，只推异常）；模型每天写一份更新稿（改哪几处、依据哪个提交），
-放进数据目录 status/<工作区>.runbook.md，不改仓库：用户在场的会话里由“我”看过再改、提交（用户 2026-10-29 选的）。
+放进数据目录 status/<工作区>.runbook.md。开启自动更新的工作区可按提交原文补事实、打勾（用户 2026-11-18）。
 runbook 一改，稿就算处理过了，不再提示。
 
 工作区要用，在项目现状的手写部分写一行“- runbook：<仓库内路径>”。"""
 import hashlib
+import os
 import re
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,13 +17,15 @@ from ...engram.store.instance import USER_ALIASES, USER_NAME
 LONG = 1500             # 一项超过几个字算经过写长了（起步值：10-29 清理时移出的几项是 3000–8000 字，留着的多在 1000 以内）
 WAIT_DAYS = 3           # “等用户……”挂了几天没动算久
 LOG_CUT = 20000         # 给模型的提交说明最多几个字
-PROMPT = Path(__file__).parent / "prompts" / "runbook-v0.2.md"
+PROMPT = Path(__file__).parent / "prompts" / "runbook-v0.3.md"
 ITEM = re.compile(r"^(\s*)- \[([ x])\] (?:~~)?([A-Z]\d+[a-z]?′?)?")
 ID = re.compile(r"(?<![A-Za-z0-9])([A-Z]\d+[a-z]?′?)(?![A-Za-z0-9])")
 LINK = re.compile(r"\]\(([^)\s#]*)(?:#([^)\s]+))?\)")
 REF = re.compile(r"runbook ?([A-Z]\d+[a-z]?′?)(?![A-Za-z0-9])")
 HISTORY = ("cases", "已做.md")   # 只追加的历史：链接和编号停在写下时，不核
 SHOW = 5                        # 对不上的链接最多列几处
+EDIT = re.compile(r"- \[(事实|完结)\] " + ID.pattern + r" (.+)（依据：([0-9a-f]{7,40})）")
+DONE = {"完成", "已完成", "结项", "已结项"}
 
 
 def _run(args, cwd):
@@ -192,42 +197,138 @@ def window(ws, repo, rel, home=None):
     return since(repo, rel)[1]
 
 
-def material(ws, repo, rel, home=None):
+def material(ws, repo, rel, home=None, *, snapshot=None, commits=None):
     """给模型的材料：runbook 全文、上一份稿以来的提交（说明和改了哪些文件，见 window）、程序认出的落后之处。"""
-    commits = window(ws, repo, rel, home)
+    if commits is None:
+        commits = window(ws, repo, rel, home)
     log = ""
     if commits:
-        first = commits[-1].split()[0]
-        log = _run(["git", "log", f"{first}~1..HEAD", "--format=### %h %cd%n%B", "--date=format-local:%m-%d %H:%M", "--stat=100"], repo)
+        log = _run(["git", "log", "--no-walk=unsorted", "--format=### %h %cd%n%B",
+                    "--date=format-local:%m-%d %H:%M", "--stat=100", *(c.split()[0] for c in commits)], repo)
         if len(log) > LOG_CUT:
             log = log[:LOG_CUT] + "\n……（后面截掉了）"
-    return {"runbook": (repo / rel).read_text(), "log": log or "（上一份稿之后没有新提交）",
+    return {"runbook": (repo / rel).read_text() if snapshot is None else snapshot,
+            "log": log or "（上一份稿之后没有新提交）",
             "behind": "\n".join(behind(repo, rel)) or "（没有）"}
 
 
-def draft(ws, repo, rel, model, home=None):
+def _edits(repo, snapshot, output, commits):
+    """只收本次窗口内、提交原文明确挂到唯一未完结条目的单行事实。"""
+    entries = {}
+    for line, checked, key, body in items(snapshot):
+        if key:
+            entries.setdefault(key, []).append((line, checked, body))
+    allowed = {c.split()[0] for c in commits}
+    messages = {}
+    facts, closed, handled = {}, set(), set()
+    for proposal in output.splitlines():
+        match = EDIT.fullmatch(proposal)
+        if not match:
+            continue
+        kind, key, claim, sha = match.groups()
+        entry = entries.get(key, [])
+        if len(entry) != 1 or entry[0][1] or sha not in allowed or not claim.isprintable():
+            continue
+        if sha not in messages:
+            messages[sha] = _run(["git", "show", "-s", "--format=%B", sha], repo).splitlines()
+        prefix = rf"{re.escape(key)}(?:[ ：:]+)"
+        if not any(re.fullmatch(prefix + re.escape(claim), line.strip()) for line in messages[sha]):
+            continue
+        line, _, body = entry[0]
+        complete = claim.rstrip("。.!！") in DONE
+        if kind == "完结" and complete:
+            closed.add(line)
+        elif kind == "事实" and not complete:
+            literal = re.sub(r"([\\`*_\[\]<>#])", r"\\\1", claim)
+            if claim not in body and literal not in body:
+                first = body.splitlines()[0]
+                indent = first[:len(first) - len(first.lstrip())]
+                facts.setdefault(line + len(body.splitlines()) - 1, set()).add(f"{indent}  - {literal}（{sha}）")
+        else:
+            continue
+        handled.add(proposal)
+
+    result = []
+    for number, line in enumerate(snapshot.splitlines(keepends=True), 1):
+        result.append(line.replace("- [ ] ", "- [x] ", 1) if number in closed else line)
+        if number in facts:
+            ending = "\r\n" if line.endswith("\r\n") else "\n"
+            if not line.endswith("\n"):
+                result.append(ending)
+            result.extend(fact + ending for fact in sorted(facts[number]))
+    return "".join(result), handled
+
+
+def _commit_update(repo, rel, before, after, head):
+    """先用独立索引生成确切提交，再让 Git 快进；现场修改由 Git 保留。"""
+    def git(*args, env=None, data=None):
+        return subprocess.run(["git", *args], cwd=repo, env=env, input=data,
+                              capture_output=True, check=True, timeout=20).stdout.decode().strip()
+
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            env = dict(os.environ, GIT_INDEX_FILE=str(Path(temp) / "index"))
+            mode, kind, _ = git("ls-tree", head, "--", rel).split("\t", 1)[0].split()
+            if kind != "blob" or mode not in ("100644", "100755"):
+                return None
+            git("read-tree", head, env=env)
+            blob = git("hash-object", "-w", "--stdin", data=after.encode())
+            git("update-index", "--cacheinfo", mode, blob, rel, env=env)
+            tree = git("write-tree", env=env)
+            commit = git("commit-tree", tree, "-p", head, "-m", "runbook：按提交更新进度")
+            if git("rev-parse", "HEAD") != head or _blob(repo, rel) != before:
+                return None
+            git("diff", "--quiet", "HEAD", "--", rel)
+            git("merge", "--ff-only", "--no-autostash", commit)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return commit
+
+
+def draft(ws, repo, rel, model, home=None, *, auto=False):
     """写一份更新稿进数据目录。runbook 自上次写稿以来没变、也没有新提交，就不写（不花额度）。返回写了没有。"""
     from ...engram import invoke
     from ... import express
     f = _draft_path(ws, home)
-    blob, head = _blob(repo, rel), _run(["git", "rev-parse", "HEAD"], repo)
+    try:
+        original = (repo / rel).read_bytes()
+    except OSError:
+        return False
+    snapshot = original.decode()
+    blob, head = hashlib.sha1(original).hexdigest(), _run(["git", "rev-parse", "HEAD"], repo)
     try:
         if f"runbook={blob} head={head}" in f.read_text().splitlines()[0]:
             return False
     except (OSError, IndexError):
         pass
-    m = material(ws, repo, rel, home)
-    if not window(ws, repo, rel, home) and m["behind"] == "（没有）":
+    commits = window(ws, repo, rel, home)
+    m = material(ws, repo, rel, home, snapshot=snapshot, commits=commits)
+    if not commits and m["behind"] == "（没有）":
         return False
     text = express.prompt(PROMPT.read_text(), USER_NAME)
     for k, v in m.items():
         text = text.replace("{{" + k + "}}", v)
     out, meta = invoke.call(model, text)
     now = datetime.now(timezone.utc)
-    body = f"<!-- 编于 {now.isoformat(timespec='seconds')} runbook={blob} head={head} model={meta.get('model')} -->\n{out.strip()}\n"
+
+    def body(output, digest, base):
+        return f"<!-- 编于 {now.isoformat(timespec='seconds')} runbook={digest} head={base} model={meta.get('model')} -->\n{output.strip()}\n"
+
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(body)
-    kept = f.parent / "runbook-drafts" / f"{ws}-{now:%Y%m%dT%H%M}.md"     # 每份留底：G8 要攒几次稿再看，覆盖就攒不起来（2026-11-07）
+    kept = f.parent / "runbook-drafts" / f"{ws}-{now:%Y%m%dT%H%M%S%f}.md"
     kept.parent.mkdir(exist_ok=True)
-    kept.write_text(body)
+    kept.write_text(body(out, blob, head))
+    if auto:
+        updated, handled = _edits(repo, snapshot, out, commits)
+        if updated != snapshot and (commit := _commit_update(repo, rel, blob, updated, head)):
+            out = "\n".join(line for line in out.splitlines() if line not in handled) or "无"
+            f.write_text(body(out, hashlib.sha1(updated.encode()).hexdigest(), commit))
+            return True
+        if _blob(repo, rel) != blob or _run(["git", "rev-parse", "HEAD"], repo) != head:
+            if not f.exists() and head:
+                base = _run(["git", "log", "-1", "--format=%H", head, "--", rel], repo)
+                if base:
+                    f.write_text(body("无", blob, base))
+            return True  # 稿留底，下次沿旧窗口重算
+    f.write_text(body(out, blob, head))
     return True

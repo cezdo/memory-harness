@@ -7,14 +7,11 @@ projects = "~/projects"                          # 放项目的目录：Synapse 
 name = "用户"                                    # 写记录、填提示词用的称呼（默认“用户”）
 aliases = []                                     # 另外的称呼：识别与检索候选；同名按上下文判断，通用角色词不加入个人组
 
-[workspace.engram]                               # Engram 按目录更正工作区：最长前缀；其余取会话 cwd 的最后一节
+[workspace.engram]                               # 按目录更正工作区（Engram、Synapse 共用）：最长前缀；其余按 git 仓库根、projects 下第一层、cwd 的最后一节
 # "~/projects/old-name" = "new-name"
 
 [workspace.managing]                             # 管理性质的工作区：会话可以挂到目录下任何一个工作区的线
 # home = "~"
-
-[workspace.synapse]                              # Synapse 的改名、删除、别名：按路径前缀，最长的优先
-# "~/projects/old-name" = "new-name"
 
 # [[workspace.sessions]]                         # 按会话更正工作区
 # source = "claude"
@@ -39,6 +36,7 @@ quiet = []                                       # 不当“查不到的词”�
 
 [tools]
 # codex = "codex"                                # codex CLI 的路径（默认按 PATH 找）
+# agy = "agy"                                    # agy CLI 的路径（默认按 PATH 找）
 # dsh_test = "/usr/local/mh-tools/dsh-observe"    # mh 专用的 dsh 实例（精读）：env/ 程序、home/ 是 DSH_HOME
 
 [vector]                                        # 检索面的向量一路（Synapse v0.33）：服务端是 mh/synapse/pull/vector_serve.py，跑在有 numpy 和 bge-m3 的机器上
@@ -83,13 +81,14 @@ quiet = []                                       # 不当“查不到的词”�
 [resources]                                     # 私有文本，独立于代码和发行包
 # core = "~/.config/memory-harness/core.md"         # 内核（手记里不变的那部分）；2026-10-24 前叫 standing
 # glossary = "~/.config/memory-harness/glossary.md"
+# reflex = "~/.config/memory-harness/reflex.md"
 # workspace_status = "~/.config/memory-harness/workspace-status"
 
 [review]                                        # 给用户看的预览站：发布的页面链接是一次性的，form 写陈述时去掉
 # url = "https://preview.example.org/"
 
 [show]                                          # 展示自己的窗口（mh rhythm --show）：只读网页，打开时现编
-# listen = "127.0.0.1:3089"                     # 只听这个地址（例如 tailscale 的地址），由前面的 nginx 管登录
+# listen = "127.0.0.1:3089"                     # 只听这个地址，由前面的 nginx 管登录
 # allow = ["127.0.0.1"]                         # 只放这些来源进来
 # local_model = "http://192.0.2.20:28080"       # 本地模型服务（看加载了哪个）；不写就不看
 # local_model_key = "~/.config/memory-harness/local-model.key"
@@ -98,7 +97,7 @@ quiet = []                                       # 不当“查不到的词”�
 # dsh_port = 3080                               # 宿主 dsh 的端口（重启后看它在不在）
 # backup_unit = "dsh-backup.service"            # 每天备份的用户级 unit
 # chain = "协议端 → ssh 隧道 → listen 记、reply 回"   # QQ 那一格的一行说明
-# review_ctl = "~/review-station/ctl.py"        # 预览站的 ctl.py：近几天发的页面留没留输入；不写就不看
+# review_ctl = "~/tools/preview/ctl.py"        # 预览站的 ctl.py：近几天发的页面留没留输入；不写就不看
 # raid = "md0"                                  # RAID 阵列（/proc/mdstat、/sys/block/<名>/md）
 # patrol = "/var/lib/nas-patrol/last.status"    # 每天巡检的结论（key=value，exit 0/1/2）；patrol_log 给 WARN/CRIT 行
 # proxy_api = "http://127.0.0.1:9090"           # mihomo / clash 的 external-controller：连接数、累计流量

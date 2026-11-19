@@ -11,7 +11,7 @@ from ...engram.observe.label import self_talk
 
 N = 3                  # 列几条
 SAID = 60              # “你最后说”最多几个字
-HOST = {"claude": "Claude Code", "codex": "codex", "dsh": "dsh"}
+HOST = {"claude": "Claude Code", "codex": "codex", "dsh": "dsh", "agy": "agy"}
 
 
 def _t(s):
@@ -25,11 +25,14 @@ def _one(s, n):
 
 def sessions(conn, ws, foreign=False):
     """这个工作区的用户会话：[{source, session, file, cwd, title, turns: [{origin, started, text, user}]}]，最近停下的在前。
-    foreign：反过来取在别的工作区开的会话（是否碰过这个工作区由 crossed() 判断）。"""
+    foreign：反过来取在别的工作区开的会话（是否碰过这个工作区由 crossed() 判断）。已挂到具体工作区线的会话按所挂工作区归位（2026-11-19）。"""
+    from ...engram import store as st
+    attached = st.attached_workspaces(conn)
     out = []
     for s in conn.execute("SELECT source, session, file, cwd, title FROM session_detail "
-                          "WHERE kind='user' AND source IN ('claude','codex','dsh')"):
-        if (workspace(s[3]) == ws) == foreign:
+                          "WHERE kind='user' AND source IN ('claude','codex','dsh','agy')"):
+        s_ws = st.SESSION_WORKSPACE.get((s[0], s[1])) or attached.get((s[0], s[1])) or workspace(s[3])
+        if (s_ws == ws) == foreign:
             continue
         turns = [dict(zip(("origin", "started", "text", "user"), r)) for r in conn.execute(
             """SELECT d.origin, o.started, d.text, x.user FROM turn_detail d JOIN occurrence o ON o.id=d.occurrence
@@ -45,8 +48,8 @@ def sessions(conn, ws, foreign=False):
 def crossed(x, ws):
     """在别的工作区开的会话，工具调用里碰过这个工作区的路径（不分读写）。"""
     try:
-        from ...engram.observe.written_files import touched
-        return any(workspace(p) == ws for p in touched(x["source"], x["file"], x.get("cwd")))
+        from ...engram.observe.written_files import touched_workspaces     # 按原始记录的 mtime 缓存（2026-11-19）
+        return ws in touched_workspaces(x["source"], x["file"], x.get("cwd"))
     except Exception:
         return False
 
@@ -69,7 +72,7 @@ def active(conn, since):
     """since（UTC ISO）以后有过轮次的用户会话，不分工作区：[{source, session, file, cwd, title, last}]。"""
     rows = conn.execute("""SELECT s.source, s.session, s.file, s.cwd, s.title, MAX(o.started) FROM session_detail s
                            JOIN turn_detail d ON d.source=s.source AND d.session=s.session JOIN occurrence o ON o.id=d.occurrence
-                           WHERE s.kind='user' AND s.source IN ('claude','codex','dsh') GROUP BY s.source, s.session
+                           WHERE s.kind='user' AND s.source IN ('claude','codex','dsh','agy') GROUP BY s.source, s.session
                            HAVING MAX(o.started) >= ?""", (since,)).fetchall()
     return [dict(zip(("source", "session", "file", "cwd", "title"), r[:5]), last=_t(r[5])) for r in rows]
 

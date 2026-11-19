@@ -281,9 +281,14 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             self.assertIn("先给这段对话的结构", text)                  # 有 form 写的结构：结构在前（v0.38）
             self.assertIn("J1 判断（我；S1）先迁配置再升", text)
             self.assertIn("第 1–2 轮 升级方案确认：", text)             # 目录跟在后面
+            self.assertIn("- 第 1–2 轮 讨论：L1:T1:S2", text)           # 目录一次给全（2026-11-19），窗口=1 也不截断第 2 节
+            self.assertNotIn("下一页 page=2", text)
             from unittest import mock
             with mock.patch.object(pull.structure, "latest", return_value=None):
-                self.assertIn("先给目录", pull.show_node(L, nid, None, self.conn)[0])   # 没有结构（或对不上现在的主列）照旧给目录
+                toc = pull.show_node(L, nid, None, self.conn)[0]
+                self.assertIn("先给目录", toc)                          # 没有结构（或对不上现在的主列）照旧给目录
+                self.assertIn("- 第 1–2 轮 讨论：L1:T1:S2", toc)
+                self.assertNotIn("下一页 page=2", toc)
         finally:
             pull._WIN.reset(tok)
         t, _ = pull.show_stmt(self.conn, L, items[0]["id"], "S1", said=True)
@@ -546,6 +551,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         from unittest.mock import patch
         from ..push import pos, yorimichi
         from ..push import associate
+        associate.cached(self.conn, build=True)      # 在线只读缓存（N5）：先建好，免得这一轮“联想数据未就绪”
         real = pos.tag
         pos.tag = lambda texts, timeout=5: [[("甲服务", "nz", 2, "SBV"), ("当时", "nt", 3, "ADV"), ("怎么", "r", 3, "ADV"),
                                              ("升级", "v", 0, "HED"), ("来着", "u", 4, "RAD")]]
@@ -590,6 +596,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         tag = lambda texts, timeout=5: [[("甲服务", "nz", 2, "SBV"), ("当时", "nt", 3, "ADV"), ("怎么", "r", 3, "ADV"),
                                          ("升级", "v", 0, "HED"), ("来着", "u", 4, "RAD")]]
         got = {}
+        associate.cached(self.conn, build=True)      # 在线只读缓存（N5）：先建好
         with patch.object(pos, "tag", tag), patch.object(associate, "DELIVER", {"专名", "强回想", "组合"}):
             for width, session in ((0, "p1"), (1, "p2")):
                 with patch.object(yorimichi, "state", return_value={"width": width}):
@@ -604,13 +611,17 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertEqual(json.loads(q)["associate"]["yorimichi"], 1)
 
     def test_head_marks_review(self):
-        """话题的挂线还标着待审视（中间插入留下的，J6）：话题头下面提示；没有标记的头不变。"""
+        """话题的挂线还标着待审视（中间插入留下的，J6）：话题头下面提示；没有标记的头不变。跨天话题写两个完整年月日（2026-11-19）。"""
         class L:
-            nodes = {"T1": {"name": "N", "date": "", "topic": "t", "items": [], "review": ""},
-                     "T2": {"name": "N", "date": "", "topic": "t", "items": [], "review": "待审视：晚到的 E 插进了已整理的范围（E9）"}}
+            nodes = {"T1": {"name": "N", "first_date": "2026-08-16T05:00:00Z", "date": "2026-09-11T04:00:00Z", "topic": "t", "items": [], "review": ""},
+                     "T2": {"name": "N", "first_date": "2026-09-11T01:00:00Z", "date": "2026-09-11T04:00:00Z", "topic": "t", "items": [],
+                            "review": "待审视：晚到的 E 插进了已整理的范围（E9）"}}
             where = staticmethod(lambda nid: nid)
-        self.assertNotIn("待审视", pull._head(L, "T1"))
+        head1 = pull._head(L, "T1")
+        self.assertNotIn("待审视", head1)
+        self.assertIn("（2026-08-16～2026-09-11，0 条陈述）", head1)
         head = pull._head(L, "T2")
+        self.assertIn("（2026-09-11，0 条陈述）", head)
         self.assertEqual(head.count("\n"), 1)
         self.assertIn("挂线待审视：晚到的 E", head)
         self.assertNotIn("feedback", head)                      # v0.36：feedback 工具撤了，不再指过去
@@ -652,7 +663,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         (repo / "design" / "new.md").write_text("x")
         (src / "w.md").write_text(f"# 项目现状：w\n\n- 仓库：{repo}\n- 检查：printf '检查了 3 份\\n\\n- 没有发现事件'\n\n## 目录\n\n"
                                   "- design/：设计文档\n- tmp/：实验\n")
-        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=[]):   # 不读正式库
+        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=[]), \
+                mock.patch.object(status, "_recent", return_value=None):   # 不读正式库（最近停下的几件事会扫正式原始记录，GPT 验收 11-19）
             text = status.compile("w")
             self.assertIn("- 近 3 天有提交：design/（1）；不进 git：tmp/", text)    # 2026-10-24 目录压成一行，说明不推
             self.assertNotIn("设计文档", text)
@@ -673,7 +685,8 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         self.assertNotIn("### 没提交的改动", cc)
         from ..push.recent import TOUCHED
         touched = [f"  - design/new.md：Claude Code「别的会话」（L1:T1）10-27 12:00 最后{TOUCHED}"]       # 宿主给不了的“是谁碰的”留下
-        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=touched):
+        with mock.patch.object(status, "SOURCES", src), mock.patch.object(status, "_dirty_sources", return_value=touched), \
+                mock.patch.object(status, "_recent", return_value=None):
             status.write("w", home=self.dir / "status2")
         kept = status.read("w", home=self.dir / "status2", host="claude")
         self.assertIn("### 没提交的改动", kept)

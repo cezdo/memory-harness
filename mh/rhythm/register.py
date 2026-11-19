@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -32,7 +33,7 @@ EXTRA = {"memory-harness-invoke": (["engram", "serve"], "mh engram serve：远�
 EXTRA = {k: v for k, v in EXTRA.items() if k != "memory-harness-tend" or (Path(__file__).parent / "tend").is_dir()}
 ALL = {**SERVICES, **EXTRA}
 # 循环要调的外部程序：服务的 PATH 由它们此刻所在的目录拼成（dsh 要 Node 24，系统自带的 node 可能太旧）
-TOOLS = ("node", "claude", "codex")
+TOOLS = ("node", "claude", "codex", "agy")
 RESTART_SEC = 30
 STAMP_ENV = "MH_LOG_STAMP"           # launchd 下置 1：日志每行补上时刻
 LOG_TAIL = 4 << 20                   # macOS 读日志文件末尾多少字节找出错行
@@ -132,6 +133,16 @@ def state(name):
         return "active" if m.group(1) == "running" else m.group(1)
     out = dict(x.partition("=")[::2] for x in _run(["systemctl", "--user", "show", name, "-p", "LoadState,ActiveState"]).splitlines())
     return "not-found" if out.get("LoadState") == "not-found" else out.get("ActiveState", "")
+
+
+def since(name):
+    """服务这一次是什么时候起来的（绝对时间，秒）；读不到给 None。常驻循环是长进程、不重新加载代码，近况拿它和最新提交比。"""
+    if PLATFORM == "launchd":
+        m = re.search(r"^\s*pid = (\d+)", _run(["launchctl", "print", f"gui/{os.getuid()}/{name}"]), re.M)
+        out = _run(["ps", "-o", "etimes=", "-p", m.group(1)]).strip() if m else ""
+        return time.time() - int(out) if out.isdigit() else None
+    out = _run(["systemctl", "--user", "show", name, "-p", "ActiveEnterTimestamp", "--value", "--timestamp=unix"]).strip()
+    return int(out[1:]) if re.fullmatch(r"@\d+", out) and int(out[1:]) else None
 
 
 def lines(name, hours):

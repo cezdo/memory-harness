@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS turn_detail(
 CREATE INDEX IF NOT EXISTS turn_detail_text ON turn_detail(text);
 CREATE TABLE IF NOT EXISTS collect_file(path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL,
   parser TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS worktree_repo(       -- Zeron worktree 的根 → 主仓库：采集时 worktree 还在就读 .git 记下，删了以后照记录算（2026-11-18）
+  root TEXT PRIMARY KEY, main TEXT NOT NULL, seen TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS act_detail(
   occurrence INTEGER PRIMARY KEY,
@@ -342,10 +344,32 @@ def worktree_main(root):
     return None
 
 
+def _recorded_main(root):
+    """采集时记下的主仓库（worktree_repo）；没记过、库还没有或读不了返回 None。"""
+    try:
+        conn = sqlite3.connect(f"file:{DEFAULT_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT main FROM worktree_repo WHERE root=?", (root,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def remember_worktree(conn, cwd):
+    """会话 cwd 在 Zeron worktree 里、worktree 还在：把主仓库记下，删了以后不用再猜（采集时调，2026-11-18）。"""
+    m = _ZERON.match((cwd or "").rstrip("/"))
+    main = m and worktree_main(m.group(1))
+    if main:
+        conn.execute("INSERT OR REPLACE INTO worktree_repo VALUES(?,?,?)", (m.group(1), main, now()))
+
+
 @functools.lru_cache(maxsize=256)
 def _zeron_main(root, project):
-    """Zeron worktree 的根 → 主仓库的路径；worktree 已经删了或读不出时，按 <家目录>/<项目> 猜（工作区名只用到最后一节）。"""
-    return worktree_main(root) or str(Path.home() / project)
+    """Zeron worktree 的根 → 主仓库的路径：先读 .git，再查采集时的记录（worktree_repo）；都没有才按 <家目录>/<项目> 猜
+    （工作区名只用到最后一节）。记录只在 worktree 还在时写，所以猜出的结果缓存着也不会过时。"""
+    return worktree_main(root) or _recorded_main(root) or str(Path.home() / project)
 
 
 def unworktree(path):
@@ -360,21 +384,71 @@ def unworktree(path):
     return re.sub(r"/(?:\.claude|tmp)/worktrees/[^/]+(?=/|$)", "", p)
 
 
+def _exists(p):
+    """路径在不在；一节超过 255 字节之类的 OSError 当不在（2026-11-08 方向探索第 3 轮：dsh run_code 里的 base64 带“/”）。"""
+    try:
+        return p.exists()
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=2048)
+def _git_root(c, home_str):
+    p, home = Path(c), Path(home_str)
+    for d in (p, *p.parents):
+        if d != home and home in d.parents and _exists(d / ".git"):
+            return str(d)
+    return ""
+
+
 def workspace(cwd):
-    """工作区名：先按 WORKSPACE_DIRS（最长前缀），否则取会话 cwd 的最后一节；worktree（Claude Code、Zeron，见 unworktree）
-    算回它所在的仓库。没有 cwd 返回 ""。"""
-    c = unworktree(cwd)
+    """工作区名：先按 WORKSPACE_DIRS（最长前缀）；再往上看所在 git 仓库根目录（跳过家目录本身的仓库，子目录或文件路径都能
+    算回仓库根，2026-11-19 合并 push.workspace）；再看放项目的目录（PROJECTS）下的第一层目录；其余取路径最后一节。
+    worktree（Claude Code、Zeron、tmp/worktrees，见 unworktree）先算回所在的仓库。没有 cwd 返回 ""。"""
+    c = unworktree(str(cwd or ""))
+    if not c or absent(c):
+        return ""
+    if c == str(SELF_ROOT) or c.startswith(str(SELF_ROOT) + "/"):     # 测试换掉映射表时 self 照认
+        return "self"
     for d in sorted(WORKSPACE_DIRS, key=len, reverse=True):
         if c == d or c.startswith(d + "/"):
             return WORKSPACE_DIRS[d]
-    return c.split("/")[-1] if c else ""
+    home, proj = Path.home(), instance.PROJECTS
+    root = _git_root(c, str(home))
+    if root:
+        main = worktree_main(Path(root))
+        return workspace(main) if main else Path(root).name
+    p = Path(c)
+    if proj and proj in p.parents:
+        return p.relative_to(proj).parts[0]
+    return c.split("/")[-1]
+
+
+def project_workspace(path):
+    """工具调用里碰到的文件路径 → 具体项目工作区名；系统路径（家目录和 WORKSPACE_DIRS 之外的 /dev、/etc、/tmp 等）、
+    家目录下的点文件/普通文件（不在 WORKSPACE_DIRS 且不是 git 仓库）、管理性质工作区和临时目录（tmp）返回 ""（2026-11-19）。"""
+    c = unworktree(str(path or ""))
+    home = Path.home()
+    if not c or absent(c):
+        return ""
+    hit = any(c == d or c.startswith(d + "/") for d in WORKSPACE_DIRS) or c == str(SELF_ROOT) or c.startswith(str(SELF_ROOT) + "/")
+    p = Path(c)
+    if not hit:                       # 映射表外：只认家目录下、不是点目录的；直接放在家目录下的只认 git 仓库（~/memory-harness）
+        if p == home or home not in p.parents or p.relative_to(home).parts[0].startswith("."):
+            return ""
+        if p.parent == home and not _exists(p / ".git"):
+            return ""
+    w = canonical(workspace(c))
+    if w in MANAGING or w in ("", "home", "tmp", home.name):
+        return ""
+    return w
 
 
 def worktree_uncertain(cwd):
-    """Zeron 的 worktree 删了、读不出主仓库：工作区只能按项目名猜，等模型或用户确认（form 挂线时跳过，2026-11-13）。
-    tmp/worktrees、.claude/worktrees 按路径就能算回仓库，不算不确定。"""
+    """Zeron 的 worktree 删了、采集时也没记下主仓库：工作区只能按项目名猜，等模型或用户确认（form 挂线时跳过，2026-11-13；
+    采集时记下的算确定，2026-11-18）。tmp/worktrees、.claude/worktrees 按路径就能算回仓库，不算不确定。"""
     m = _ZERON.match((cwd or "").rstrip("/"))
-    return bool(m) and worktree_main(m.group(1)) is None
+    return bool(m) and worktree_main(m.group(1)) is None and _recorded_main(m.group(1)) is None
 
 
 def canonical(ws):
@@ -398,6 +472,34 @@ def reachable(conn, ws):
 def session_workspace(source, session, cwd):
     """一段会话的工作区：先查按会话的更正，否则按 cwd（workspace）。"""
     return SESSION_WORKSPACE.get((source, session)) or workspace(cwd)
+
+
+def attached_workspaces(conn):
+    """全库已挂线会话的归位映射：{(来源, 会话): 具体工作区名}（一次查询，以最新会话入口的最后一次挂线为准；管理工作区不覆盖，2026-11-19）。"""
+    if conn is None or not hasattr(conn, "execute"):
+        return {}
+    try:
+        rows = conn.execute(
+            """SELECT e.source, e.session, l.workspace FROM session_entry e
+               JOIN attachment a ON a.entry = e.id
+               JOIN topic_line l ON l.id = a.line
+               ORDER BY e.id, a.id"""
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    for src, ses, raw in rows:
+        ws = canonical(raw) if raw else ""
+        if ws and ws not in MANAGING:
+            out[(src, ses)] = ws
+        else:
+            out.pop((src, ses), None)
+    return out
+
+
+def attached_workspace(conn, source, session):
+    """这段会话在库里已经挂到了哪个具体工作区的线（以最新会话入口的最后一次挂线为准）；没挂线或挂在管理工作区上返回 ""（2026-11-19）。"""
+    return attached_workspaces(conn).get((source, session), "")
 
 
 def handle(kind, id_):

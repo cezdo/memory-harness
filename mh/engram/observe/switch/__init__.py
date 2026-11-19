@@ -108,17 +108,37 @@ def _hook(path, command, host, event="UserPromptSubmit", backed=None, apply=Fals
     return f"{path}：{event} 加了 {host} 的{'开关' if event == 'UserPromptSubmit' else '叫醒'}钩子"
 
 
+def _agy_hook(path, command, event="PreInvocation", backed=None, apply=False):
+    """把钩子加进 agy 的 ~/.gemini/config/hooks.json（顶层是组名 memory-harness，PreInvocation / Stop 是扁平列表）。"""
+    data = json.loads(path.read_text()) if path.exists() else {}
+    entries = data.setdefault("memory-harness", {}).setdefault(event, [])
+    if any(command == h.get("command", "") for h in entries):
+        return None
+    if apply:
+        if path.exists() and (backed is None or path not in backed):
+            shutil.copy2(path, path.with_name(f"{path.name}.bak-observe-switch-{datetime.now():%Y%m%d-%H%M%S}"))
+            if backed is not None:
+                backed.add(path)
+        entries.append({"type": "command", "command": command, "timeout": 5})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return f"{path}：{event} 加了 agy 的{'开关' if event == 'PreInvocation' else '叫醒'}钩子"
+
+
 def install(home=Path.home(), python="/usr/bin/python3", apply=False):
-    """装 Claude Code 命令、codex skill（符号链接到 `mh/skills/`，改仓库即生效）和两边的开关钩子、叫醒钩子（Stop）。
+    """装 Claude Code 命令、codex / agy skill（符号链接到 `mh/skills/`，改仓库即生效）和各宿主的开关钩子、叫醒钩子（Stop）。
     apply=False 只列要做什么；宿主里指向搬家前位置的链接就地换掉。codex 的新钩子要用户在 codex 里信任一次才会运行。
     dsh 的 bundle 要挂进 web profile、重启 dsh web，不在这里做（宿主由用户重启）。返回做了什么。"""
     done = []
     for name in NAMES:
         done.append(_link(SKILL / name / "claude" / f"{name}.md", home / ".claude/commands" / f"{name}.md", apply))
         done.append(_link(SKILL / name / "codex" / name, home / ".codex/skills" / name, apply))
+        done.append(_link(SKILL / name / "codex" / name, home / ".gemini/config/skills" / name, apply))
     hook, backed = HERE / "hook.py", set()
     done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude", "Claude Code", backed=backed, apply=apply))
     done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex", "codex", backed=backed, apply=apply))
+    done.append(_agy_hook(home / ".gemini/config/hooks.json", f"{python} -I -S {hook} agy", "PreInvocation", backed, apply))
     done.append(_hook(home / ".claude/settings.json", f"{python} -I -S {hook} claude stop", "Claude Code", "Stop", backed, apply))
     done.append(_hook(home / ".codex/hooks.json", f"{python} -I -S {hook} codex stop", "codex", "Stop", backed, apply))
+    done.append(_agy_hook(home / ".gemini/config/hooks.json", f"{python} -I -S {hook} agy stop", "Stop", backed, apply))
     return [x for x in done if x]

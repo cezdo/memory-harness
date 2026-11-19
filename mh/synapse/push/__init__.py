@@ -4,36 +4,12 @@
 import re
 from pathlib import Path
 
-from ...engram.store.instance import PROJECTS, SYNAPSE_DIRS as WORKSPACES    # 改名、删除、别名的目录，放项目的目录：实例配置（重构 H）
 from ...engram.store.instance import resource, unplugged
 
-HOME = Path.home()
-
-
-def _exists(p):
-    """路径在不在；一节超过 255 字节之类的 OSError 当不在（2026-11-08 方向探索第 3 轮：dsh run_code 里的 base64 带“/”，被认成
-    相对路径进了 touches，form.crossed 在这里抛 Errno 36，挂线整轮出错、同一个单元每轮排第一）。"""
-    try:
-        return p.exists()
-    except OSError:
-        return False
-
-
 def workspace(path):
-    """工作区的键。先查 WORKSPACES；否则取所在 git 仓库根目录的名字（跳过家目录本身的仓库）；
-    再否则取放项目的目录（PROJECTS）下的第一层目录；都不是就归 home。纯程序判断，目录不必仍然存在。"""
-    from ...engram.store import unworktree, worktree_main
-    p = Path(unworktree(str(path or "")))                  # worktree 算回所在仓库（Claude Code、Zeron，2026-11-07）
-    for d in sorted(WORKSPACES, key=lambda d: -len(d.parts)):
-        if p == d or d in p.parents:
-            return WORKSPACES[d]
-    for d in [p, *p.parents]:
-        if d != HOME and HOME in d.parents and _exists(d / ".git"):
-            main = worktree_main(d)                # 仓库里的 worktree（tmp/worktrees/<任务>，用户 11-07）算回主仓库
-            return workspace(main) if main else d.name
-    if PROJECTS and PROJECTS in p.parents:
-        return p.relative_to(PROJECTS).parts[0]
-    return "home"
+    """工作区的键（2026-11-19 与 store.workspace 统一）：不再另走一套映射或兜底到 home。"""
+    from ...engram.store import workspace as ws_of
+    return ws_of(path)
 
 
 def _core():
@@ -89,7 +65,7 @@ def standing(cwd="", memory=""):
     return "\n\n".join(x for x in parts if x)
 
 
-HOST_NAME = {"claude": "Claude Code", "codex": "codex", "dsh": "dsh"}
+HOST_NAME = {"claude": "Claude Code", "codex": "codex", "dsh": "dsh", "agy": "agy"}
 
 
 def environment(host, start="", model="", now=None):
@@ -104,27 +80,29 @@ def environment(host, start="", model="", now=None):
 
 # ---- 新库上的手记推送（E1a）----
 
-TOOL = "mcp__mh__"       # 宿主给 MCP 工具起的名字：mcp__<服务名>__<工具名>
+TOOL = "mcp__mh__"       # 宿主给 MCP 工具起的名字：mcp__<服务名>__<工具名>（agy 是单下划线 mcp_mh_）
 
 
-def entry(L, cwd):
+def entry(L, cwd, host="claude"):
     """工具怎么用（2026-10-24：常用入口并进“最近停下的几件事”，每条带句柄；2026-10-28 改成介绍的口吻，和内核“记忆与认知”一致，加上 yorimichi）。L、cwd 留着给调用方。"""
     from ...engram.store import workspace as ws_of
     here = ws_of(cwd)
+    tool = "mcp_mh_" if host == "agy" else TOOL
     return "\n".join(["### 工具",
-                      f"- `{TOOL}evoke`（words）：按词回忆，几个词一起给，带上换个说法的词；",
-                      f"- `{TOOL}relive`（handles）：按句柄读下去，需要时一直走到原话；",
-                      f"- `{TOOL}roam`（node）：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
-                      f"- `{TOOL}yorimichi`（width）：告诉记忆现在给联想留几条；",
+                      f"- `{tool}evoke`（words）：按词回忆，几个词一起给，带上换个说法的词；",
+                      f"- `{tool}relive`（handles）：按句柄读下去，需要时一直走到原话；",
+                      f"- `{tool}roam`（node）：不知道用什么词的时候，在地图上一层层走（这个工作区全部的线：`roam {here}`）；",
+                      f"- `{tool}yorimichi`（width）：告诉记忆现在给联想留几条；",
                       "- 句柄：线 L3、话题 L3:T5、陈述 L3:T5:S1（没挂上线写 L?）、骨架 k-、E、J、认知 C8（也认名字）。括号里是主参数，其余参数见各工具的说明。"])
 
 
-def render(cwd, host="claude", session="", start="", model=""):
+def render(cwd, host="claude", session="", start="", model="", conn=None):
     """手记的正文（还没包 <memory-harness>）：内核 + 工具 → 项目现状 → 环境，稳定的在前、易变的在后。
-    钩子和 `mh boot` 共用。项目现状是整理循环编好的，宿主自己给了的节去掉；读不到就不给（宿主不能报错）。"""
+    钩子和 `mh boot` 共用。项目现状是整理循环编好的，宿主自己给了的节去掉；没有手写近况源的工作区也送达环境级反射和未落库栞。"""
     from . import status
-    text = standing(cwd, entry(None, cwd))
-    now = status.read(workspace(cwd), host=host)
+    text = standing(cwd, entry(None, cwd, host))
+    ws = workspace(cwd)
+    now = status.read(ws, host=host, conn=conn) or status.fallback(ws, conn=conn)
     if now:
         try:
             from . import recent
@@ -136,7 +114,7 @@ def render(cwd, host="claude", session="", start="", model=""):
 
 
 def hook(conn, payload):
-    """手记推送（Claude Code SessionStart、codex start、dsh 的 agent/created 用同一个入口）：内核 + 工具 + 项目现状 + 环境，
+    """手记推送（Claude Code SessionStart、codex start、dsh 的 agent/created、agy start 用同一个入口）：内核 + 工具 + 项目现状 + 环境，
     稳定的在前、易变的在后；记一条 use（push / assist），再写进推送流水（pushes.py）。返回宿主要的 JSON。"""
     from .. import track
     from ..track import pushes
@@ -151,8 +129,8 @@ def hook(conn, payload):
         except Exception:
             pass
     model = payload.get("model")
-    text = render(cwd, host, session, str(payload.get("source") or ""), model if isinstance(model, str) else "")
-    pairs = re.findall(r"(?<![A-Za-z0-9_:])L(\d+|\?):T(\d+)(?![0-9])", text.replace(entry(None, cwd), ""))  # 写出的话题和线算送达，工具节的示例不算
+    text = render(cwd, host, session, str(payload.get("source") or ""), model if isinstance(model, str) else "", conn=conn)
+    pairs = re.findall(r"(?<![A-Za-z0-9_:])L(\d+|\?):T(\d+)(?![0-9])", text.replace(entry(None, cwd, host), ""))  # 写出的话题和线算送达，工具节的示例不算
     got = {"topic_line": sorted({int(x) for x, _ in pairs if x != "?"}), "session_entry": sorted({int(t) for _, t in pairs})}
     text = track.deliver(conn, VERSION, "assist", {"push": "standing"}, text,
               {k: v for k, v in got.items() if v}, session=session, purpose="interactive",

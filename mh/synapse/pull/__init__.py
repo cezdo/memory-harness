@@ -266,6 +266,12 @@ def _day(t):
     return t[:10] if t and not absent(t) else "日期未知"
 
 
+def _entry_day(n):
+    """话题的日期（2026-11-19）：跨天写两个完整年月日（2026-08-16～2026-09-11），同一天只写一个。"""
+    d1, d2 = _day(n.get("first_date")), _day(n.get("date"))
+    return f"{d1}～{d2}" if d1 != "日期未知" and d2 != "日期未知" and d1 < d2 else d2
+
+
 def _stmt_day(L, sid):
     """陈述的日期（v0.40）：它的 E 出自的轮次里最晚的那天；归纳出的（没有直接的 E）用所在话题的日期。按读视图缓存。"""
     cache = L.__dict__.setdefault("_sday", {})
@@ -302,7 +308,7 @@ def _node_line(L, nid, marked=True):
     n = L.nodes[nid]
     m = _mark(L, nid) if marked else ""
     if n["kind"] == "entry":
-        return f"{L.where(nid)} {n['name']}（{_day(n['date'])}{m}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+        return f"{L.where(nid)} {n['name']}（{_entry_day(n)}{m}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n["kind"] == "line":
         return f"{nid} {n['name']}（{_size(L, nid)}{m}）"
     return f"{nid} {n['name']}（骨架）"
@@ -364,7 +370,7 @@ def _span(hs):
 
 def _head(L, nid):
     n = L.nodes[nid]
-    head = f"[{L.where(nid)}] {n['name']}（{_day(n['date'])}{_mark(L, nid)}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
+    head = f"[{L.where(nid)}] {n['name']}（{_entry_day(n)}{_mark(L, nid)}，{len(n.get('items', []))} 条陈述）：{n['topic']}"
     if n.get("review"):          # 中间插入留下的标记（v0.23）：这条挂线形成时没看到后来补进的内容，用到时由你带着新内容再看
         head += f"\n挂线{n['review']}"
     return head
@@ -505,7 +511,7 @@ def _turn_name(conn, t):
 
 
 def _show_sections(L, nid, secs):
-    """目录一行一节：第几轮、类型、这一节的陈述（连着的写成一段，读它就是 relive 这个句柄）。节多了照窗口翻页。"""
+    """目录一行一节：第几轮、类型、这一节的陈述（连着的写成一段，读它就是 relive 这个句柄）。一次给全（用户 2026-11-19）。"""
     out = [_head(L, nid) + "（陈述多，先给目录：relive 某一节的句柄读它）"]
     lines = []
     for k, ids in secs:
@@ -514,7 +520,7 @@ def _show_sections(L, nid, secs):
         hs_text = span if span != hs[0] or len(hs) == 1 else "、".join(hs)
         name = "其余" if k is None else _group_name(k)
         lines.append(f"- {name}：{hs_text}（{len(ids)} 条）")
-    out += _cap(lines, len(lines))
+    out += lines
     return "\n".join(out), {"session_entry": [L.nodes[nid]["row"]]}
 
 
@@ -917,7 +923,7 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
                 t, g = show_stmt(conn, L, sid, hh, source, said, recall, section=k, files=files)
                 if not attrs and sid in L.stmts:            # 只给这一条时标出在哪个话题（v0.39）
                     e = L.nodes[L.stmts[sid]["entry"]]
-                    t += f"\n  在 {L.where(L.stmts[sid]['entry'])}「{e['name']}」（{(e.get('date') or '')[:10]}）"
+                    t += f"\n  在 {L.where(L.stmts[sid]['entry'])}「{e['name']}」（{_entry_day(e)}）"
                 if g.pop("_sections", 0):
                     sections[key] = k
                 parts.append(t)
@@ -1141,7 +1147,7 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
         has = ("含 " + "、".join(live[i] for i in sorted(cover[x])) if n >= 2 else "") if x in cover else "意思相近"
         extra = "；".join(filter(None, [has, mark]))
         if nd["kind"] == "entry":
-            return f"- {L.where(x)} {nd['name']}（{_day(nd['date'])}{_mark(L, x)}，{len(nd.get('items', []))} 条陈述" + \
+            return f"- {L.where(x)} {nd['name']}（{_entry_day(nd)}{_mark(L, x)}，{len(nd.get('items', []))} 条陈述" + \
                    (f"；{extra}" if extra else "") + f"）：{nd['topic']}"
         return f"- {x} {nd['name']}（{_size(L, x) if nd['kind'] == 'line' else '骨架'}{_mark(L, x)}" + (f"；{extra}" if extra else "") + "）"
     take = _fit(rem, line)
@@ -1180,7 +1186,8 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
              **({"grain": g} if g != "S" else {}), **({"vector": "off"} if dense is None and vector.ENABLED else {})}
     evoked = [key(it) for it in shown]
     from ...engram.form import glossary             # 用到才导入（form 包导入要几十毫秒）
-    naming = glossary.fuller(ts) if ws and ws == glossary.home() else []   # 命名演进的影子（D5，11-08）：只记、不给看
+    gpath = glossary.path_for(ws) if ws else None
+    naming = glossary.fuller(ts, gpath) if gpath else []   # 命名演进的影子（D5，11-08；D6 11-19 按工作区读词典）：只记、不给看
     meta = {**({"evoked": evoked} if evoked else {}), **({"naming": naming} if naming else {})}
     text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note,
                          meta=meta or None)

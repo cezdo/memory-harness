@@ -91,7 +91,7 @@ python3 -m mh.synapse.pull.mcp
 
 Supply the correct Python, source path and instance environment. Inspect `python3 -m mh.synapse.hosts.codex.install --help` before running the Codex hook installer, which modifies host configuration.
 
-Claude Code's session-start entry point is `python3 -m mh inject`; the per-turn entry point is `python3 -m mh.synapse.push.associate`. The dsh plugin and observation switches are bundled under `mh/synapse/hosts/dsh/` and `mh/engram/observe/switch/` and require explicit host configuration.
+Claude Code's session-start entry point is `python3 -m mh inject`; the per-turn entry point is `python3 -m mh.synapse.push.associate`. The dsh plugin and observation switches are bundled under `mh/synapse/hosts/dsh/` and `mh/engram/observe/switch/` and require explicit host configuration. For Antigravity CLI and ACP, see the [AGY adapter](../synapse/设计.md#antigravity-cliagy).
 
 Observation and formation call external CLIs or an observation-only dsh instance. Preview uses authenticated Codex or Claude CLI; formation and rough reading use Codex; precise reading uses a dsh instance with a configured model provider, kept only for observation (not a shared test environment for host upgrades). Set its root through `[tools].dsh_test`. Credentials come from the relevant host configuration. Model selection and isolation are implemented in `mh/engram/invoke/` and the individual process modules.
 

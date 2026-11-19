@@ -75,6 +75,7 @@ def save(conn, op, session, turns, log=None):
         sid = row[0]      # 会话的元数据（标题、文件位置……）可以变，照最新的
         conn.execute("UPDATE session_detail SET file=?, kind=?, parent=?, cwd=?, model=?, title=? WHERE occurrence=?",
                      (*meta, sid))
+    st.remember_worktree(conn, s.cwd)                    # Zeron worktree 还在时记下主仓库，删了以后照记录归工作区（2026-11-18）
     new = texts = fixed = 0
     for i, t in enumerate(turns):
         cur = conn.execute("INSERT OR IGNORE INTO turn_text VALUES(?,?,?,?,?,?,?)",

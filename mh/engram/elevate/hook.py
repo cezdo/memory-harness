@@ -16,8 +16,9 @@ def main(argv):
     d = {}
     try:
         d = json.load(sys.stdin)
+        cwd = d.get("cwd") or (d.get("workspacePaths") or [""])[0] or ""
         from mh.engram.store.instance import unplugged
-        if unplugged(d.get("cwd")):                       # 不接 mh 的目录（[connect].unplugged）：内核态不管
+        if unplugged(cwd):                                # 不接 mh 的目录（[connect].unplugged）：内核态不管
             return 0
         if d.get("agent_id") or d.get("agent_type"):      # 子代理：提权只给用户直接对话的那一层
             if event in ("prompt", "stop"):
@@ -31,6 +32,8 @@ def main(argv):
             return 2
         if out is not None:
             json.dump(out, sys.stdout, ensure_ascii=False)
+        elif host == "agy":
+            sys.stdout.write("{}")
         return code
     except Exception as e:
         try:

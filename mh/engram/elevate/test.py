@@ -63,6 +63,35 @@ class Flow(Base):
         out, _ = self.ev("pre", "codex", tool_name="apply_patch", tool_input={"command": patch})
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_agy_flow(self):
+        out, _ = handle(self.k, "agy", "pre", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
+                                               "toolCall": {"name": "edit_file", "args": {"Path": str(self.src)}}})
+        self.assertEqual(out["decision"], "deny")
+        out, _ = handle(self.k, "agy", "pre", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
+                                               "toolCall": {"name": "replace_file_content", "args": {"TargetFile": str(self.src)}}})
+        self.assertEqual(out["decision"], "deny")
+        out, _ = handle(self.k, "agy", "prompt", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
+                                                  "lastUserInput": "<USER_REQUEST>\n/mhcore 改称呼\n</USER_REQUEST>"})
+        self.assertIn("内核态", out["injectSteps"][0]["systemMessage"]["systemMessage"])
+        # 同轮工具调用后的续调（invocationNum=2）不会关掉刚开的窗口
+        self.assertEqual(handle(self.k, "agy", "prompt", {"conversationId": "a1", "invocationNum": 2,
+                                                          "lastUserInput": "<USER_REQUEST>\n/mhcore 改称呼\n</USER_REQUEST>"}), (None, 0))
+        self.assertEqual(handle(self.k, "agy", "pre", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
+                                                       "toolCall": {"name": "edit_file", "args": {"Path": str(self.src)}}}), (None, 0))
+        # ACP（transcriptPath 是 conversations/<id>.db）：钩子拿不到原话，/mhcore 交给 Zeron 调的 acp-prompt；这里什么都不做，
+        # 也不把 acp-prompt 刚开的窗口当“下一次输入”关掉
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "conversations/a1.db"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"SQLite format 3\n123\n\"str\"\n")
+            for n in (1, 2):
+                self.assertEqual(handle(self.k, "agy", "prompt", {"conversationId": "a1", "invocationNum": n,
+                                                                  "transcriptPath": str(db), "lastUserInput": ""}), (None, 0))
+            self.assertTrue(self.k.opened("agy", "a1"))
+        out, _ = handle(self.k, "agy", "prompt", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
+                                                  "lastUserInput": "<memory-harness>\n联想\n</memory-harness>\n/mhcore 再改"})
+        self.assertIn("内核态", out["injectSteps"][0]["systemMessage"]["systemMessage"])
+
     def test_grant_edit_close(self):
         self.ev("post", tool_name="Read")                                 # 第一次见：记基线
         out, code = self.ev("prompt", prompt="/mhcore 接下来优先把称呼改成示例用户")
@@ -161,15 +190,26 @@ class Install(unittest.TestCase):
             (home / ".claude").mkdir()
             (home / ".claude/settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"command": "x"}]}]}}))
             plan = install(home, apply=False)
-            self.assertEqual(len(plan), 4)
+            self.assertEqual(len(plan), 6)
             self.assertFalse((home / ".claude/commands/mhcore.md").exists())
             install(home, apply=True)
             d = json.loads((home / ".claude/settings.json").read_text())
             self.assertEqual(len(d["hooks"]["Stop"]), 2)                      # 原有的钩子留着
             self.assertEqual(d["hooks"]["PreToolUse"][0]["matcher"], "Edit|Write|MultiEdit|NotebookEdit")
             self.assertNotIn("matcher", json.loads((home / ".codex/hooks.json").read_text())["hooks"]["PreToolUse"][0])
+            agy_hooks = json.loads((home / ".gemini/config/hooks.json").read_text())["memory-harness"]
+            want_matcher = "edit_file|write_file|replace_file_content|write_to_file|multi_replace_file_content"
+            self.assertEqual(agy_hooks["PreToolUse"][0]["matcher"], want_matcher)
             self.assertTrue((home / ".claude/commands/mhcore.md").is_symlink())
+            self.assertTrue((home / ".gemini/config/skills/mhcore").is_symlink())
             self.assertEqual(install(home, apply=True), [])                  # 装过就不动
+            # 旧 matcher 会就地更新
+            agy_hooks["PreToolUse"][0]["matcher"] = "edit_file|write_file"
+            (home / ".gemini/config/hooks.json").write_text(json.dumps({"memory-harness": agy_hooks}))
+            self.assertTrue(install(home, apply=True))
+            agy_hooks = json.loads((home / ".gemini/config/hooks.json").read_text())["memory-harness"]
+            self.assertEqual(agy_hooks["PreToolUse"][0]["matcher"], want_matcher)
+            self.assertEqual(install(home, apply=True), [])
 
     def test_install_moves_old_paths(self):
         """2026-11-13 elevate 从 mh/synapse/push/ 搬到 mh/engram/：指向旧位置的钩子、链接就地换成新的，不并存。"""

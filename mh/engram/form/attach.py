@@ -96,7 +96,7 @@ def build(prompt, entry, pool, picks, ns=None, nodes_count=None, ws=None):
     else:
         cand = candidates(pool, [e for e in picks if pool[e]["kind"] != "node"], ws)
         body = "\n\n## 新文件夹\n\n" + entry + "\n\n## 候选\n\n" + cand
-    return prompt + body + glossary.text(entry.replace("\n索引词：\n", "\n") + cand)   # 格式里的标题不算用到
+    return prompt + body + glossary.text(entry.replace("\n索引词：\n", "\n") + cand, glossary.for_workspace(ws))   # 格式里的标题不算用到
 
 
 def parse(output, skeleton_on):

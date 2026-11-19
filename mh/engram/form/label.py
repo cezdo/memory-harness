@@ -123,14 +123,14 @@ def terms(items, lists):
     return seen
 
 
-def expand(lists):
+def expand(lists, path=glossary.PATH):
     """按词典补别名：组里的词是词典里某个东西的叫法，就把它的其他叫法补进这一组；单个字母不补。返回新的列表。"""
     out = []
     for items in lists:
         items = list(items)
         have = {norm(a) for a in items}
         for a in list(items):
-            for b in glossary.aliases(a):
+            for b in glossary.aliases(a, path):
                 if len(norm(b)) >= 2 and norm(b) not in have:
                     items.append(b)
                     have.add(norm(b))
@@ -138,11 +138,11 @@ def expand(lists):
     return out
 
 
-def words(model_lists, items):
+def words(model_lists, items, path=glossary.PATH):
     """会话入口的全部索引词：模型写的 + 程序补的词，再按词典补别名。{"lists", "constraints", "origin"}。"""
     extra = terms(items, model_lists)
     lists = [list(g) for g in model_lists] + [[t] for t in extra]
-    return {"lists": expand(lists), "constraints": [], "origin": ["model"] * len(model_lists) + ["program"] * len(extra)}
+    return {"lists": expand(lists, path), "constraints": [], "origin": ["model"] * len(model_lists) + ["program"] * len(extra)}
 
 
 def show(words, sep="\n"):

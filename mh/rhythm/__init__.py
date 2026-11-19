@@ -69,11 +69,11 @@ def _cite(conn, log):
 
 
 def _runbook(conn, log):
-    """runbook 更新稿（用户 2026-10-29）：手写部分写了 runbook 的工作区，每天让模型对照新提交写一份，放进数据目录，不改仓库。"""
+    """每天对照新提交写更新稿；在开启自动更新的工作区落地可核验的事实和勾销。"""
     from ..synapse.push import runbook, status
     wrote = [ws for ws in status.workspaces()
              if (cfg := status.source(ws)) and cfg["runbook"] and cfg["repo"]
-             and runbook.draft(ws, cfg["repo"], cfg["runbook"], _runbook_model())]
+             and runbook.draft(ws, cfg["repo"], cfg["runbook"], _runbook_model(), auto=cfg["runbook_auto"])]
     return f"runbook 更新稿：{'、'.join(wrote)}" if wrote else ""
 
 
@@ -115,7 +115,7 @@ TIDY = [("检查", "程序", 1800, _check),           # 排在项目现状前面
         ("向量同步", "程序", 600, _vector),          # 检索面的向量一路跟上新陈述（2026-11-02）
         ("清理空会话", "程序", 3600, _clean),         # 打开了却没开口的会话（2026-11-06）；最近 6 小时动过的不动
         ("引用回填", "模型", 86400, _cite),          # 调 Jev 判转述说的是哪一条（2026-10-22）
-        ("runbook 更新稿", "模型", 86400, _runbook),  # Sol 对照新提交写稿，用户在场时落地（2026-10-29）；照看 11-05 起自己一个服务（memory-harness-tend）
+        ("runbook 更新稿", "模型", 86400, _runbook),
         ("self", "模型", 3600, _self)]              # 每小时看一眼有没有到点的便签，到了就叫醒（2026-11-08）；该不该叫由 self.pick 定
 if importlib.util.find_spec(f"{__name__}.self") is None:      # 公开包缺了 self（只装了 mh 的一部分）也照常跑
     TIDY = [t for t in TIDY if t[0] != "self"]

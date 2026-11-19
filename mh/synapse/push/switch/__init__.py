@@ -62,7 +62,8 @@ def record(state_, host, session, prompt, log=None):
 
 def handle(d, host, stdout, stderr, log=None):
     """钩子收到的 JSON 是开关命令就记下、拦下 → 退出码；不是命令返回 None，由联想接着做。
-    拦法：Claude Code 输出 {"decision": "block"}；codex 以退出码 2 加 stderr 的理由拦（codex 的约定）。"""
+    拦法：Claude Code 输出 {"decision": "block"}；codex 以退出码 2 加 stderr 的理由拦（codex 的约定）；
+    agy 输出 injectSteps.errorMessage 加 terminationBehavior="terminate"。"""
     want = command(d.get("prompt"))
     if not want:
         return None
@@ -70,6 +71,10 @@ def handle(d, host, stdout, stderr, log=None):
     if host == "codex":
         print(SAID[want].replace("/do-souhatsu", "$do-souhatsu"), file=stderr)
         return 2
+    if host == "agy":
+        json.dump({"injectSteps": [{"errorMessage": {"userMessage": SAID[want]}}],
+                   "terminationBehavior": "terminate"}, stdout, ensure_ascii=False)
+        return 0
     json.dump({"decision": "block", "reason": SAID[want]}, stdout, ensure_ascii=False)
     return 0
 
@@ -91,10 +96,11 @@ def _link(src, dst, apply):
 
 
 def install(home=Path.home(), apply=False):
-    """装联想开关的 Claude Code 命令、codex skill（符号链接到 `mh/skills/`，改仓库即生效）。apply=False 只列要做什么；
+    """装联想开关的 Claude Code 命令、codex / agy skill（符号链接到 `mh/skills/`，改仓库即生效）。apply=False 只列要做什么；
     宿主里指向搬家前位置的链接就地换掉。钩子（`push/associate.py`）由宿主接入单独装，不在这里做。返回做了什么。"""
     done = []
     for name in NAMES:
         done.append(_link(SKILL / name / "claude" / f"{name}.md", home / ".claude/commands" / f"{name}.md", apply))
         done.append(_link(SKILL / name / "codex" / name, home / ".codex/skills" / name, apply))
+        done.append(_link(SKILL / name / "codex" / name, home / ".gemini/config/skills" / name, apply))
     return [x for x in done if x]

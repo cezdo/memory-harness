@@ -169,7 +169,67 @@ def _codex(path):
     return uses, results
 
 
-READERS = {"claude": _claude, "dsh": _dsh, "codex": _codex}
+_AGY = {
+    "write_file": "Write",
+    "edit_file": "Edit",
+    "write_to_file": "Write",
+    "replace_file_content": "Edit",
+    "multi_replace_file_content": "Edit",
+    "read_file": "Read",
+    "view_file": "Read",
+    "run_command": "Bash",
+}
+
+
+def _unquote(v):
+    if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        try:
+            return json.loads(v)
+        except ValueError:
+            pass
+    return v
+
+
+_AGY_OUTPUTS = ("GENERIC", "RUN_COMMAND", "VIEW_FILE", "CODE_ACTION", "MCP_TOOL")   # 工具输出：CLI 记 GENERIC，ACP 按工具分（2026-11-20）
+
+
+def _agy(path):
+    """agy 的 transcript_full.jsonl：PLANNER_RESPONSE 里记 tool_calls（write_file、edit_file、read_file、run_command 等），
+    紧随的 GENERIC（ACP 是 RUN_COMMAND、VIEW_FILE、CODE_ACTION、MCP_TOOL）step 是工具输出。"""
+    uses, results, pending = {}, {}, []
+    with open(path, errors="replace") as f:
+        for i, line in enumerate(f):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = d.get("type")
+            if t == "PLANNER_RESPONSE" and d.get("created_at"):
+                ts = _t(d["created_at"])
+                pending = []
+                for j, tc in enumerate(d.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    kind = _AGY.get(tc.get("name"))
+                    if not kind:
+                        continue
+                    args = {k: _unquote(v) for k, v in (tc.get("args") or {}).items()}
+                    key = f"s{d.get('step_index', i)}#{j}"
+                    if kind == "Bash":
+                        inp = {"command": args.get("CommandLine") or args.get("command") or ""}
+                    else:
+                        inp = {"file_path": args.get("Path") or args.get("AbsolutePath") or args.get("TargetFile") or args.get("file_path") or ""}
+                    uses[key] = (ts, kind, inp)
+                    pending.append(key)
+            elif t in _AGY_OUTPUTS and d.get("content"):
+                key = pending.pop(0) if pending else f"g{d.get('step_index', i)}"
+                results[key] = d["content"]
+    return uses, results
+
+
+READERS = {"claude": _claude, "dsh": _dsh, "codex": _codex, "agy": _agy}
 LOOK = {"sed", "cat", "head", "tail", "less", "grep", "rg", "wc", "ls", "jq", "diff", "cd", "find"}
 PATHY = re.compile(r"^[~\w.\-/]*(/|\.(py|md|json|jsonl|yml|yaml|toml|sh|txt|html|js|ts|csv))[\w.\-/]*$")
 
@@ -258,6 +318,32 @@ def touched(source, path, cwd=None):
     return set(touches(source, path, cwd))
 
 
+_WS_CACHE = {}         # (来源, 原始记录, mtime, 大小) → {工作区: 碰过几处}；原始记录没变就不重读（2026-11-19）
+
+
+def touched_workspaces(source, path, cwd=None):
+    """工具调用碰过的具体项目工作区 → 碰过几处路径（store.project_workspace：家目录、管理工作区、系统路径不算）。按原始记录的
+    mtime、大小缓存：observe 每轮判家目录会话、整理循环每 5 分钟编“最近停下的几件事”都要问一遍全部会话，逐段解析原始记录一次要
+    几十秒到一百多秒（案例 11-19）；常驻进程里只有变了的会话才重读。读不到原始记录的不缓存。"""
+    from .. import store as st
+    try:
+        s = Path(path).stat()
+        key = (source, str(path), s.st_mtime, s.st_size)
+    except (OSError, TypeError):
+        key = None
+    if key is not None and key in _WS_CACHE:
+        return _WS_CACHE[key]
+    got = defaultdict(int)
+    for p in touches(source, path, cwd):
+        w = st.project_workspace(p)
+        if w:
+            got[w] += 1
+    got = dict(got)
+    if key is not None:
+        _WS_CACHE[key] = got
+    return got
+
+
 def commit_files(repo, h):
     try:
         out = subprocess.run(["git", "-c", "core.quotepath=off", "-C", repo, "show", "--name-only", "--format=", h],
@@ -268,16 +354,19 @@ def commit_files(repo, h):
 
 
 def commits(repo, since, until):
-    """时间窗里全部分支的提交：[(哈希, UTC 时间, 说明)]，早的在前（同一轮的几次提交按先后列，最后一条是最后提交）。
+    """时间窗里全部分支的提交：[(哈希, UTC 时间, 说明, 是不是这个仓库自己的身份提交的)]，早的在前（同一轮的几次提交按先后列，最后一条是最后提交）。
+    时间取提交者时间：rebase、cherry-pick 出的副本照搬原提交的作者时间，按作者时间会落进别的会话、别的轮（方向探索第 4 轮，11-15）。
     工作区不是 git 仓库时返回空。"""
     if not repo or not Path(repo).is_dir():
         return []
     if subprocess.run(["git", "-C", repo, "rev-parse"], capture_output=True).returncode:
         return []
     out = subprocess.run(["git", "-C", repo, "log", "--all", "--reverse", f"--since={since}", f"--until={until}",
-                          "--date=format-local:%Y-%m-%dT%H:%M:%S.000Z", "--format=%H%x09%ad%x09%s"],
+                          "--date=format-local:%Y-%m-%dT%H:%M:%S.000Z", "--format=%H%x09%cd%x09%ce%x09%s"],
                          capture_output=True, text=True, env={"TZ": "UTC", "PATH": "/usr/bin:/bin"}).stdout
-    return [tuple(x.split("\t", 2)) for x in out.splitlines() if x.count("\t") >= 2]
+    me = subprocess.run(["git", "-C", repo, "config", "user.email"], capture_output=True, text=True).stdout.strip()
+    rows = [x.split("\t", 3) for x in out.splitlines() if x.count("\t") >= 3]
+    return [(h, when, subject, not me or ce == me) for h, when, ce, subject in rows]
 
 
 def written(source, path, cwd, starts):
@@ -299,15 +388,17 @@ def written(source, path, cwd, starts):
     committing = {k: _at(ts) for k, (ts, name, inp) in uses.items() if name == "Bash" and "git commit" in (inp.get("command") or "")}
     calls = list(committing.values())
     said = "\n".join(results.values())
-    by_commit = "\n".join(results.get(k) or "" for k in committing)   # 跑了 git commit 的那次调用自己的输出（同一条命令里 git log 打出的哈希也算）
+    by_commit = "\n".join(results.get(k) or results.get(k.split("#")[0]) or "" for k in committing)   # 跑了 git commit 的那次调用自己的输出（同一条命令里 git log 打出的哈希也算）
     until = _t((datetime.fromisoformat(starts[-1].replace("Z", "+00:00")) + TAIL).timestamp() * 1000)
     repo = cwd
     if cwd and not Path(cwd).is_dir():         # worktree 删了：到主仓库找，worktree 和主仓库共用提交（2026-11-07，Zeron 的 worktree 用完就删）
         from ..store import unworktree
         repo = unworktree(cwd)
-    for h, when, subject in commits(repo, starts[0], until):
+    for h, when, subject, mine in commits(repo, starts[0], until):
         turn = bisect.bisect_right(starts, when) - 1
         at = _at(when)
-        if turn >= 0 and (h[:7] in by_commit or re.search(r"\[[^\]\n]*\b" + h[:7] + r"[0-9a-f]*\]", said) or any(-COMMIT_LAG[0] <= (at - c).total_seconds() <= COMMIT_LAG[1] for c in calls)):
+        # 只靠时间窗认的，还要是这个仓库自己的身份提交的：多人仓库里别人的合并正好落进窗口会被认走（第 4 轮：Zeron 上 3 条，手记“最后提交”显示错过一次）
+        near = mine and any(-COMMIT_LAG[0] <= (at - c).total_seconds() <= COMMIT_LAG[1] for c in calls)
+        if turn >= 0 and (h[:7] in by_commit or re.search(r"\[[^\]\n]*\b" + h[:7] + r"[0-9a-f]*\]", said) or near):
             out[turn].append(f"提交 {h[:8]}「{subject[:80]}」：" + "、".join(rel(f, cwd) for f in commit_files(repo, h)))
     return dict(out)

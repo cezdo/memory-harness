@@ -12,7 +12,9 @@ MODULES = [
     "mh.engram.observe.switch.test", "mh.engram.form.test", "mh.engram.test",
     "mh.engram.cognize.test", "mh.rhythm.test", "mh.rhythm.self.test", "mh.synapse.pull.test",
     "mh.synapse.track.test", "mh.synapse.push.test", "mh.engram.elevate.test",
-    "mh.synapse.hosts.codex.test",
+    "mh.synapse.hosts.codex.test", "mh.synapse.hosts.agy.test",
+    "mh.synapse.hosts.unplug.test", "mh.rhythm.self.hosts.codex_test",
+    "mh.rhythm.self.hosts.dsh_test",
 ]
 
 with tempfile.TemporaryDirectory(prefix="mh-tests-") as tmp:

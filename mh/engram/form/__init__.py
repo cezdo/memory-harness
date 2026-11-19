@@ -456,6 +456,15 @@ def _date(conn, pack_act):
     return r[0] or ""
 
 
+def _first_date(conn, packs):
+    turns = [t for p in (packs if isinstance(packs, (list, tuple)) else [packs])
+             for t in json.loads(conn.execute("SELECT inputs FROM occurrence WHERE id=?", (p,)).fetchone()[0]).get("turn", [])]
+    if not turns:
+        return ""
+    r = conn.execute(f"SELECT min(started) FROM occurrence WHERE id IN ({','.join('?' * len(turns))}) AND started NOT LIKE '?%'", turns).fetchone()
+    return r[0] or ""
+
+
 def _stop_text(stop, nums_by_id):
     nums = [nums_by_id[i] for i in stop["basis"] if i in nums_by_id]
     return stop["text"] + (f"（{'、'.join(f'陈述{n}' for n in nums)}）" if nums else "")
@@ -501,9 +510,10 @@ def entries(conn, h=None):
         nums = {**{it["was"]: it["n"] for it in mine}, **{it["id"]: it["n"] for it in mine}}   # 停在的依据写的是 pack 的那条
         out[f"T{f['id']}"] = {
             "id": f"T{f['id']}", "kind": "entry", "name": f["name"], "topic": f["topic"],
-            "words": label.words(json.loads(f["words"]), items),
+            "words": label.words(json.loads(f["words"]), items, glossary.for_workspace(ws.get((f["source"], f["session"]), ""))),
             "stops": [_stop_text(s, nums) for s in json.loads(f["stops"])],
             "parent": f"L{place[f['id']]}" if f["id"] in place else None, "date": _date(conn, f["record"]),
+            "first_date": _first_date(conn, packs),
             "review": review.get(f["id"], ""),
             "session": (f["source"], f["session"]), "row": f["id"], "ws": ws.get((f["source"], f["session"]), ""),
             "items": items,                # 这段会话的主列：现行的标准陈述（Synapse 的 get 往下一层用）
@@ -536,8 +546,9 @@ def pool(conn):
     registry = skeleton.adopted(conn)
     skeletons = {ws: skeleton.nodes(ws, conn, registry) for ws in dict.fromkeys([*skeleton.WORKSPACES, *registry])}
     for ws, ns in skeletons.items():
+        gpath = glossary.for_workspace(ws)
         for p, n in (ns or {}).items():
-            names = [n["name"]] + [a for a in glossary.aliases(n["name"]) if a != n["name"]]
+            names = [n["name"]] + [a for a in glossary.aliases(n["name"], gpath) if a != n["name"]]
             out[n["id"]] = {"id": n["id"], "kind": "node", "name": n["name"], "topic": n.get("topic", ""), "stops": [], "date": "",
                             "words": {"lists": [names], "constraints": []}, "ws": ws, "path": p,
                             "parent": ns[n["parent"]]["id"] if n["parent"] is not None else None}
@@ -835,8 +846,10 @@ def build_structure(conn, job):
     mine = record(conn, f["record"])[2]
     nums = {**{it["was"]: it["n"] for it in mine}, **{it["id"]: it["n"] for it in mine}}
     stops = [_stop_text(s, nums) for s in json.loads(f["stops"])]
+    cwd = conn.execute("SELECT cwd FROM session_detail WHERE source=? AND session=?", (f["source"], f["session"])).fetchone()
+    ws = st.session_workspace(f["source"], f["session"], cwd[0] if cwd else "")
     body = structure.block({"name": f["name"], "topic": f["topic"], "stops": stops}, items,
-                           glossary.text("\n".join(x["text"] for x in items) + f["name"] + f["topic"]))
+                           glossary.text("\n".join(x["text"] for x in items) + f["name"] + f["topic"], glossary.for_workspace(ws)))
     return redact(prompt("structure") + "\n\n---\n\n" + body)
 
 
@@ -1056,7 +1069,8 @@ def build_label(conn, u, pack_act, corpus=None, h=None, prev=None):
     before = label.previous_text(prev[0]["name"], prev[0]["topic"], [s["text"] for s in json.loads(prev[0]["stops"])],
                                  json.loads(prev[0]["words"]), prev[1]) if prev else shared_context(conn, u, h)[0]
     why = _pending(conn, u, "entry")
-    return redact(prompt("label") + "\n\n## 会话记录\n\n" + rec + glossary.text(rec) + before + label.complaint_text(why)
+    gpath = glossary.for_workspace(u["session"]["workspace"])
+    return redact(prompt("label") + "\n\n## 会话记录\n\n" + rec + glossary.text(rec, gpath) + before + label.complaint_text(why)
                   + label.existing_text(others, near)), near
 
 
@@ -1107,27 +1121,45 @@ CROSS_MIN = 3          # 碰过别的工作区几处路径，那个工作区的�
 
 
 def crossed(conn, u):
-    """这段会话工具调用里碰过的路径按工作区数（不分读写，observe.touches；家目录不算）。2026-10-26：在别的项目的目录开、
+    """这段会话工具调用里碰过的路径按具体项目工作区数（不分读写，observe.touches；家目录和系统路径不算）。2026-10-26：在别的项目的目录开、
     做本仓的事的会话，候选只有那个项目的线（runbook M2：会话挂到目标所属的项目，不按在哪个目录开的）。"""
     from ..observe.written_files import touches
-    from ...synapse.push import workspace as root_of           # 按仓库根、项目目录认（store.workspace 只看最后一节，给 cwd 用）
     s = conn.execute("SELECT file, cwd FROM session_detail WHERE source=? AND session=?", tuple(u["unit"][:2])).fetchone()
     if not s:
         return {}
-    got = collections.Counter(st.canonical(root_of(p)) for p in touches(u["unit"][0], s["file"], s["cwd"]))
-    got.pop("home", None)
+    got = collections.Counter(st.project_workspace(p) for p in touches(u["unit"][0], s["file"], s["cwd"]))
+    got.pop("", None)
     return dict(got)
 
 
+def target_workspace(ws, par=None, counts=None):
+    """开错工作区或在家目录（管理工作区）开的会话，新起一条线时落到哪个工作区（2026-11-19）：
+    有父线跟父线；否则若在管理工作区（或本区 0 触及）且触及了别的具体工作区（>= CROSS_MIN），落到触及最多的那个工作区。"""
+    if par and par.get("kind") == "line" and par.get("ws"):
+        return par["ws"]
+    counts = counts or {}
+    if misplaced(ws, counts):
+        cands = [w for w, n in counts.items() if w != ws and n >= CROSS_MIN]
+        if cands:
+            return max(cands, key=lambda w: counts[w])
+    return ws
+
+
+def misplaced(ws, counts):
+    """开错工作区的会话（2026-11-19）：在家目录这类管理工作区开的，或工具调用一处也没碰过自己所在的工作区。只有它们才跨到触及的工作区挂线、起线。"""
+    return ws != SELF_WORKSPACE and (ws in st.MANAGING or counts.get(ws, 0) == 0)
+
+
 def reach_of(conn, u, counts=None):
-    """能挂到哪些工作区的线：store.reachable，加上碰过 CROSS_MIN 处以上的工作区。有骨架的工作区先不跨（挂线要选本区的
-    节点，别处的线过不了节点的检查；M2 逐层往下时再定）。"""
+    """能挂到哪些工作区的线：store.reachable，加上碰过 CROSS_MIN 处以上的工作区。有骨架的工作区原来不跨（挂线要选本区的
+    节点，别处的线过不了节点的检查）；2026-11-19 起开错工作区的会话（misplaced）例外，跨过去的不按本区骨架拦。
+    开在对的、有骨架的工作区、顺手碰了别处的会话照旧不跨。"""
     ws = u["session"]["workspace"]
     if ws == SELF_WORKSPACE:                         # self 的会话只挂 self 的线：醒来常读 mh 的文件，跨过去自言自语就混进别处的线
         return {ws}                                  # （2026-11-08，design/rhythm/self“进记忆”）；和别处的关联交给读的时候
-    if skeleton.nodes(ws, conn):
-        return st.reachable(conn, ws)
     counts = crossed(conn, u) if counts is None else counts
+    if not misplaced(ws, counts) and skeleton.nodes(ws, conn):
+        return st.reachable(conn, ws)
     return st.reachable(conn, ws) | {w for w, n in counts.items() if n >= CROSS_MIN}
 
 
@@ -1153,9 +1185,9 @@ def build_attach(conn, u, label_act, the_pool, corpus):
     f = conn.execute("SELECT * FROM session_entry WHERE born=?", (label_act,)).fetchone()
     _, _, items, written = record(conn, f["record"])
     nums = {it["id"]: it["n"] for it in items}
-    words = label.words(json.loads(f["words"]), items)
-    stops = [_stop_text(s, nums) for s in json.loads(f["stops"])]
     ws = u["session"]["workspace"]
+    words = label.words(json.loads(f["words"]), items, glossary.for_workspace(ws))
+    stops = [_stop_text(s, nums) for s in json.loads(f["stops"])]
     flat = [a for g in words["lists"] for a in g]
     counts = crossed(conn, u)
     reach = reach_of(conn, u, counts)                # 候选和检查用同一个范围：看得到的都挂得上
@@ -1195,6 +1227,8 @@ def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_po
             error = f"content_error: {target} 不是已有的线"
         elif name is None and the_pool[target]["ws"] not in reach_of(conn, u):
             error = f"content_error: {target} 属于别的工作区"
+        elif name is None and the_pool[target]["ws"] != u["session"]["workspace"]:
+            node = None                                                         # 跨工作区挂到别处的已有线：不按本区骨架拦（2026-11-19）
         elif ns and node == ns[""]["id"] and "global" in ns:                    # 根下不挂线（2026-10-24）：跨模块的挂 global
             node = ns["global"]["id"]
             meta["root_to_global"] = True
@@ -1227,8 +1261,9 @@ def store_attach(conn, op_id, u, label_act, step, text, ns, picks, count, the_po
         if name is not None:
             path = next((p for p, n in ns.items() if n["id"] == node), None) if ns else None
             par = the_pool.get(parent) if parent else None
+            line_ws = target_workspace(u["session"]["workspace"], par, crossed(conn, u))
             line = conn.execute('INSERT INTO topic_line(born, name, workspace, node, parent, "from") VALUES(?,?,?,?,?,?)',
-                                (act, name, u["session"]["workspace"], path if path is not None else NA,
+                                (act, name, line_ws, path if (path is not None and line_ws == u["session"]["workspace"]) else NA,
                                  par["row"] if par and par["kind"] == "line" else NA, "[]")).lastrowid
         else:
             line = the_pool[target]["row"]

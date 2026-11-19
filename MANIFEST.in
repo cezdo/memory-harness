@@ -1,6 +1,7 @@
-include README.md README.en.md AGENTS.md AGENTS.zh-CN.md LICENSE RELEASE-MANIFEST.json
+include .gitignore README.md README.en.md AGENTS.md AGENTS.zh-CN.md LICENSE RELEASE-MANIFEST.json
 include tools/test.py
 recursive-include design *.md
-recursive-include mh *.md *.toml *.yml *.json *.js
+recursive-include mh *.md *.toml *.yml *.json *.js *.mjs
+include mh/synapse/hosts/agy/acp
 global-exclude *.pyc
 prune **/__pycache__

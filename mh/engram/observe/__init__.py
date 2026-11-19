@@ -179,18 +179,50 @@ def _stuck(h, op_ids):
     return out
 
 
-def unwatched(conn, states=None):
-    """工作区默认不观察的会话：{(来源, 会话)}（实例配置 [connect].unwatched，2026-11-07）。和 /no-observe 一样作用于
-    observe 的全流程：不预览、不读；已经产出的 E 不动（规则只管以后）。会话里显式的 /do-observe 压过它（临时要看时用）。
-    按会话的路径认（instance.under 的通配符，2026-11-14 起；之前按工作区名），worktree 先算回所在仓库（store.unworktree：
-    mh 自己的 tmp/worktrees/<任务> 不算 tmp）。states：调用方已经算过的 switch.states。"""
-    skip, paused = instance.UNWATCHED, instance.PAUSE_SOURCES
-    if not skip and not paused:
+def _touches_project(src, file, cwd):
+    from .written_files import touched_workspaces
+    return bool(touched_workspaces(src, file, cwd))
+
+
+def _home_unattached(conn, rows):
+    """在家目录（~）直接开的会话里，挂不回具体工作区的：{(来源, 会话)}。能挂回的（已显式指定、已挂到具体工作区的线、已产出过 E、
+    夹了栞，或工具调用碰过具体项目工作区）照常观察；都挂不回的（随手问一句、login、闲聊）按默认不观察处理（用户 2026-11-19）。
+    rows：(来源, 会话, cwd, 原始记录)。库里的条件一次查完，原始记录按 mtime 缓存（逐段查时 unwatched 从 0.06 秒涨到 9 秒，
+    开场手记经 shiori.pending 跟着慢到 10 秒，2026-11-19）。"""
+    home = str(Path.home())
+    rows = [r for r in rows if st.unworktree(r[2]) == home and (r[0], r[1]) not in st.SESSION_WORKSPACE]
+    if not rows:
         return set()
+    keep = set(st.attached_workspaces(conn))
+    keys = {(r[0], r[1]) for r in rows} - keep
+    if keys:
+        marks = ",".join("(?,?)" for _ in keys)
+        flat = [x for k in keys for x in k]
+        keep |= {tuple(r) for r in conn.execute(
+            f"SELECT DISTINCT d.source, d.session FROM turn_detail d JOIN event e ON e.turn=d.occurrence "
+            f"WHERE (d.source, d.session) IN (VALUES {marks})", flat)}
+        keep |= {(r[0], r[1]) for r in conn.execute(
+            f"SELECT d.source, d.session, x.tools FROM turn_detail d JOIN turn_text x ON x.id=d.text "
+            f"WHERE (d.source, d.session) IN (VALUES {marks}) AND x.tools LIKE ?", [*flat, f"%{shiori.NAME}%"])
+            if shiori.marked(r[2])}
+    return {(src, ses) for src, ses, cwd, f in rows
+            if (src, ses) not in keep and not _touches_project(src, f, cwd)}
+
+
+def unwatched(conn, states=None, sessions=None):
+    """工作区默认不观察的会话：{(来源, 会话)}（实例配置 [connect].unwatched，2026-11-07；家目录挂不回具体工作区的会话，2026-11-19）。
+    和 /no-observe 一样作用于 observe 的全流程：不预览、不读；已经产出的 E 不动（规则只管以后）。会话里显式的 /do-observe 压过它（临时要看时用）。
+    按会话的路径认（instance.under 的通配符，2026-11-14 起；之前按工作区名），worktree 先算回所在仓库（store.unworktree：
+    mh 自己的 tmp/worktrees/<任务> 不算 tmp）。states：调用方已经算过的 switch.states。sessions：只问这几段会话（{(来源, 会话)}），
+    调用方只关心少数几段时（shiori.pending）不必把家目录会话的原始记录全读一遍。"""
+    skip, paused = instance.UNWATCHED, instance.PAUSE_SOURCES
     on = {k for k, v in (switch.states(conn) if states is None else states).items() if v == "on"}
-    rows = conn.execute("SELECT source, session, cwd FROM session_detail").fetchall()
-    return ({(src, ses) for src, ses, cwd in rows if skip and instance.under(st.unworktree(cwd), skip)} - on) \
-        | {(src, ses) for src, ses, _ in rows if src in paused}           # 暂停的来源（[engram].pause_sources）：/do-observe 也不压过
+    rows = [tuple(r) for r in conn.execute("SELECT source, session, cwd, file FROM session_detail")]
+    if sessions is not None:
+        rows = [r for r in rows if (r[0], r[1]) in sessions]
+    return ({(src, ses) for src, ses, cwd, f in rows if skip and instance.under(st.unworktree(cwd), skip)}
+            | _home_unattached(conn, rows)) - on \
+        | {(src, ses) for src, ses, _, _ in rows if src in paused}           # 暂停的来源（[engram].pause_sources）：/do-observe 也不压过
 
 
 def ready(conn, op_id, session=None, now=None, reobserve=None):

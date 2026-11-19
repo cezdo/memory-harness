@@ -34,8 +34,7 @@ USER_ALIASES = tuple(dict.fromkeys([USER_NAME, *_user.get("aliases", ())]))   # 
 
 PROJECTS = Path(_dir(_D["projects"])) if _D.get("projects") else None          # 放项目的目录（Synapse 认工作区用）
 
-ENGRAM_DIRS = {_dir(d): w for d, w in _ws.get("engram", {}).items()}           # Engram：按目录更正工作区（最长前缀）
-SYNAPSE_DIRS = {Path(_dir(d)): w for d, w in _ws.get("synapse", {}).items()}   # Synapse：改名、删除、别名的目录
+ENGRAM_DIRS = {_dir(d): w for d, w in _ws.get("engram", {}).items()}           # 按目录更正工作区（最长前缀；Synapse 共用，[workspace.synapse] 11-19 退役）
 MANAGING = {w: _dir(d) for w, d in _ws.get("managing", {}).items()}            # 管理性质的工作区 → 目录
 SESSIONS = {(s["source"], s["session"]): s["workspace"] for s in _ws.get("sessions", ())}   # 按会话更正工作区
 
@@ -75,6 +74,7 @@ VIEWS = dict(_D.get("engram", {}).get("views", {}))   # 来源 → 视角：导�
 CHATGPT_EXPORTS = tuple(_D.get("observe", {}).get("chatgpt_exports", ()))  # 显式导出文件与工作目录；不扫描 archive
 
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
+AGY = _tools.get("agy", "agy")                           # agy CLI（额度查询用）
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # mh 专用的 dsh 实例（精读用；不要指到 dsh 升级的测试环境，它会被 teardown）
 INVOKE = _D.get("invoke", {})                            # 远端调用：listen、token、remote（invoke/serve.py）
 LISTEN = _D.get("listen", {})                            # 监听 QQ 协议端：ssh、remote、local、token_file（observe/listen.py）
@@ -89,6 +89,9 @@ def resource(name, development, filename):
     if configured:
         return Path(_dir(configured))
     return development if development.exists() else PATH.parent / filename
+
+
+GLOSSARIES = {w: Path(_dir(p)) for w, p in (_D.get("resources", {}).get("glossaries") or _ws.get("glossaries") or {}).items() if p}
 
 
 def expression(purpose, *, author="source", addressee="source", reader="model"):

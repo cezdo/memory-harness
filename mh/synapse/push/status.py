@@ -39,19 +39,20 @@ def _cut(s, n=CUT):
 
 
 def source(ws):
-    """手写的部分 → {"repo", "services", "check", "runbook", "notes": {目录: 说明}, "reflex": [行…]}；这个工作区没写就返回 None。"""
+    """读近况手写配置（含 runbook 路径和自动更新开关）；没有该工作区的文件就返回 None。"""
     f = SOURCES / f"{ws}.md"
     if not f.exists():
         return None
     text = f.read_text()
-    cfg = {"repo": None, "services": [], "check": None, "runbook": None, "notes": {}, "reflex": []}
+    cfg = {"repo": None, "services": [], "check": None, "runbook": None, "runbook_auto": False,
+           "notes": {}, "reflex": []}
     if "## 反射" in text:                      # 反射条目（runbook I9）：推送时放近况最前，这里先摘出来，别混进目录说明
         head, _, rest = text.partition("## 反射")
         block, mark, tail = rest.partition("\n## ")
         cfg["reflex"] = [l for l in block.splitlines() if l.strip().startswith("- ")]
         text = head + ("## " + tail if mark else "")
     for line in text.splitlines():
-        m = re.match(r"- (仓库|服务|检查|runbook)：(.+)", line)
+        m = re.match(r"- (仓库|服务|检查|runbook|runbook 自动更新)：(.+)", line)
         if m and "## 目录" not in text.split(line)[0]:
             k, v = m.groups()
             if k == "仓库":
@@ -60,6 +61,8 @@ def source(ws):
                 cfg["check"] = v.strip()
             elif k == "runbook":
                 cfg["runbook"] = v.strip()
+            elif k == "runbook 自动更新":
+                cfg["runbook_auto"] = v.strip() == "开"
             else:
                 cfg["services"] = [x.strip() for x in re.split(r"[、,，]", v) if x.strip()]
     body = text.split("## 目录", 1)[1] if "## 目录" in text else ""
@@ -115,14 +118,20 @@ def _worktrees(repo):
     return out
 
 
-def _services(names):
-    """都在跑、近几个小时没出错就压成一行；有异常的才单列（2026-10-24：只推异常）。"""
+def _services(names, repo=None):
+    """都在跑、近几个小时没出错就压成一行；有异常的才单列（2026-10-24：只推异常）。
+    常驻循环不重新加载代码：起来以后 mh/ 又有提交的列一行（哪个进程跑哪一版代码原来没有东西报，方向探索第 3、4 轮各撞上一次）；
+    只比到 mh/ 整个目录，不分每个服务用哪几个文件。"""
     from ...rhythm import register
-    ok, bad = [], []
+    ok, bad, behind = [], [], []
+    last = _run(["git", "log", "-1", "--format=%ct %h %cd", "--date=format-local:%m-%d %H:%M", "--", "mh"], repo).split(None, 2) if repo else []
     for s in names:
         st = register.state(s)
         if not st:
             continue
+        up = register.since(s) if st == "active" and len(last) == 3 else None
+        if up and up < int(last[0]):
+            behind.append(s.removeprefix("memory-harness-"))
         errs = [x for x in register.lines(s, ERR_HOURS) if ERR.search(x[1])]
         short = s.removeprefix("memory-harness-")
         if st == "active" and not errs:
@@ -130,7 +139,8 @@ def _services(names):
         else:
             bad.append(f"- {s}：{'在跑' if st == 'active' else st}" + (_errors(errs) if errs else ""))
     head = [f"- {'、'.join(ok)} {'都' if len(ok) > 1 else ''}在跑，近 {ERR_HOURS} 小时没有出错"] if ok else []
-    return head + bad
+    late = [f"- {'、'.join(behind)} 起来以后 `mh/` 又有提交（最新 {last[1]}，{last[2]}）：改到它用的代码就挑空档重启"] if behind else []
+    return head + late + bad
 
 
 def _errors(lines):
@@ -148,8 +158,10 @@ def compile(ws, home=None):
         return None
     repo = cfg["repo"]
     parts = []
-    if cfg["reflex"]:                          # 稳定的在前：反射比近况的其余节都稳
-        parts += ["### 反射（一句话现行答案；失效当场改源文件那一行、换新句柄）", *cfg["reflex"], ""]
+    from .. import reflex
+    ref = reflex.section(cfg["reflex"])
+    if ref:                          # 稳定的在前：反射比近况的其余节都稳（环境级 + 本工作区）
+        parts += [*ref, ""]
     parts += ["### 目录", *_dirs(repo, cfg["notes"])]
     wts = _worktrees(repo)
     if wts:
@@ -163,7 +175,7 @@ def compile(ws, home=None):
     marks = _shiori(ws)
     if marks:
         parts += ["", "### 未落库（夹了栞、还没形成陈述；形成了就不再列）", *marks]
-    svc = _services(cfg["services"])
+    svc = _services(cfg["services"], repo)
     if svc:
         parts += ["", "### 服务", *svc]
     kernel = _kernel(repo)
@@ -335,16 +347,47 @@ def _given(part, drop):
     return "\n".join([part.splitlines()[0], *(l[2:] for l in keep)]) if keep else None
 
 
-def read(ws, home=None, host=None):
+def read(ws, home=None, host=None, conn=None):
     """手记推送用：编好的项目现状，带编好的时刻，去掉这个宿主自己给了的节（HOST_GIVES）；没有就返回 ""。"""
     got = _read_stamped((home or _out()) / f"{ws}.md")
     if not got:
         return ""
     at, body = got
+    if home is None and "### 未落库" not in body:
+        marks = _shiori(ws, conn=conn)
+        if marks:
+            body += "\n\n" + "\n".join(["### 未落库（夹了栞、还没形成陈述；形成了就不再列）", *marks])
     drop = HOST_GIVES.get(host, ())
     if drop:
         body = "\n\n".join(filter(None, (_given(p, drop) for p in re.split(r"\n\n(?=### )", body)))).strip()
     return f"## 近况（{ws}，{at:%m-%d %H:%M} 编）\n\n{body}" if at else f"## 近况（{ws}）\n\n{body}"
+
+
+def fallback(ws, conn=None):
+    """没有手写 workspace-status/<工作区>.md（或还没编出 status/<工作区>.md）的工作区：
+    照常送达环境级反射（I9）和该工作区的未落库栞（I7），不再因缺手写近况源而丢失（2026-11-19）。"""
+    if not ws:
+        return ""
+    from .. import reflex
+    own = conn is None
+    if own:
+        try:
+            from .. import library
+            conn = library()
+        except Exception:
+            conn = None
+    try:
+        parts = []
+        ref = reflex.section(conn=conn)
+        if ref:
+            parts.append("\n".join(ref))
+        marks = _shiori(ws, conn=conn)
+        if marks:
+            parts.append("\n".join(["### 未落库（夹了栞、还没形成陈述；形成了就不再列）", *marks]))
+        return f"## 近况（{ws}）\n\n" + "\n\n".join(parts) if parts else ""
+    finally:
+        if own and conn is not None and hasattr(conn, "close"):
+            conn.close()
 
 
 def workspaces():

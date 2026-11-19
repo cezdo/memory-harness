@@ -10,7 +10,9 @@ import math
 import os
 import pickle
 import re
+import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -234,7 +236,7 @@ def terms(text):
 
 # ---- 新库上的联想（E1a）----
 
-CACHE_V = 9                # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名；8：加上会话，向量一路排除同一段会话的陈述；9：加上 self 来的标记）
+CACHE_V = 10               # 缓存格式；改了缓存里放的东西就加一（2：加上查不到的词要用的陈述和节点正文；3：加上常用词；4：旧 J 退役，不再收；5、6：加上往外一跳的边；7：加上话题名；8：加上会话，向量一路排除同一段会话的陈述；9：加上 self 来的标记；10：数据里带 v，在线读旧的一份时认格式）
 NAMES_FILE = HOME / "names.json"   # 名单变体：旧记忆系统迁来的节点名（用户整理过），换库时从旧库冻结下来；是用户的数据，放数据目录（重构 H）
 
 
@@ -315,10 +317,16 @@ def hop(data, hits, rank, skip):
     return out
 
 
-def cached(conn):
-    """联想用的数据，按（陈述、挂线的条数和最大编号）缓存在库文件旁边：库里只多了观察、没多陈述时不重建。"""
-    home = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
-    from ..pull import layers
+BUILD_STALE = 15 * 60     # 秒：后台重建的锁过了这么久还在，当它死了（建一次约 25 秒）
+
+
+def cached(conn, build=False):
+    """联想用的数据，按（陈述、挂线的条数和最大编号）缓存在库文件旁边：库里只多了观察、没多陈述时不重建。
+    在线（build=False，每轮的钩子）只读：签名对不上就先用最近的一份（旧几分钟，后台 form 落库时签名每几分钟一变），
+    同时起一个后台进程重建；一份都没有返回 None，这一轮不联想。重建要 25 秒左右，以前在钩子里同步建，
+    撞上 agy 的 30 秒超时。build=True（后台进程）才建。"""
+    db = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    home = db.parent
     sig = conn.execute("SELECT (SELECT count(*) || ':' || ifnull(max(id), 0) FROM form_record WHERE kind='session'), "
                        "(SELECT count(*) || ':' || ifnull(max(id), 0) FROM attachment), "
                        "(SELECT count(*) FROM session_entry)").fetchone()
@@ -328,28 +336,69 @@ def cached(conn):
     if path.exists():
         with open(path, "rb") as f:
             return pickle.load(f)
-    idx = Docs(layers(conn))
+    if build:
+        return _build(conn, folder, path)
+    _rebuild_later(db, folder)
+    for old in sorted(folder.glob("*.pkl"), key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            with open(old, "rb") as f:
+                data = pickle.load(f)
+        except (OSError, EOFError, pickle.UnpicklingError, AttributeError):
+            continue
+        if data.get("v") == CACHE_V:
+            return data
+    return None
+
+
+def _rebuild_later(db, folder):
+    """起一个后台进程建缓存（不等它）；已经有一个在建就不再起。出错不影响这一轮。"""
+    lock = folder / "build.lock"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if lock.exists() and time.time() - lock.stat().st_mtime < BUILD_STALE:
+            return
+        lock.write_text(str(os.getpid()))
+        subprocess.Popen([sys.executable, "-m", "mh.synapse.push.associate", "--build"],
+                         cwd=str(Path(__file__).resolve().parents[3]), env=dict(os.environ, MH_DB=str(db)),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def _build(conn, folder, path):
+    from ..pull import layers
+    L = layers(conn)
+    idx = Docs(L)
     msgs = [u for (u,) in conn.execute("SELECT user FROM turn_text WHERE length(user) < 2000")]
     body = {k: _norm(d["text"]) for k, d in idx.k.items()}
-    lex = {w: f for w, f in lexicon().items() if all(w[i:i + 2] in idx.post for i in range(len(w) - 1))}
+    fq = lexicon()
+    lex = {w: f for w, f in fq.items() if all(w[i:i + 2] in idx.post for i in range(len(w) - 1))}
     try:
         names = json.loads(NAMES_FILE.read_text())
     except OSError:
         names = []
-    L = layers(conn)
     stmts = "\x00".join(b for k, b in body.items() if k[0] == "s")          # 现在的陈述：get 取得到的 S
     nodes = "\x00".join(_norm(" ".join([n.get("name", ""), n.get("topic", "")] + [a for g in n["words"]["lists"] for a in g]))
                         for n in L.nodes.values())                         # 话题、线、骨架的名字、主题、索引词：search 碰得到的节点
-    common = {w for w, f in lexicon().items() if f >= RARE_FREQ}            # 常用词：查不到也不列（2026-10-20：按词典过滤）
-    data = {"idx": idx, "msgs": msgs, "body": body, "lex": lex, "names": names, "stmts": stmts, "nodes": nodes, "common": common,
-            "hop": hop_edges(conn, idx)}
+    common = {w for w, f in fq.items() if f >= RARE_FREQ}                   # 常用词：查不到也不列（2026-10-20：按词典过滤）
+    data = {"v": CACHE_V, "idx": idx, "msgs": msgs, "body": body, "lex": lex, "names": names, "stmts": stmts, "nodes": nodes,
+            "common": common, "hop": hop_edges(conn, idx)}
     folder.mkdir(parents=True, exist_ok=True)
-    for old in folder.glob("*.pkl"):
-        old.unlink()
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
     with open(tmp, "wb") as f:
         pickle.dump(data, f)
     tmp.replace(path)
+    for old in list(folder.glob("*.pkl")) + list(folder.glob("*.tmp")):    # 只留最新一份；别的进程正在写的 .tmp 也清掉（它写完 replace 会失败，下次再建）
+        if old != path:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    try:
+        (folder / "build.lock").unlink()
+    except OSError:
+        pass
     return data
 
 
@@ -414,13 +463,14 @@ def _cut_spans(text, i, j):
 _JUNK = re.compile(r"[^A-Za-z0-9_.\-㐀-鿿]")     # 英文词、汉字段以外的字符（标点、空格、中点）
 
 
-def missing(data, toks, text, lookup=known):
+def missing(data, toks, text, lookup=known, ws=None):
     """查不到的词（2026-10-20）：这句话里的名词（只看 LTP 标成名词的词，仓库名这类英文专名也在里面），在现在的陈述正文里、
     话题 / 线 / 骨架的名字、主题、索引词里都逐字找不到的，也就是 search 碰不到、get 取不到 S 的。只在 E 或旧 J 里出现过的算查不到。
     英文和汉字粘在一起的词（“ds问”）拆开分别看，一个汉字的不算；词典里的常用词不列；贴进来的代码、日志行不看。
     日语不交给 LTP（2026-10-22）：假名比汉字多的行整行不看，带假名的词不列。
     通用词汇不列（2026-10-22）：普通名词在通用词库里有的不列，切坏的（_cut）不列，实例配置的手动名单 QUIET 不列。
-    词典（design/global/词典.md）词头里的叫法不列（2026-10-28）：项目自己定下的名字，刚起的还没进记忆，但词典里查得到。
+    词典词头里的叫法不列（2026-10-28）：项目自己定下的名字，刚起的还没进记忆，但词典里查得到。ws：当前工作区，读它的词典
+    （glossary.for_workspace，没有就是 mh 的；D6，2026-11-19）。
     词里夹着标点、空格的（分词把“Souhatsu] · Yorimichi”切成一个词，2026-10-28）按英文词和汉字段拆开分别看。
     lookup：词 → 词频 的查表（默认 known，测试换成字典）。→ [词……]，按在句子里出现的先后。"""
     mine = "\n".join(l for l in text.splitlines()
@@ -442,7 +492,7 @@ def missing(data, toks, text, lookup=known):
             out.append(w)
     if out:
         from ...engram.form import glossary          # 用到才导入（form 包导入要几十毫秒）
-        named = {_norm(n) for e in glossary.entries() for n in e["names"]}
+        named = {_norm(n) for e in glossary.entries(glossary.for_workspace(ws)) for n in e["names"]}   # 当前工作区的词典（D6，11-19）
         out = [w for w in out if _norm(w) not in named]
     if not out:
         return out
@@ -596,7 +646,7 @@ def _flagged(conn):
 def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", host_kind=None):
     """返回 (给模型的附加上下文, 给用户看的一行)；没命中返回 None。每一轮都留足迹（一条 use）。"""
     from .. import hosts, track
-    from ..hosts import claude, codex, dsh_log
+    from ..hosts import agy, claude, codex, dsh_log
     from ..track import pushes
     from . import pos, switch, yorimichi
     from ..pull import VERSION
@@ -643,6 +693,8 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
         ctx, injected, found = dsh_log.read_context(session, text)
     elif host == "codex":
         ctx, injected, found = codex.read_context(transcript, text)
+    elif host == "agy":
+        ctx, injected, found = agy.read_context(transcript, text)
     else:
         ctx, injected, found = claude.read_context(transcript, text) if transcript else ("", None, False)
     rec["in_transcript"] = found
@@ -655,9 +707,11 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
     if toks is None:
         return done("词性未就绪")
     data = cached(conn)
+    if data is None:
+        return done("联想数据未就绪")
     idx = data["idx"]
     idx_k.update(idx.k)
-    lost = missing(data, toks[0], text) if "stmts" in data else []
+    lost = missing(data, toks[0], text, ws=workspace(cwd) if cwd else None) if "stmts" in data else []
     sent = _sent_words(conn, session)
     told = _flagged(conn) if lost else set()
     fresh = [w for w in lost if _norm(w) not in sent and _norm(w) not in told]
@@ -858,4 +912,12 @@ def hook(stdin=sys.stdin, stdout=sys.stdout):
 
 if __name__ == "__main__":
     from mh.synapse.push import associate      # 按包路径调：缓存里 pickle 的类要记成包里的，不能记成 __main__
+    if sys.argv[1:] == ["--build"]:            # 后台重建联想数据（cached 起的）
+        from mh.synapse import library
+        c = library()
+        try:
+            associate.cached(c, build=True)
+        finally:
+            c.close()
+        sys.exit(0)
     sys.exit(associate.hook() or 0)

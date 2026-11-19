@@ -6,7 +6,7 @@
 
 Memory Harness lets an AI assistant remember what it has been through with its user — across sessions, tools and projects — and every memory traces back to the original words.
 
-It wraps the assistants you already use: Claude Code, Codex and dsh today. The assistant works as usual; in the background, Memory Harness reads the conversations, turns them into memories that can be recalled, and brings them back when the next conversation starts.
+It wraps the assistants you already use: Claude Code, Codex, dsh and Antigravity CLI (AGY) today. The assistant works as usual; in the background, Memory Harness reads the conversations, turns them into memories that can be recalled, and brings them back when the next conversation starts.
 
 ```mermaid
 flowchart LR
@@ -92,7 +92,7 @@ Under active development; mainly for Linux, Chinese-language conversations and l
 - **Working**: collection, observation, session records and topic lines, notebook delivery, MCP recall, traces and feedback, integrity checks.
 - **In progress**: automatic cognition from session records and topic lines, Atlas map rebuilding and unified scheduling. Per-turn association is delivered according to the yorimichi width (0–3) the assistant records, and users can turn it off per session.
 
-The bundled Claude Code, Codex and dsh adapters are ready-to-use examples. To support another harness, write your own adapter following them.
+The bundled Claude Code, Codex, dsh and AGY adapters are ready-to-use examples. To support another harness, write your own adapter following them.
 
 ## Getting started
 

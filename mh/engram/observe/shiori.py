@@ -15,13 +15,13 @@ WHY = re.compile(r'"why"\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
 def marked(tools):
-    """工具名列表（或它的 JSON）里有没有夹栞：Claude、dsh 写 mcp__mh__shiori，codex 采集时补成同样的名字。"""
+    """工具名列表（或它的 JSON）里有没有夹栞：Claude、dsh 写 mcp__mh__shiori，codex 采集时补成同样的名字，agy 写 mcp_mh_shiori。"""
     if isinstance(tools, str):
         try:
             tools = json.loads(tools)
         except ValueError:
             return False
-    return any(t == NAME or str(t).endswith("__" + NAME) for t in tools or [])
+    return any(t == NAME or str(t).endswith(("__" + NAME, "_" + NAME)) for t in tools or [])
 
 
 def why(file, address):
@@ -64,7 +64,7 @@ def pending(conn, workspace=None):
     if not rows:
         return []
     states = switch.states(conn)
-    off = {k for k, v in states.items() if v == "off"} | unwatched(conn, states)
+    off = {k for k, v in states.items() if v == "off"} | unwatched(conn, states, {(r["source"], r["session"]) for r in rows})
     rows = [r for r in rows if (r["source"], r["session"]) not in off]
     turns = [r["occurrence"] for r in rows]
     events = {}
