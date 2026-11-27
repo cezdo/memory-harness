@@ -10,17 +10,18 @@ from pathlib import Path
 from ....engram import store
 from .. import confine
 from ....engram.invoke import NO_UPDATE, OFFLINE_FEATURES
+from ....synapse.hosts import mcp_command, python
 from ....synapse.hosts.codex.install import configuration
 
 NAME = "codex"
 REPO = Path(__file__).resolve().parents[4]
-MODEL = "gpt-6.1-sol"
+MODEL = "gpt-6.2-sol"
 RESUME_BYTES = 3_000_000
 
 
 def hooks():
     out = configuration()
-    py = f"/usr/bin/python3 -I -S {REPO}"
+    py = f"{python()} -I -S {REPO}"        # 解释器按平台（hosts.python），11-26 self 搬到 macOS 服务机
     for event, command in (
         ("UserPromptSubmit", f"{py}/mh/engram/observe/switch/hook.py codex"),
         ("UserPromptSubmit", f"{py}/mh/engram/elevate/hook.py codex prompt"),
@@ -42,6 +43,7 @@ def home(base=None, root=store.SELF_ROOT):
         auth.symlink_to(Path.home() / ".codex/auth.json")
     # 只生成 self 自己的配置，不复制交互配置（通知、插件、全局说明等）。
     q = lambda s: json.dumps(str(s))
+    mcp = mcp_command([python(), "-m", "mh.synapse.hosts.codex", "mcp"])     # 装了 relay 就经常驻服务（X10），MH_HOST 让服务认宿主
     (h / "config.toml").write_text(
         'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
         'check_for_update_on_startup = false\n'
@@ -49,10 +51,10 @@ def home(base=None, root=store.SELF_ROOT):
         '[memories]\ngenerate_memories = false\nuse_memories = false\n'
         '[analytics]\nenabled = false\n'
         f'[projects.{q(Path(root).resolve())}]\ntrust_level = "trusted"\n'
-        '[mcp_servers.mh]\ncommand = "/usr/bin/python3"\n'
-        'args = ["-m", "mh.synapse.hosts.codex", "mcp"]\n'
+        f'[mcp_servers.mh]\ncommand = {q(mcp[0])}\n'
+        f'args = {json.dumps(mcp[1:], ensure_ascii=False)}\n'
         'default_tools_approval_mode = "approve"\n'
-        f'[mcp_servers.mh.env]\nPYTHONPATH = {q(REPO)}\n')
+        f'[mcp_servers.mh.env]\nPYTHONPATH = {q(REPO)}\nMH_HOST = "codex"\n')
     (h / "hooks.json").write_text(json.dumps(hooks(), ensure_ascii=False, indent=2))
     return h
 
@@ -97,7 +99,7 @@ def launch(root, text, session, resumed, logs):
     args = ["codex", "exec"] + (["resume", session] if resumed else [])
     args += ["-m", MODEL, "--json", "--strict-config", "--skip-git-repo-check",
              "--dangerously-bypass-hook-trust", *OFFLINE_FEATURES, *NO_UPDATE, "-"]
-    env = dict(os.environ, CODEX_HOME=str(h))
+    env = confine.env(dict(os.environ, CODEX_HOME=str(h)), logs)
     # 外层会话/终端身份不传入后台会话，避免终端包装器改当前 pane 或错误绑定足迹。
     for key in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "TMUX", "TMUX_PANE"):
         env.pop(key, None)

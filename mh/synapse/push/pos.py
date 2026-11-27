@@ -15,8 +15,9 @@ import sys
 import time
 from pathlib import Path
 
-VENV = os.environ.get("MH_LTP_PYTHON", "/usr/local/mh-tools/ltp/venv/bin/python")
-MODEL = os.environ.get("MH_LTP_MODEL", "/usr/local/mh-tools/ltp/model")
+_TOOLS = os.path.expanduser("~/local/mh-tools") if sys.platform == "darwin" else "/usr/local/mh-tools"   # 同 instance.TOOLS（服务端不 import mh；[tools].root 改了要设下面两个环境变量）
+VENV = os.environ.get("MH_LTP_PYTHON", f"{_TOOLS}/ltp/venv/bin/python")
+MODEL = os.environ.get("MH_LTP_MODEL", f"{_TOOLS}/ltp/model")
 HOME = Path(os.environ.get("MH_HOME", Path.home() / ".local/share/memory-harness"))   # 同 collect.store.HOME（服务端不 import mh）
 SOCK, LOCK, LOG = HOME / "pos.sock", HOME / "pos.lock", HOME / "pos.log"
 THREADS = 2          # torch 线程数：单句 20ms 左右，不跟观察、形成抢 CPU

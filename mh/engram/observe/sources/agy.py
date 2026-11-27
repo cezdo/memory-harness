@@ -46,7 +46,7 @@ def _root_of(path):
 
 
 def _meta(path, conv_id):
-    """从同根目录的 conversation_summaries.db 只读查会话元数据，缺失时再读 ACP 的 conversations/<id>.meta → {title, cwd, parent, kind}。"""
+    """读 CLI 的会话摘要库，或 ACP 的 .meta 与子代理登记目录 → {title, cwd, parent, kind}。"""
     root = _root_of(path)
     if not root:
         return {}
@@ -78,7 +78,11 @@ def _meta(path, conv_id):
             parent = parent or ""
             kind = "subagent" if (parent or (depth or 0) > 0) else "user"
             out = {"title": (title or "").strip(), "cwd": cwd, "parent": parent, "kind": kind}
-    meta_file = root / "conversations" / f"{conv_id}.meta"
+    records = root / "conversations"
+    child = next((records / "subagents").glob(f"*/{conv_id}.json"), None)
+    if child is not None:
+        out.update(kind="subagent", parent=child.parent.name)
+    meta_file = records / f"{conv_id}.meta"
     if meta_file.exists() and (not out or not out.get("cwd")):
         try:
             m = json.loads(meta_file.read_text(encoding="utf-8", errors="replace"))
@@ -98,9 +102,7 @@ def _meta(path, conv_id):
 def signature(path):
     """元数据（title、cwd、parent、kind）存在外层 SQLite 或 .meta 里，变了也要重新采集。"""
     m = _meta(path, _conv_id(path))
-    if not m:
-        return ""
-    raw = f"{m.get('cwd', '')}|{m.get('title', '')}|{m.get('kind', '')}|{m.get('parent', '')}"
+    raw = f"v2|{m.get('cwd', '')}|{m.get('title', '')}|{m.get('kind', '')}|{m.get('parent', '')}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
 
@@ -192,6 +194,8 @@ def parse(path):
         cwd=meta.get("cwd") or "",
         title=meta.get("title") or "",
     )
+    if session.kind == "subagent":
+        return session, []
     turns, cur = [], None
     steps = []
 
@@ -223,6 +227,7 @@ def parse(path):
                 if not text:
                     continue
                 if not turns and cur is None and text.startswith(_HELPER):
+                    session.kind = "title"
                     return session, []
                 if cur is not None:
                     close(done=True)

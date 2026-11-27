@@ -257,9 +257,8 @@ def confirm(conn, operator_id, cid, reason, holder=USER_NAME, **change):
         raise ValueError(f"不能改：{sorted(bad)}")
     act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="cognition",
                      inputs={"cognition": [cid]}, cause="manual", outcome="ok")
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "cognize", "confirm", dumps({"cognition": cid}), dumps(change), "",
-                  dumps({"reason": reason, "holder": holder})))
+    st.write_act(conn, act, "cognize", "confirm", dumps({"cognition": cid}), dumps(change), "",
+                 dumps({"reason": reason, "holder": holder}))
     new = write(conn, act, old["kind"], change.get("name", old["name"]), change.get("statements", old["statements"]),
                 change.get("members", old["members"]), from_=[cid], state=change.get("state", old["state"]),
                 window=change.get("window", old["window"]))

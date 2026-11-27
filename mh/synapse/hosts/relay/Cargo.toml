@@ -1,0 +1,14 @@
+[package]
+name = "mh-relay"
+version = "0.1.0"
+edition = "2021"
+description = "宿主的 MCP 入口：把 stdio 转给常驻的 mh MCP 服务（mh/synapse/pull/mcp.py daemon），连不上就 exec 原来的命令"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,7 +28,7 @@ DEFAULT_DB = HOME / "engram.db"
 # 两种都沾的（超时的字样加上额度、限流）按环境错误算。
 ENVIRONMENTAL = re.compile(r"quota|insufficient|balance|rate.?limit|usage limit|too many requests|\b40[23]\b|\b429\b|\b50[23]\b"
                            r"|overloaded|\bmodel is at capacity\b|connection (refused|reset|error|aborted)|ECONN|ENOTFOUND|EAI_AGAIN|network"
-                           r"|waiting for service|did not activate|can.t find source path|远端调用连不上|远端的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅"
+                           r"|waiting for service|did not activate|can.t find source path|远端调用连不上|远端的 Operator 不一致|代跑连不上|代跑的 Operator 不一致|not supported when using Codex with a ChatGPT account|额度|余额|欠费|限流|网络|订阅|高峰时段"
                            r"|failed to authenticate|OAuth|\b401\b|登录过期", re.I)     # 认证失败（11-11 claude -p 刷新失败被当成内容错误，25 轮满次数）
 # 内容过滤：服务商按内容拦下（如 ark 的 finish_reason: content_filter）。重试不会变，这一份就不要了（2026-10-17）
 FILTERED = re.compile(r"content_filter|content.?(policy|moderation)|内容过滤|内容安全|敏感内容", re.I)
@@ -129,9 +130,11 @@ CREATE TABLE IF NOT EXISTS act_detail(
   process TEXT NOT NULL,
   step TEXT NOT NULL,             -- observe: preview | deep | rough | withdraw / restore（开关在 observe → form 边界上的记录；旧版本逐轮：split）；form: pack | label | attach | import（B2 起；import 是导入实验结果的程序 act；旧做法 organize | pack | judge | relate）；cognize: …
   window TEXT NOT NULL,           -- JSON：这次看的窗口（哪一轮、哪段会话的哪几轮）
-  input TEXT NOT NULL,            -- 实际发给模型的输入
-  output TEXT NOT NULL,           -- 原始输出
   meta TEXT NOT NULL);            -- JSON：其余的调用信息
+CREATE TABLE IF NOT EXISTS act_io(
+  occurrence INTEGER PRIMARY KEY,
+  input BLOB NOT NULL,            -- 实际发给模型的输入（zlib 压缩 UTF-8；空串存 b""）
+  output BLOB NOT NULL);          -- 原始输出（zlib 压缩 UTF-8；空串存 b""）
 CREATE TABLE IF NOT EXISTS use_detail(
   occurrence INTEGER PRIMARY KEY,
   channel TEXT NOT NULL,          -- push | pull
@@ -163,6 +166,9 @@ CREATE TABLE IF NOT EXISTS event(
   relations TEXT NOT NULL DEFAULT '[]');   -- JSON [{"kind": "supersedes", "to": E 编号}]：点名申请重新观察时，新 E 取代哪些旧 E
                                   -- （C1a 2026-10-21 加；范围申请的取代按轮次推出，不写在这里）
 CREATE INDEX IF NOT EXISTS event_born ON event(born, idx);
+-- 按轮次找 E（2026-11-26）：observe.frame 按会话取 E 时从 turn_detail 的 text 走到 event，没有它就整表扫 event，
+-- form 每轮的 units 对 800 多段会话各扫一遍，占了每轮 CPU 的大半
+CREATE INDEX IF NOT EXISTS event_turn ON event(turn);
 CREATE TABLE IF NOT EXISTS form_record(
   id INTEGER PRIMARY KEY, born INTEGER NOT NULL, idx INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK(kind IN ('turn','session')),    -- 逐轮记录、会话记录
@@ -225,8 +231,61 @@ CREATE TABLE IF NOT EXISTS expression(       -- 再次表达：同一个说法�
 CREATE TABLE IF NOT EXISTS legacy(key TEXT PRIMARY KEY, id TEXT NOT NULL);   -- 旧库的哪一行导成了哪一行
 """
 
-IMMUTABLE = ("operator", "occurrence", "turn_text", "act_detail", "use_detail", "request_detail", "deletion_detail",
+IMMUTABLE = ("operator", "occurrence", "turn_text", "act_detail", "act_io", "use_detail", "request_detail", "deletion_detail",
              "event", "form_record", "judgment", "session_entry", "topic_line", "attachment", "cognition", "alias", "expression", "legacy")
+
+
+def zpack(text):
+    """大文本进库压缩（zlib level 6）；空串存空字节。"""
+    if not text:
+        return b""
+    return zlib.compress(text.encode("utf-8"), 6)
+
+
+def zunpack(val):
+    """读出压缩的大文本；兼容历史未压缩的 str。"""
+    if not val:
+        return ""
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return zlib.decompress(val).decode("utf-8")
+    return val
+
+
+def write_act(conn, occ, process, step, window, inp, out, meta):
+    """写一次 act 的元数据（act_detail）与原始输入输出（act_io，zlib 压缩）。"""
+    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?)", (occ, process, step, window, meta))
+    conn.execute("INSERT INTO act_io VALUES(?,?,?)", (occ, zpack(inp), zpack(out)))
+
+
+def migrate_act_io(conn, vacuum=True):
+    """把旧的 7 列 act_detail 拆成 act_detail（5 列）+ act_io（zlib 压缩 input/output）。已拆过的跳过。"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(act_detail)")]
+    if "input" not in cols:
+        return False
+    conn.commit()
+    conn.execute("DROP TRIGGER IF EXISTS act_detail_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS act_detail_no_delete")
+    conn.execute("CREATE TABLE act_detail_new(occurrence INTEGER PRIMARY KEY, process TEXT NOT NULL, step TEXT NOT NULL, window TEXT NOT NULL, meta TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS act_io(occurrence INTEGER PRIMARY KEY, input BLOB NOT NULL, output BLOB NOT NULL)")
+    batch_m, batch_io = [], []
+    for occ, proc, step, win, inp, out, meta in conn.execute("SELECT occurrence, process, step, window, input, output, meta FROM act_detail"):
+        batch_m.append((occ, proc, step, win, meta))
+        batch_io.append((occ, zpack(inp), zpack(out)))
+        if len(batch_m) >= 2000:
+            conn.executemany("INSERT INTO act_detail_new VALUES(?,?,?,?,?)", batch_m)
+            conn.executemany("INSERT INTO act_io VALUES(?,?,?)", batch_io)
+            batch_m.clear()
+            batch_io.clear()
+    if batch_m:
+        conn.executemany("INSERT INTO act_detail_new VALUES(?,?,?,?,?)", batch_m)
+        conn.executemany("INSERT INTO act_io VALUES(?,?,?)", batch_io)
+    conn.execute("DROP TABLE act_detail")
+    conn.execute("ALTER TABLE act_detail_new RENAME TO act_detail")
+    conn.executescript(_triggers())
+    conn.commit()
+    if vacuum:
+        conn.execute("VACUUM")
+    return True
 
 
 def _triggers():
@@ -402,10 +461,12 @@ def _git_root(c, home_str):
 
 
 def workspace(cwd):
-    """工作区名：先按 WORKSPACE_DIRS（最长前缀）；再往上看所在 git 仓库根目录（跳过家目录本身的仓库，子目录或文件路径都能
-    算回仓库根，2026-11-19 合并 push.workspace）；再看放项目的目录（PROJECTS）下的第一层目录；其余取路径最后一节。
-    worktree（Claude Code、Zeron、tmp/worktrees，见 unworktree）先算回所在的仓库。没有 cwd 返回 ""。"""
-    c = unworktree(str(cwd or ""))
+    """工作区名：先按 WORKSPACE_DIRS（最长前缀）；再看放项目的目录（PROJECTS）下的第一层目录——工作区包含仓库，里面有几个
+    仓库都算它的（2026-11-24）；再往上看所在 git 仓库根目录（跳过家目录本身的仓库，子目录或文件路径都能算回仓库根，
+    2026-11-19 合并 push.workspace）；其余取路径最后一节。
+    worktree（Claude Code、Zeron、tmp/worktrees，见 unworktree）先算回所在的仓库。没有 cwd 返回 ""。
+    客户端推来的路径先换成本机家目录下的（instance.local，X7 2026-11-26）。"""
+    c = unworktree(instance.local(cwd))
     if not c or absent(c):
         return ""
     if c == str(SELF_ROOT) or c.startswith(str(SELF_ROOT) + "/"):     # 测试换掉映射表时 self 照认
@@ -413,21 +474,24 @@ def workspace(cwd):
     for d in sorted(WORKSPACE_DIRS, key=len, reverse=True):
         if c == d or c.startswith(d + "/"):
             return WORKSPACE_DIRS[d]
+    for w, d in MANAGING.items():                   # 管理性质工作区的目录本身按配置的名字认：家目录在客户端和服务机上
+        if c == d:                                  # 名字可以不同，不能靠最后一节碰巧对上（2026-11-26）
+            return w
     home, proj = Path.home(), instance.PROJECTS
+    p = Path(c)
+    if proj and proj in p.parents:                  # 工作区可以包含几个仓库（用户 11-24：一个目录下管理多个仓库是常见的），
+        return p.relative_to(proj).parts[0]         # 放项目的目录下第一层就是工作区，不看里面的 git 仓库
     root = _git_root(c, str(home))
     if root:
         main = worktree_main(Path(root))
         return workspace(main) if main else Path(root).name
-    p = Path(c)
-    if proj and proj in p.parents:
-        return p.relative_to(proj).parts[0]
     return c.split("/")[-1]
 
 
 def project_workspace(path):
     """工具调用里碰到的文件路径 → 具体项目工作区名；系统路径（家目录和 WORKSPACE_DIRS 之外的 /dev、/etc、/tmp 等）、
     家目录下的点文件/普通文件（不在 WORKSPACE_DIRS 且不是 git 仓库）、管理性质工作区和临时目录（tmp）返回 ""（2026-11-19）。"""
-    c = unworktree(str(path or ""))
+    c = unworktree(instance.local(path))
     home = Path.home()
     if not c or absent(c):
         return ""

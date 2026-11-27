@@ -146,4 +146,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))     # 仓库根（-I -S 下按路径跑）
+    from mh.synapse.hosts import forward       # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+    forward.maybe()
     sys.exit(main(sys.argv))

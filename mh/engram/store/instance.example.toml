@@ -38,14 +38,24 @@ quiet = []                                       # 不当“查不到的词”�
 # codex = "codex"                                # codex CLI 的路径（默认按 PATH 找）
 # agy = "agy"                                    # agy CLI 的路径（默认按 PATH 找）
 # dsh_test = "/usr/local/mh-tools/dsh-observe"    # mh 专用的 dsh 实例（精读）：env/ 程序、home/ 是 DSH_HOME
+# mh_count = "/usr/local/mh-tools/mh-count/mh-count"   # 精读提示词里的字数命令：精读经 [invoke.remote] 交给别的机器时写那台上的路径（默认本机工具根下）
 
 [vector]                                        # 检索面的向量一路（Synapse v0.33）：服务端是 mh/synapse/pull/vector_serve.py，跑在有 numpy 和 bge-m3 的机器上
 # url = "http://127.0.0.1:28082"                 # 不写就只有字面一路
 # key_file = "~/.config/memory-harness/vector.key"
 
+[deploy.clients]                                # 服务机上：客户端的 ssh 名字 → 它的家目录。推来的会话 cwd 先换成本机家目录下的，再认工作区、对 [connect]；
+# linux-box = "/home/user"                      # 本机没装的服务（开场手记的“服务”一节）经 ssh 去这些客户端看
+
+# [deploy.tunnel]                                 # macOS 服务端：launchd 起的第三方程序连不了局域网，经系统 ssh 映射到本机回环（mh deploy tunnel，design/deploy）
+# ssh = "linux-box"
+# forward = ["127.0.0.1:17890:127.0.0.1:7890"]    # 照 ssh -L 写
+# control = "~/.ssh/cm-linux-box-tunnel"         # 可选：兼当 ssh 的复用主连接（~/.ssh/config 那个 Host 的 ControlPath 指这里）
 [invoke]                                        # 远端调用（mh engram serve）：只能在一台机器上跑的模型定义由它代跑
 # listen = "127.0.0.1:3090"                      # 服务端听哪里（默认只听本机）
 # token = ""                                     # 两边一样；不写就不开放
+# max_cli = 4                                   # 本机同时最多几个起 CLI 子进程的模型调用（每个 node 进程 180–250M）
+# min_free_mb = 2048                            # 第二个名额起，本机可用内存低于它就等（第一个总给）
 
 [invoke.remote]                                  # 客户端：哪些模型定义转发到哪里；没写的在本机跑
 # "deepseek-oc-web-deep" = "http://linux-box:3090"

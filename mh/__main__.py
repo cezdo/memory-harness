@@ -6,6 +6,10 @@ import sys
 import unicodedata
 from pathlib import Path
 
+if __name__ == "__main__" and sys.argv[1:2] == ["inject"]:
+    from .synapse.hosts import forward     # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+    forward.maybe()
+
 from . import synapse
 
 
@@ -38,8 +42,8 @@ class Parser(argparse.ArgumentParser):
         super().__init__(*a, **k)
 
 
-ENGRAM = ["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve", "correct", "feedback", "skeleton", "serve", "listen"]
-SYNAPSE = ["inject", "evoke", "relive", "boot", "standing", "roam", "backfill"]
+ENGRAM = ["check", "show", "page", "collect", "observe", "form", "request", "requests", "reobserve", "correct", "feedback", "skeleton", "tree", "serve", "listen"]
+SYNAPSE = ["inject", "evoke", "relive", "boot", "standing", "roam", "backfill", "mcp"]
 
 
 def _grouped(argv):
@@ -63,6 +67,7 @@ def main():
                                        "reobserve --reread --session … --reason …：补读（当时判了不读、按现在的规则要读的，程序重算、粗读）；"
                                        "correct [--limit N]：按给 observe 的点名申请纠正那几条 E（C1b）；"
                                        "skeleton --workspace … --root … --file … --section … --placements …：按文件申请骨架（--dry-run 预览）；"
+                                       "tree [工作区] [--short]：只读导出工作区的挂线树（不给工作区列汇总）；"
                                        "feedback T<入口> --name …|--topic … --reason … --model …：主会话直写的反馈（会话入口）；"
                                        "serve：远端调用的服务端，代跑只能在这台机器上跑的模型定义（实例配置 [invoke]）；"
                                        "listen：监听 QQ 协议端，事件原样追加进数据目录（实例配置 [listen]）；"
@@ -74,6 +79,7 @@ def main():
     eg.add_argument("--section", help="skeleton：包含显式文本树的章节")
     eg.add_argument("--overview", help="skeleton：模块导览表的章节（可选）")
     eg.add_argument("--placements", type=Path, help="skeleton：已有线到节点路径的 JSON 对象")
+    eg.add_argument("--short", action="store_true", help="tree：只列日期和名字，不带主题摘要")
     eg.add_argument("--name", help="feedback：改好的名字")
     eg.add_argument("--topic", help="feedback：改好的主题")
     eg.add_argument("--holder", default="我", help="feedback：谁说的（默认“我”）")
@@ -106,6 +112,7 @@ def main():
     rh.add_argument("--show", action="store_true", help="展示自己的窗口：只读网页“此刻的我”，打开时现编，memory-harness-show.service 跑它")
     rh.add_argument("--tend", action="store_true", help="照看：值班的主体管看板上的警告，memory-harness-tend.service 跑它；--once 只醒一次（强制给主体送心跳）")
     rh.add_argument("--once", action="store_true", help="只跑一轮就退出")
+    rh.add_argument("--round", action="store_true", help="常驻循环起的子进程：不拿锁跑一轮，还忙退出码 3（X9）")
     rh.add_argument("--register", nargs="*", metavar="服务", help="常驻服务按这个平台（systemd / launchd）生成，看和装着的差在哪；"
                                                                   "不点名是三个循环，远端调用的服务端要点名 memory-harness-invoke")
     rh.add_argument("--apply", action="store_true", help="--register：写进去、登记开机自启（不重启正在跑的服务）")
@@ -138,17 +145,18 @@ def main():
     for x in (gt, mp):
         x.add_argument("--page", type=int, default=None, help="第几页，从 1 起（一页 8 条）")
     sub.add_parser("backfill", help="补足迹：form 内部的拉取（2026-10-20 以前没记的）补成 use，回复里的〖〗认出引用了哪条记忆（调 Jev）；可以重复跑")
+    sub.add_parser("mcp", help="常驻的 MCP 服务：各会话的 mh-relay 经数据目录下 run/mcp.sock 连进来，库连接和读视图缓存全机一份（memory-harness-mcp 服务跑它）")
     top.add_parser("reply", help="回复：在实例配置 [reply] 的群里被叫到时回几句（常驻，memory-harness-reply 服务跑它）")
-    lk = top.add_parser("links", help="机器连接：列出现在到登记表里那几台机器的连接、按标识对上，标认不出和未知；"
-                                      "--errors 把最近两小时的报错按标识归过来")
-    lk.add_argument("--registry", type=Path, help="登记表（默认 <仓库>/tmp/links/registry.toml）")
-    lk.add_argument("--errors", action="store_true", help="连最近两小时的报错一起看")
-    lk.add_argument("--json", action="store_true", help="给程序读")
     qa = top.add_parser("quota", help="额度查询（只读；部署自己接，公开包不带）")
     qa.add_argument("names", nargs="*", help="只看这几家")
     qa.add_argument("--json", action="store_true")
     qa.add_argument("--wait", action="store_true", help="只看一家：用完了就打印要等到的 unix 秒，没用完打印 0，读不到打印 -1")
-    top.add_parser("unplug", help="拔掉 mh 起宿主：unplug <claude|codex|dsh> [宿主参数…]，独立 home、不接 mh，测试用（会话不进记忆）")
+    top.add_parser("unplug", help="拔掉 mh 起宿主：unplug <claude|codex|dsh|agy> [宿主参数…]，独立 home、不接 mh，测试用（会话不进记忆）")
+    top.add_parser("deploy", help="部署：deploy <migrate|install|push> …，数据迁移、安装器、原文推送（design/deploy）")
+    if sys.argv[1:2] == ["deploy"]:                           # 后面的参数交给 mh.deploy 自己解析
+        from .deploy.__main__ import main as deploy_main
+        deploy_main(sys.argv[2:])
+        return
     if sys.argv[1:2] == ["unplug"]:                           # 后面的参数原样交给宿主，不经 argparse
         from .synapse.hosts import unplug
         unplug.main(sys.argv[2:])
@@ -158,6 +166,10 @@ def main():
         from .engram import observe
         from .engram.invoke import serve
         serve.serve(serve.servable(observe.MODELS))
+        return
+    if args.cmd == "mcp":                                     # 常驻，库在它的工作线程里开
+        from .synapse.pull import mcp
+        mcp.daemon()
         return
     if args.cmd == "reply":                                   # 常驻，不开库
         from . import reply
@@ -175,9 +187,13 @@ def main():
         from .engram import store as estore
         from .engram import check as echeck, show
         path = args.engram_db or estore.DEFAULT_DB
-        conn = estore.connect(path, readonly=args.action == "skeleton" and args.dry_run)
+        conn = estore.connect(path, readonly=args.action == "tree" or (args.action == "skeleton" and args.dry_run))
         if args.action == "check":
             print(echeck.check(conn, path, brief=args.brief))
+        elif args.action == "tree":
+            from .engram.form import tree as etree
+            ws = args.args[0] if args.args else None
+            print(etree.render(conn, ws, short=args.short))
         elif args.action == "skeleton":
             from .engram.form import skeleton
             if not all((args.workspace, args.root, args.file, args.section)):
@@ -315,9 +331,6 @@ def main():
         from .synapse.track import cite
         conn = estore.connect(estore.DEFAULT_DB)
         print(f"补成 use：form 内部的拉取 {track.backfill_internal(conn)} 条；引用回填 {'，出错 '.join(map(str, cite.backfill(conn)))} 轮")
-    elif args.cmd == "links":
-        from .links import report
-        sys.exit(report(args.registry, args.errors, args.json))
     elif args.cmd == "quota":
         try:
             from .rhythm import quota
@@ -351,6 +364,9 @@ def main():
                 print(tend.tick(collect(), force=True) or "没事")
             else:
                 tend.serve(log=log)
+        elif args.round:
+            name = "tidy" if args.tidy else "form" if args.form else "observe"
+            sys.exit(rhythm.BUSY_EXIT if rhythm.run_round(name, args.engram_db, log=log) else 0)
         elif args.tidy:
             got = rhythm.tidy_loop(args.engram_db, once=args.once, log=log)
             if args.once:

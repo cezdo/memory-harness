@@ -29,6 +29,21 @@ def _dir(s):
 _D = _load(PATH)
 _user, _ws, _tools = _D.get("user", {}), _D.get("workspace", {}), _D.get("tools", {})
 
+# 客户端的家目录（2026-11-26：服务在 macOS 服务机，Linux 客户端推来的会话 cwd 是 /home/<名>/…，配置里的 ~ 在这里展开成本机家目录，
+# 工作区、[connect] 都对不上，不接 mh 的目录也被收了进来）。认工作区、按路径匹配之前先换成本机家目录；库里的 cwd 原样不动。
+# [deploy.clients]：客户端的 ssh 名字 → 它的家目录。服务机按家目录换算路径，按 ssh 名字去看装在客户端上的服务（开场手记的“服务”一节）。
+CLIENTS = {k: v.rstrip("/") for k, v in _D.get("deploy", {}).get("clients", {}).items() if v.rstrip("/")}
+CLIENT_HOMES = tuple(sorted(set(CLIENTS.values()), key=len, reverse=True))
+
+
+def local(path, homes=None):
+    """客户端家目录下的路径换成本机家目录下的同一处；别的原样返回。"""
+    p = str(path or "")
+    for h in CLIENT_HOMES if homes is None else homes:
+        if p == h or p.startswith(h + "/"):
+            return str(Path.home()) + p[len(h):]
+    return p
+
 USER_NAME = _user.get("name", "用户")                    # 程序写记录、填提示词时用的称呼
 USER_ALIASES = tuple(dict.fromkeys([USER_NAME, *_user.get("aliases", ())]))   # 匹配时认其中任何一个；第一个是 USER_NAME
 
@@ -55,7 +70,7 @@ UNPLUGGED = _patterns(_connect.get("unplugged", ()))     # 不接 mh（2026-11-1
 def under(cwd, patterns):
     """路径本身或任何一层上级对得上其中一个通配符（fnmatch：`*` 也跨 `/`，`?`、`[...]`；~ 开头的先展开），子目录因此都算；
     用户 2026-11-14 要按模式写（`*tmp`）。只看路径，目录删了也一样；没有 cwd 的不算。"""
-    c = (cwd or "").rstrip("/")
+    c = local(cwd).rstrip("/")
     if not c or not patterns:
         return False
     p = PurePosixPath(c)
@@ -73,6 +88,9 @@ VIEWS = dict(_D.get("engram", {}).get("views", {}))   # 来源 → 视角：导�
 
 CHATGPT_EXPORTS = tuple(_D.get("observe", {}).get("chatgpt_exports", ()))  # 显式导出文件与工作目录；不扫描 archive
 
+# 第三方工具的根（AGENTS“工具位置”）：Linux /usr/local/mh-tools，macOS ~/local/mh-tools（2026-10-31）；[tools].root 可改。
+# pos.py 的服务端不 import mh，那里照同样的规则另写一次
+TOOLS = Path(_dir(_tools.get("root") or ("~/local/mh-tools" if sys.platform == "darwin" else "/usr/local/mh-tools")))
 CODEX = _tools.get("codex", "codex")                     # codex CLI（额度查询用）
 AGY = _tools.get("agy", "agy")                           # agy CLI（额度查询用）
 DSH_TEST = Path(_dir(_tools["dsh_test"])) if _tools.get("dsh_test") else None   # mh 专用的 dsh 实例（精读用；不要指到 dsh 升级的测试环境，它会被 teardown）

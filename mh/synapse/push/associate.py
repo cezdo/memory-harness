@@ -18,7 +18,7 @@ from pathlib import Path
 
 from ...engram.observe.label import SELF_WORKSPACE
 from ...engram.store import HOME, UNKNOWN
-from ...engram.store.instance import QUIET, USER_ALIASES, USER_NAME
+from ...engram.store.instance import QUIET, TOOLS, USER_ALIASES, USER_NAME
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*")
 _CONCEPT = re.compile(r"「([^」]+)」")
@@ -44,7 +44,7 @@ DETERMINERS = {"所有", "全部", "一些", "各种", "其他", "别的", "每�
 NAMES = set(USER_ALIASES)                           # 用户的称呼几乎出现在每条认识里（实例配置）
 CUT_FREQ = 1000            # 切坏的词：跨过它边界的常用词至少这么常见（高通 1.7 万、二字、错的；初值，按出错的案例调）
 RARE_FREQ = 60000          # 单独一个词时，雾凇拼音词频不低于它的是日常词（时候 50 万、情况 50 万、门槛 17 万），不单独触发
-LEXICON = os.environ.get("MH_LEXICON", "/usr/local/mh-tools/lexicon")
+LEXICON = os.environ.get("MH_LEXICON", str(TOOLS / "lexicon"))
 COVER, COVER_N = 0.6, 6    # 认识正文的 6 字片段有六成以上在上下文里逐字出现过，算已经在上下文里
 PROMPT_KEEP = 500          # 足迹里留原话的前多少字
 _CJK = re.compile(r"[㐀-鿿]+")
@@ -659,7 +659,7 @@ def associate(conn, prompt, session="", cwd="", transcript=None, host="claude", 
         hs = [idx_k[k]["h"] for k in shown] if shown else []
         track.use(conn, VERSION, "associate", {"associate": rec, "omitted": kw.get("omitted", 0)}, kw.get("text") or "",
                   {"judgment": [k[1] for k in shown if k[0] == "j"], "form_record": [k[1] for k in shown if k[0] == "s"]},
-                  session=session, purpose="prefetch", cwd=cwd, channel="push", meta={"shown": hs, "host": host})
+                  session=session, purpose="prefetch", cwd=cwd, channel="push", host=host, meta={"shown": hs, "host": host})
         if rec.get("candidates") is not None:
             try:      # 流水出了任何错都不影响这一轮（pushes.py 的纪律）
                 tier = rec.get("tier") or []
@@ -905,12 +905,15 @@ def hook(stdin=sys.stdin, stdout=sys.stdout):
             conn = conn or library()
             track.use(conn, VERSION, "associate", {"associate": {"prompt": str(d.get("prompt", ""))[:PROMPT_KEEP],
                                                                  "skip": "出错", "error": repr(e)}}, "", {},
-                      session=d.get("session_id", ""), purpose="prefetch", cwd=d.get("cwd", ""), channel="push")
+                      session=d.get("session_id", ""), purpose="prefetch", cwd=d.get("cwd", ""), channel="push",
+                      host=d.get("host") or "claude")
         except Exception:
             pass
 
 
 if __name__ == "__main__":
+    from mh.synapse.hosts import forward       # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+    forward.maybe()
     from mh.synapse.push import associate      # 按包路径调：缓存里 pickle 的类要记成包里的，不能记成 __main__
     if sys.argv[1:] == ["--build"]:            # 后台重建联想数据（cached 起的）
         from mh.synapse import library

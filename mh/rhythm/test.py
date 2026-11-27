@@ -4,6 +4,7 @@
 python3 -m unittest mh.rhythm.test
 """
 import io
+import json
 import os
 import tempfile
 import time
@@ -66,12 +67,12 @@ class RhythmTest(unittest.TestCase):
             return lambda names: [x for x in (codex, claude) if x["name"] in names]
         def w(name, h5, week, ok=True):
             return {"name": name, "ok": ok, "windows": [{"name": "5h", "used": h5}, {"name": "week", "used": week}]}
-        names = ["sol", "sonnet"]
-        self.assertEqual(pick(names, q(w("codex", 0, 10), w("claude", 0, 58))), ["sol", "sonnet"])
-        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 0, 58))), ["sonnet", "sol"])
-        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 85, 20))), ["sol", "sonnet"])
-        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 0, 20, ok=False))), ["sol", "sonnet"])
-        self.assertEqual(pick(names, q({"name": "codex", "error": "x"}, w("claude", 0, 90))), ["sonnet", "sol"])
+        names = ["sol62", "sonnet"]
+        self.assertEqual(pick(names, q(w("codex", 0, 10), w("claude", 0, 58))), ["sol62", "sonnet"])
+        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 0, 58))), ["sonnet", "sol62"])
+        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 85, 20))), ["sol62", "sonnet"])
+        self.assertEqual(pick(names, q(w("codex", 0, 70), w("claude", 0, 20, ok=False))), ["sol62", "sonnet"])
+        self.assertEqual(pick(names, q({"name": "codex", "error": "x"}, w("claude", 0, 90))), ["sonnet", "sol62"])
 
     def test_lock(self):
         a = lock("x", self.dir)
@@ -177,7 +178,7 @@ class RhythmTest(unittest.TestCase):
         old = st.operator(conn, "old", "observe", "observer")
         for (t,) in conn.execute("SELECT occurrence FROM turn_detail").fetchall():
             a = st.occurrence(conn, "act", old, outcome="ok", scale="turn")
-            conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "observe", "split", st.dumps({"turn": t}), "", "", "{}"))
+            st.write_act(conn, a, "observe", "split", st.dumps({"turn": t}), "", "", "{}")
         conn.commit()
         models = {"preview": Model(["### 第 1–2 轮\n读法：粗读\n"]), "deep": Model([]),
                   "rough": Model([f"### 事件1\n{U}说一。\n来源：1:U1"])}
@@ -223,6 +224,17 @@ class RegisterTest(unittest.TestCase):
         self.assertEqual(d["KeepAlive"], {"SuccessfulExit": False})
         self.assertEqual(d["StandardOutPath"], d["StandardErrorPath"])
 
+    def test_proxy_env(self):
+        """注册时 shell 里的代理带进 launchd 服务（X7 2026-11-26：launchd 不读 ~/.zshenv）；没设的不带。"""
+        from unittest import mock
+        from . import register as r
+        env = {"HTTPS_PROXY": "http://p:1", "NO_PROXY": "localhost", "HTTP_PROXY": "", "HOME": "/h"}
+        self.assertEqual(r.proxy_env(env), {"HTTPS_PROXY": "http://p:1", "NO_PROXY": "localhost"})
+        import plistlib
+        with mock.patch.dict(r.os.environ, {"HTTPS_PROXY": "http://p:1"}, clear=False):
+            d = plistlib.loads(r.plist("memory-harness-form", python="/py", path="/a").encode())
+        self.assertEqual(d["EnvironmentVariables"]["HTTPS_PROXY"], "http://p:1")
+
     def test_journal_lines(self):
         from unittest import mock
         from . import register as r
@@ -248,6 +260,49 @@ class RegisterTest(unittest.TestCase):
         now = datetime.fromisoformat("2026-10-20T09:00:00+09:00")
         self.assertEqual(r._file_lines(log, 6, now=now), [("2026-10-20T08:00:00+09:00", "本轮出错：y")])
         self.assertEqual(r._file_lines(log.with_name("没有.log"), 6, now=now), [])
+
+
+class RoundTest(unittest.TestCase):
+    """一轮放进子进程（X9 2026-11-26）：常驻的只剩锁、叫醒、休眠。"""
+
+    def test_due(self):
+        from . import _due
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "tidy-state.json"
+            tasks = [("a", "程序", 60, None), ("b", "程序", 3600, None)]
+            self.assertTrue(_due(tasks, state, now=1000))                           # 没跑过的：到期
+            state.write_text(json.dumps({"a": 990, "b": 990}))
+            self.assertFalse(_due(tasks, state, now=1000))
+            self.assertTrue(_due(tasks, state, now=1050))                           # a 到了
+
+    def test_child(self):
+        from unittest import mock
+        from . import BUSY_EXIT, _child
+        log = io.StringIO()
+        for code, busy in ((0, False), (BUSY_EXIT, True), (1, False)):
+            with mock.patch("subprocess.run", return_value=mock.Mock(returncode=code)) as run:
+                self.assertEqual(_child(["--form"], None, log), busy)
+            argv = run.call_args[0][0]
+            self.assertEqual(argv[1:], ["-m", "mh", "rhythm", "--form", "--round"])
+        self.assertIn("退出码 1", log.getvalue())
+
+    def test_order_cached_in_file(self):
+        from unittest import mock
+        from . import _order, _picked
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(_picked, {"at": 0.0, "order": None}):
+            path = Path(d) / "preview-order.json"
+            with mock.patch(f"{__package__}.pick", return_value=["sonnet", "sol62"]) as p:
+                self.assertEqual(_order(path), ["sonnet", "sol62"])
+            _picked.update(at=0.0, order=None)                                       # 下一轮是新进程：从文件读，不再查额度
+            with mock.patch(f"{__package__}.pick") as p:
+                self.assertEqual(_order(path), ["sonnet", "sol62"])
+                p.assert_not_called()
+            import json, time
+            path.write_text(json.dumps({"at": time.time(), "order": ["sonnet", "sol"]}))   # 池里换了定义名：旧名单作废
+            _picked.update(at=0.0, order=None)
+            with mock.patch(f"{__package__}.pick", return_value=["sol62", "sonnet"]) as p:
+                self.assertEqual(_order(path), ["sol62", "sonnet"])
+                p.assert_called_once()
 
 
 if __name__ == "__main__":

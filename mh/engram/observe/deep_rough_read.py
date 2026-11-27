@@ -3,7 +3,7 @@
 这里放精读、粗读这一步的 Operator 定义（哪个模型、经哪个宿主、叠哪些补丁、怎样隔离）和给模型的输入；调用本身在 mh/engram/invoke/。
 2026-10-17 起（tmp/observe-e4/）：
 - 精读 deepseek-oc-web-deep：常驻 dsh web（端口 3085），minimal 预设原样带 bash，只放行字数命令（白名单外判失败），high；
-  2026-10-31 从 deepseek-ark-web-deep 改名：ark 订阅用完，provider 换成 OpenCode Go（模型仍是 DeepSeek V4.1 Flash）。
+  2026-10-31 从 deepseek-ark-web-deep 改名：ark 订阅用完，provider 换成 OpenCode Go（模型仍是 DeepSeek V4.1 Flash）。到 2026-11-25。
 - 粗读 deepseek-ark-web-rough：另起的 dsh web（端口 3086），bare 预设去掉全部工具，low（到 2026-10-19，已退役）。
 2026-10-19 起（tmp/window/ 实验三到六，用户：粗读是常态、精读是精品，各用所长）：
 - 粗读 luna-codex-rough：codex exec 上的 Luna，low，用了工具就作废；提示词 rough-read-v0.2（10-26 前 v0.1）。
@@ -14,6 +14,10 @@
 - 粗读 terra-codex-rough：codex exec 上的 gpt-6.1-terra，low，其余同 Luna；同一份输入条数、长度和 Luna 几乎一样，
   更守“有名字的东西和说法用「」”，少写“记录在本轮总结里”这类没指到地方的话。以前的 E 不重读（只管以后的和以后的再观察）。
 - 精读不变：Luna 写得省、跟提示词走，DeepSeek 写得细、几乎不翻转说话人，细的放在分量重的少数轮上。
+2026-11-25 到 11-26（X8，tmp/deep-read-cost/：重放 12 组，效果不差，输出量和 dsh 相当）：
+- 精读 deepseek-api-deep：DeepSeek 官方 API 上的 deepseek-flash，high，不加 system、不带工具，提示词里不再有字数命令那句；
+  高峰时段（周一到周五 UTC 01–04、06–10）不发，留到谷价（invoke.DeepSeek.wait）。OpenCode Go 的周额度被 dsh 主会话用完过。
+2026-11-26 起（先回退，OpenCode Go 订阅到期再迁回官方 API 看看）：精读回到 deepseek-oc-web-deep，经 [invoke.remote] 交给客户端。
 补丁在 patches/：极简层（关掉记忆工具等，dsh-minimal）、模型与推理档位（dsh-web）、粗读的 bare 预设（dsh-rough）。
 补丁的内容进隔离标记，改了就是新的 Operator。
 """
@@ -22,7 +26,7 @@ from pathlib import Path
 
 import re
 
-from ..invoke import Codex, DshWeb
+from ..invoke import Codex, DeepSeek, DshWeb
 from ..invoke.serve import remote
 from ..store import HOME, absent, blocks
 from . import guard, label
@@ -35,7 +39,8 @@ MODEL = "deepseek-v4.1-flash"                 # 模型名写在 dsh-web.patch.ym
 
 MODELS = {
     # DshWeb 只能在 Linux 上跑；实例配置 [invoke.remote] 给了地址的，转发给那台机器上的 mh engram serve（X2）
-    "deepseek-oc-web-deep": lambda: remote("deepseek-oc-web-deep", DshWeb(
+    "deepseek-api-deep": lambda: DeepSeek("deepseek-flash", "high"),
+    "deepseek-oc-web-deep": lambda: remote("deepseek-oc-web-deep", DshWeb(                  # 11-26 起又用（中间 11-25 走官方 API）
         MODEL, "dsh web 常驻（测试实例，opencode-go，minimal 预设，high，bash 只放行 mh-count）",
         patches=(MINIMAL_PATCH, WEB_PATCH), allow=guard.allow, allow_tag="mh-count")),
     "deepseek-ark-web-rough": lambda: remote("deepseek-ark-web-rough", DshWeb(
@@ -52,8 +57,17 @@ ROUGH_FLOAT = 0.3            # 范围上下浮动三成（用户：只给一个�
 CONTENT_MIN = 40             # 有内容的段落：至少这么多字
 LONG_CAP = 53                # 单轮自成一窗的条数中心上限（临时兜底，2026-10-25）：ROUGH_MAX × 有内容段落 p90 密度 10.6/千字；长轮预览（observe shelved，未上线）上线后撤
 STEPS = {"精读": "deep", "粗读": "rough"}       # 读法 → 步骤；不读的不调用
-TOOLS = {"deep": f"\n环境里唯一能用的命令是 {guard.COUNT}（数字数：参数或 here-doc 给文字）；别的命令都会让这次观察作废。\n",
+# 提示词里 {tools} 那一行：按步骤的默认，模型带字数命令的（dsh web 只放行 mh-count）换成那一句。直接调 API 的精读没有工具，
+# 那一行留空（11-25 重放时就是这样）；改走哪条只改 observe.CURRENT，这一句跟着模型走，不用另改（2026-11-26 回退到 dsh web）
+TOOLS = {"deep": "\n",
          "rough": "\n不要使用任何工具或命令：用了，这次观察就作废。\n"}
+COUNT_LINE = f"\n环境里唯一能用的命令是 {guard.COUNT}（数字数：参数或 here-doc 给文字）；别的命令都会让这次观察作废。\n"
+WITH_COUNT = {"deepseek-oc-web-deep"}
+
+
+def tools(step, model):
+    """{tools} 那一行：这一步用的模型带字数命令就给那一句，否则按步骤的默认。"""
+    return COUNT_LINE if model in WITH_COUNT else TOOLS[step]
 
 
 def reply_chars(row):

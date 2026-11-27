@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-VENV = os.environ.get("MH_TYPESAFE_PYTHON", "/usr/local/mh-tools/typesafe/venv/bin/python")
 ENV = Path.home() / ".config/memory-harness/typesafe.env"
 TIMEOUT = 90
 
@@ -24,7 +23,9 @@ def _config():
 
 def choose(state, instructions, criteria):
     """问 Jev 一道单选题（criteria：{选项: 说明}）→ {"value", "probabilities", "model"}；出错抛 RuntimeError（不带密钥）。"""
-    r = subprocess.run([VENV, str(Path(__file__).resolve())], input=json.dumps(
+    from ...engram.store.instance import TOOLS         # 客户端这边才要（服务端是 venv 直接跑本文件，不 import mh）
+    venv = os.environ.get("MH_TYPESAFE_PYTHON", str(TOOLS / "typesafe/venv/bin/python"))
+    r = subprocess.run([venv, str(Path(__file__).resolve())], input=json.dumps(
         {"state": state, "instructions": instructions, "criteria": criteria}, ensure_ascii=False),
         capture_output=True, text=True, timeout=TIMEOUT)
     try:

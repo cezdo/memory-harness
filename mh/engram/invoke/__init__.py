@@ -1,10 +1,11 @@
-"""调用接口：dsh（headless、web）、claude -p、codex exec 的接入与隔离（重构 A4，2026-10-17：单独一个文件夹）。
+"""调用接口：dsh（headless、web）、claude -p、codex exec 的接入与隔离（重构 A4，2026-10-17：单独一个文件夹）；DeepSeek 官方 API（X8，2026-11-25）。
 
 每个调用只做一件事：给提示词，拿回文本和调用信息。宿主的适配和更新都在这里，换模型、宿主升级只动这里。
 具体用哪个模型、哪份提示词、叠哪些补丁，是各过程自己的 Operator 定义（observe 的在 mh/engram/observe/preview.py、deep_rough_read.py），不放在这里。
 密钥只从各宿主自己的配置读。隔离标记（isolation）由各类按构造参数算出，进 Operator：隔离方式变了就是新的 Operator。
 """
 import concurrent.futures
+import contextlib
 import ctypes
 import hashlib
 import http.client
@@ -18,11 +19,12 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
 
-from ..store.instance import DSH_TEST
+from ..store.instance import DSH_TEST, INVOKE
 
 from ..store import HOME
 
@@ -135,6 +137,41 @@ def catalog(model=None, path=None, days=CATALOG_DAYS, run=None):
         return path
 
 
+def _spec(init):
+    """记下构造参数（X7）：转给别的机器代跑时，那边照同样的参数构造同一个模型。"""
+    def wrap(self, *a, **kw):
+        self._spec = {"cls": type(self).__name__, "args": list(a), "kw": kw}
+        init(self, *a, **kw)
+    wrap.__doc__ = init.__doc__
+    return wrap
+
+
+def _forward(model, method, *args, **kw):
+    """实例配置 [invoke].forward 给了地址：这一次调用交给那台机器上的 mh engram serve（/call）代跑，结果原样带回。
+    模型的登录凭据只在那台机器上（mh 服务在服务机，codex、claude 登录在客户端，两台共用一份 OAuth 会互相顶掉）。"""
+    from .serve import SLACK
+    url, token = INVOKE["forward"].rstrip("/"), INVOKE.get("token", "")
+    body = json.dumps({"spec": model._spec, "isolation": model.isolation, "method": method, "args": list(args), "kw": kw},
+                      ensure_ascii=False).encode()
+    req = urllib.request.Request(f"{url}/call", data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=model.timeout + SLACK).read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"代跑连不上（{url}，HTTP {e.code}）：{e.read()[:300].decode('utf-8', 'replace')}")
+    except TimeoutError:
+        raise TimeoutError(f"代跑超时（{url}，{model.timeout + SLACK} 秒没有返回）")
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"代跑连不上（{url}）：{e}")
+    if d.get("ok"):
+        r = d["result"]
+        if isinstance(r, list) and len(r) == 2 and isinstance(r[1], dict):
+            r[1]["forwarded"] = url
+            return tuple(r)
+        return r
+    raise (TimeoutError if d.get("type") == "TimeoutError" else RuntimeError)(d.get("error", "代跑那边没给错误信息"))
+
+
 class Codex:
     """GPT（默认 Luna），经本机 codex exec；临时空目录、只读、不留会话文件，免得被自己采回去。
 
@@ -144,6 +181,7 @@ class Codex:
     home = HOME / "codex-home"
     isolation = "codex-home-v1"
 
+    @_spec
     def __init__(self, model="gpt-6-luna", effort="medium", platform="codex", isolation=None, no_tools=False, allow=(),
                  config=(), instructions=None):
         # 推理强度显式写死，等于 codex-home-v1 以来各模型实际用的默认值（Luna medium、Sol low）；
@@ -164,6 +202,8 @@ class Codex:
         # images：附在提示词上的图片文件（回复看清时的图，2026-10-31）；--image=路径 逐张写，免得 -i 把后面的 "-" 也当成图
         # keep：留下会话（不加 --ephemeral），meta["thread"] 是会话 id，之后 follow 接着问、close 删掉（pack 的重写，2026-11-04）。
         # 会话文件在隔离的 CODEX_HOME 里，采集只读 ~/.codex，不会采回来
+        if INVOKE.get("forward") and not getattr(self, "_local", False):
+            return _forward(self, "__call__", prompt, images=list(images), keep=keep)
         env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
         cat = catalog(self.model)
         own = self.config + (["-c", f'model_instructions_file="{self.instructions}"'] if self.instructions else [])
@@ -218,6 +258,8 @@ class Codex:
 
     def follow(self, thread, prompt):
         """接着 keep 留下的会话问下一轮（codex exec resume）：前面的输入命中缓存。返回 (文本, 调用信息)，用量是这一轮自己的。"""
+        if INVOKE.get("forward") and not getattr(self, "_local", False):
+            return _forward(self, "follow", thread, prompt)
         env = dict(os.environ, CODEX_HOME=str(_ensure_home(self.home)))
         cat = catalog(self.model)
         own = self.config + (["-c", f'model_instructions_file="{self.instructions}"'] if self.instructions else [])
@@ -249,6 +291,8 @@ class Codex:
 
     def close(self, thread):
         """删掉 keep 留下的会话文件。"""
+        if INVOKE.get("forward") and not getattr(self, "_local", False):
+            return _forward(self, "close", thread)
         self._seen().pop(thread, None)
         for f in (self.home / "sessions").glob(f"**/*{thread}*.jsonl"):
             f.unlink(missing_ok=True)
@@ -548,6 +592,7 @@ class Claude:
     isolation = "claude-home-v1"
     system = "按用户消息里的要求完成这一次文本任务，只输出所要求的内容。"     # 替换 Claude Code 默认的编程助手提示（其中含记忆目录说明）
 
+    @_spec
     def __init__(self, model="claude-sonnet-5-5", platform="claude -p", effort=None, isolation=None):
         # effort 不给 = CLI 默认档（claude-home-v1 以来一直如此）；给了就要换 isolation 标签，让它进 Operator 身份（同 Codex）
         self.model, self.platform, self.effort = model, platform, effort
@@ -555,6 +600,8 @@ class Claude:
             self.isolation = isolation
 
     def __call__(self, prompt):
+        if INVOKE.get("forward") and not getattr(self, "_local", False):
+            return _forward(self, "__call__", prompt)
         self.home.mkdir(parents=True, exist_ok=True)
         relink(self.home / ".credentials.json", Path.home() / ".claude/.credentials.json")
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.home))
@@ -575,9 +622,123 @@ class Claude:
                              "isolation": self.isolation, **({"effort": self.effort} if self.effort else {})}
 
 
-def call(model, prompt):
-    """调一次，量耗时。返回 (文本, 调用信息)；调用信息里的 seconds 是墙钟秒数。"""
-    start = time.monotonic()
-    text, meta = model(prompt)
-    meta["seconds"] = round(time.monotonic() - start, 1)
+class DeepSeek:
+    """DeepSeek 官方 API（X8，2026-11-25）：直接发 chat/completions，不加 system、不带工具，只有一条用户消息。
+    不经宿主，也就没有宿主的提示词和工具要隔离，在哪台机器上都能跑；密钥在 ~/.config/memory-harness/deepseek.key。
+    官方价高峰（周一到周五 UTC 01–04、06–10，价格页 2026-11-25）翻倍，用户：调用都等谷价。wait() 告诉调用方现在能不能发，
+    调用方在高峰里不发、当作还没到时间；__call__ 自己也拦一道（批次跑到一半跨进高峰），报环境错误。
+    中国节假日也是谷价，这里没认（只会多等，不会多花）。"""
+    timeout = TURN_TIMEOUT
+    url = "https://api.deepseek.com/chat/completions"
+    key = Path.home() / ".config/memory-harness/deepseek.key"
+    platform = "DeepSeek 官方 API"
+    PEAK = ((1, 4), (6, 10))           # 周一到周五的 UTC 小时 [起, 止)；一律按 UTC（用户 2026-11-25）
+
+    @_spec
+    def __init__(self, model="deepseek-flash", effort="high", isolation=None):
+        self.model, self.effort = model, effort
+        self.isolation = isolation or f"deepseek-api-v1-{effort}"       # 没有 system、没有工具；effort 进身份
+
+    @classmethod
+    def wait(cls, now=None):
+        """在高峰里：返回高峰结束的时刻（UTC）；否则 None。"""
+        from datetime import datetime, timezone
+        now = now or datetime.now(timezone.utc)
+        if now.weekday() < 5:
+            for a, b in cls.PEAK:
+                if a <= now.hour < b:
+                    return now.replace(hour=b, minute=0, second=0, microsecond=0)
+        return None
+
+    def __call__(self, prompt):
+        if (end := self.wait()):
+            raise RuntimeError(f"DeepSeek 高峰时段，不发（等谷价，{end:%H:%M} UTC 起）")
+        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}], "reasoning_effort": self.effort}
+        req = urllib.request.Request(self.url, json.dumps(body).encode(), method="POST", headers={
+            "Content-Type": "application/json", "Authorization": f"Bearer {self.key.read_text().strip()}"})
+        try:
+            d = json.loads(urllib.request.urlopen(req, timeout=self.timeout).read())
+        except urllib.error.HTTPError as e:       # 402 余额不足、429 限流、503 忙都由环境错误的规则认
+            raise RuntimeError(f"DeepSeek API HTTP {e.code}：{e.read()[:300].decode('utf-8', 'replace')}")
+        choice = d["choices"][0]
+        text, finish = choice["message"].get("content") or "", choice.get("finish_reason")
+        if finish == "content_filter":
+            raise RuntimeError("DeepSeek API finish_reason: content_filter")
+        if finish != "stop" or not text.strip():
+            raise RuntimeError(f"DeepSeek API 没有正常结束（finish_reason: {finish}，正文 {len(text)} 字）")
+        u = d.get("usage") or {}
+        hit = u.get("prompt_cache_hit_tokens") or 0
+        return text, {"model": d.get("model", self.model), "effort": self.effort, "id": d.get("id"),
+                      "usage": [{"inputTokens": (u.get("prompt_tokens") or 0) - hit, "cacheReadTokens": hit,
+                                 "outputTokens": u.get("completion_tokens")}],
+                      "reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+                      "reasoning": choice["message"].get("reasoning_content") or ""}   # 思考全文（用户 2026-11-25：存下来，看用什么语言想、为什么那样写）
+
+
+LOCAL_CLI = (Codex, Claude, Dsh)      # 在本机起 CLI 子进程的（DshWeb 是 Dsh 的子类）：每个 node 进程 180–250M（2026-11-26 实测）
+MAX_CLI = int(INVOKE.get("max_cli", 4))   # 本机同时最多几个（2026-11-26：内存稀缺、时间不要紧）
+MIN_FREE_MB = int(INVOKE.get("min_free_mb", 2048))   # 第二个名额起，本机可用内存低于它就不放行（X9 2026-11-26）
+POLL = 1.0
+
+
+def free_mb():
+    """本机可用内存（MB），读不到给 None。macOS 用 kern.memorystatus_level（系统自己判的可用百分比，内存压力按它算；
+    vm_stat 的 free 只算空页，inactive 里大半能回收，自己拼不准）；Linux 用 /proc/meminfo 的 MemAvailable。"""
+    try:
+        if sys.platform == "darwin":
+            level = int(subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True, text=True, timeout=5).stdout)
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5).stdout)
+            return total * level // 100 >> 20
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) >> 10
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+class _Slot:
+    """跨进程的名额：数据目录下 MAX_CLI 个槽位文件，flock 抢一个，抢不到就等（observe、form、tidy 各进程各线程共用）。
+    flock 按打开的文件算，同一进程的几个线程各自打开，也互相挡；进程死了锁随之释放。
+    按内存放行：0 号名额总给（总有一路在走，不会全卡住）；1 号起，本机可用内存不到 MIN_FREE_MB 就不抢，等下一圈。"""
+
+    def __init__(self, n=None, root=None, free=None, min_free=None):
+        self.n, self.root, self.f = n or MAX_CLI, root or HOME / "run", None
+        self.free, self.min_free = free or free_mb, MIN_FREE_MB if min_free is None else min_free
+
+    def _roomy(self):
+        mb = self.free()
+        return mb is None or mb >= self.min_free
+
+    def __enter__(self):
+        import fcntl
+        self.root.mkdir(parents=True, exist_ok=True)
+        while True:
+            for i in range(self.n):
+                if i == 1 and not self._roomy():
+                    break
+                f = open(self.root / f"cli-slot-{i}.lock", "a")
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.f = f
+                    return self
+                except OSError:
+                    f.close()
+            time.sleep(POLL)
+
+    def __exit__(self, *exc):
+        self.f.close()                  # 关掉即解锁
+
+
+def call(model, prompt, slot=None):
+    """调一次，量耗时。返回 (文本, 调用信息)；调用信息里的 seconds 是墙钟秒数（不含排队），queued 是等名额的秒数。
+    本机起 CLI 的模型先拿名额（_Slot）；DeepSeek（HTTP）、远端转发不占本机内存，不排队。"""
+    queued = time.monotonic()
+    gate = (slot or _Slot()) if isinstance(model, LOCAL_CLI) else contextlib.nullcontext()
+    with gate:
+        start = time.monotonic()
+        text, meta = model(prompt)
+        meta["seconds"] = round(time.monotonic() - start, 1)
+    if start - queued >= 1:
+        meta["queued"] = round(start - queued, 1)
     return text, meta

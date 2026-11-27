@@ -144,8 +144,8 @@ def request_file(conn, source, assignments, reason, operator_id):
                           prompt_hash=st.NA, isolation=st.NA, window="workspace", params={"reader": "text-tree-and-module-table"})
     aid = st.occurrence(conn, "act", program, started=st.now(), ended=st.now(), scale="workspace", cause="manual", outcome="ok")
     meta = {k: v for k, v in source.items() if k != "text"}
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (aid, "form", "read_skeleton", st.dumps({"workspace": source["workspace"]}),
-                 source["text"], tree(source["nodes"]), st.dumps(meta)))
+    st.write_act(conn, aid, "form", "read_skeleton", st.dumps({"workspace": source["workspace"]}),
+                 source["text"], tree(source["nodes"]), st.dumps(meta))
     rid = st.request(conn, st.MAIN, "form", {"act": [aid]}, reason, operator_id, cause="manual")
     return rid
 
@@ -174,8 +174,8 @@ def adopt(conn, rid, assignments):
     aid = st.occurrence(conn, "act", op, started=st.now(), ended=st.now(), scale="workspace", inputs=inputs,
                         cause="request", predecessor=previous["act"] if previous else st.NA, outcome="ok")
     meta = dict(m, source_act=refs[0], placements=paths)
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (aid, "form", "adopt_skeleton", st.dumps({"workspace": m["workspace"]}),
-                 st.dumps(assignments), preview(conn, m, assignments), st.dumps(meta)))
+    st.write_act(conn, aid, "form", "adopt_skeleton", st.dumps({"workspace": m["workspace"]}),
+                 st.dumps(assignments), preview(conn, m, assignments), st.dumps(meta))
     return aid
 
 

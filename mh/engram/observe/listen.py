@@ -2,7 +2,9 @@
 listen-onebot.jsonl。只收不发；常驻，memory-harness-listen 服务跑它（python3 -m mh listen），不开库。
 
 协议端在别的机器上、只听那台机器的本机时，自己起 ssh 隧道（实例配置 [listen]）；隧道或 WS 断了就整个重来，
-等待从 RETRY 起翻倍，到 RETRY_MAX 为止，连上后复位。
+等待从 RETRY 起翻倍，到 RETRY_MAX 为止，连上后复位。配置了 [listen].revive（ssh 主机上的计划任务名）和
+revive_dir（协议端装在哪），连不上满 REVIVE_AFTER、协议端进程不在，就跑那个任务；只认快速登录，要扫码就关掉它、
+喊用户（SCAN），连上之前不再拉。
 
 每行：{"received": 收到的时刻（UTC ISO）, "event": 协议端发来的原样 JSON}。心跳（meta_event/heartbeat）不记，
 连上时的 lifecycle 照记，断开、重连只进日志；配置了 groups 就只记这些群（keep）。采集读这份文件是以后的事（采集加一个来源）。
@@ -27,6 +29,9 @@ from ..store.instance import LISTEN, _dir
 LOG = HOME / "listen-onebot.jsonl"
 RETRY, RETRY_MAX = 5, 300
 READ_TIMEOUT = 90           # 协议端心跳 30 秒一次，这么久什么都没收到就当断了
+REVIVE_AFTER, REVIVE_GAP = 180, 900     # 连不上满 3 分钟去拉协议端；拉过后 15 分钟内不再拉
+LOGIN_WAIT = 120                        # 拉起后等快速登录这么久
+SCAN = HOME / "listen-scan.md"          # 要扫码时写的这一张（看板读、发预览站）；连上就删
 
 LINK = re.compile(r"https?://([^/\s]+)\S*")
 SHORT = 4                   # 名字尽可能短：留前几个字
@@ -254,11 +259,93 @@ def once(ssh, remote, local, token, only=None, peers=()):
                 p.kill()
 
 
-def serve():
+def due(down, tried, now, after=REVIVE_AFTER, gap=REVIVE_GAP):
+    """该不该去拉协议端：从 down（断开的时刻）起一直没连上满 after 秒，且离上次拉（tried，没拉过是 None）满 gap 秒。"""
+    return now - down >= after and (tried is None or now - tried >= gap)
+
+
+def ps(ssh, script):
+    """在 ssh 主机（Windows）上跑一段 PowerShell，返回标准输出（那边是 GBK）。"""
+    enc = base64.b64encode(f"$ErrorActionPreference='SilentlyContinue'; {script}".encode("utf-16le")).decode()
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", ssh, f"powershell -NoProfile -EncodedCommand {enc}"],
+                       capture_output=True, timeout=60)
+    return r.stdout.decode("gbk", "replace").strip()
+
+
+def probe(ssh, home, port):
+    """协议端那边的样子：{now: 那边的 UTC 时刻, qr: 二维码最后写入的 UTC 时刻（没有是空）, up: 端口在听,
+    procs: 装在 home 下的进程数（只认这个目录的，系统 QQ 不算）}。时刻都是 PowerShell 的 'o' 格式，能按字符串比。"""
+    out = ps(ssh, f"$q=(Get-Item '{home}\\versions\\*\\resources\\app\\napcat\\cache\\qrcode.png' | sort LastWriteTime"
+                  f" | select -Last 1).LastWriteTimeUtc.ToString('o'); $l=[bool](Get-NetTCPConnection -LocalPort {port} -State Listen);"
+                  f" $p=@(Get-Process | ? {{ $_.Path -like '{home}\\*' }}).Count;"
+                  f" \"$((Get-Date).ToUniversalTime().ToString('o'))|$q|$l|$p\"")
+    now, qr, up, procs = out.splitlines()[-1].split("|")
+    return {"now": now, "qr": qr, "up": up == "True", "procs": int(procs)}
+
+
+def stop(ssh, task, home):
+    """结束计划任务和装在 home 下的进程（系统 QQ 不动）。"""
+    ps(ssh, f"schtasks /end /tn {task} | Out-Null; Get-Process | ? {{ $_.Path -like '{home}\\*' }} | Stop-Process -Force")
+
+
+def revive(ssh, task, home, port, look=probe, end=stop, sleep=time.sleep, wait=LOGIN_WAIT):
+    """协议端进程不在就跑它的计划任务（用户 11-24：关掉登录窗口后小号离线了快一天），只认快速登录：端口起来算登上；
+    写了新二维码（登录状态失效）或 wait 秒没登上，就把它关掉，不停在等扫码（用户 11-24）。进程还在（可能是用户
+    开着窗口在扫）就不动。→ (这一次的经过, 要不要喊用户扫码)。"""
+    try:
+        p = look(ssh, home, port)
+        if p["procs"]:
+            return f"协议端进程还在（{p['procs']} 个），不拉", False
+        t0 = p["now"]
+        subprocess.run(["ssh", "-o", "BatchMode=yes", ssh, f"schtasks /run /tn {task}"], capture_output=True, timeout=60)
+        for _ in range(wait // 5):
+            sleep(5)
+            p = look(ssh, home, port)
+            if p["up"]:
+                return "拉起协议端，快速登录上了", False
+            if p["qr"] > t0:
+                end(ssh, task, home)
+                return "拉起协议端，快速登录失效、要扫码，已关掉", True
+        end(ssh, task, home)
+        return f"拉起协议端，{wait} 秒没登上，已关掉", True
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return f"拉起协议端没成：{type(e).__name__} {e}", False
+
+
+def call(note, path=SCAN, cfg=LISTEN):
+    """喊用户扫码：写 path（看板读它，连上后删），发到预览站「给用户」分类（实例配置 [show].review_ctl；没配就只写文件）。"""
+    from ..store.instance import SHOW, USER_NAME
+    at = datetime.now().astimezone().strftime("%m-%d %H:%M")
+    path.write_text(f"# QQ 要扫码（{at}）\n\n{note}。{cfg.get('scan_hint', '')}\n", encoding="utf-8")
+    ctl = SHOW.get("review_ctl")
+    if not ctl:
+        return "没配预览站，只写了文件"
+    try:
+        r = subprocess.run([sys.executable, str(Path(ctl).expanduser()), "publish", "--category", f"给{USER_NAME}",
+                            "--name", "QQ要扫码.md", str(path)], capture_output=True, text=True, timeout=120)
+        return f"发到预览站，退出码 {r.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"发预览站没成：{type(e).__name__} {e}"
+
+
+def serve(cfg=LISTEN):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))      # 服务停止时走 finally，把隧道一起收掉
-    ssh, remote, local, token = config()
-    wait = RETRY
+    ssh, remote, local, token = config(cfg)
+    task, home = (cfg.get("revive"), cfg.get("revive_dir")) if ssh else (None, None)
+    port = int(remote.rsplit(":", 1)[1])
+    wait, down, tried = RETRY, time.time(), None
     while True:
-        wait = RETRY if once(ssh, remote, local, token, groups(), private()) else min(wait * 2, RETRY_MAX)
+        if once(ssh, remote, local, token, groups(cfg), private(cfg)):
+            wait, down = RETRY, time.time()
+            SCAN.unlink(missing_ok=True)                        # 连上了：扫过码了，或自己登上了
+        else:
+            wait = min(wait * 2, RETRY_MAX)
+            if task and home and not SCAN.exists() and due(down, tried, time.time()):
+                tried = time.time()                             # 已经喊过扫码就不再拉，等用户
+                what, scan = revive(ssh, task, home, port)
+                log(what)
+                if scan:
+                    log(call(what))
+                wait = RETRY
         log(f"{wait} 秒后重连")
         time.sleep(wait)

@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ..store.instance import INVOKE
 
 DEFAULT_LISTEN = "127.0.0.1:3090"
+CALLS = {"__call__", "follow", "close"}     # 代跑（/call）只放这几个方法
 SLACK = 120                  # 客户端比模型的超时多等几秒：超时由服务端判，带回来
 
 
@@ -77,6 +78,8 @@ def handler(models, token, log=sys.stderr):
         def do_POST(self):
             if not token or not hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {token}"):
                 return self._send(401, {"ok": False, "error": "token 不对"})
+            if self.path == "/call":
+                return self._call()
             if self.path != "/invoke":
                 return self._send(404, {"ok": False, "error": f"没有 {self.path}"})
             try:
@@ -98,6 +101,34 @@ def handler(models, token, log=sys.stderr):
                 return self._send(200, {"ok": False, "type": type(e).__name__, "error": str(e)})
             print(f"{name}：{meta.get('seconds')}s", file=log, flush=True)
             self._send(200, {"ok": True, "text": text, "meta": meta})
+
+        def _call(self):
+            """代跑（X7）：按对方记下的构造参数在这边构造 Codex / Claude，调同名的方法；登录凭据只在这边。"""
+            from . import Claude, Codex
+            try:
+                d = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                spec, method = d["spec"], d["method"]
+                cls = {"Codex": Codex, "Claude": Claude}[spec["cls"]]
+            except (ValueError, KeyError) as e:
+                return self._send(400, {"ok": False, "error": f"请求格式不对：{e!r}"})
+            if method not in CALLS:
+                return self._send(400, {"ok": False, "error": f"不代跑 {method}"})
+            key = json.dumps(spec, sort_keys=True, ensure_ascii=False)
+            if key not in built:
+                built[key] = cls(*spec["args"], **spec["kw"])
+                built[key]._local = True          # 这边就是代跑的一方，不再往外转
+            model = built[key]
+            if d.get("isolation") != model.isolation:
+                return self._send(409, {"ok": False, "error": f"代跑的 Operator 不一致：本地 {d.get('isolation')}，"
+                                                              f"这边 {model.isolation}（两边仓库的版本对齐了再调）"})
+            try:
+                out = getattr(model, method)(*d.get("args", []), **d.get("kw", {}))
+            except Exception as e:
+                print(f"代跑 {spec['cls']} {getattr(model, 'model', '')} {method}：{type(e).__name__}：{e}", file=log, flush=True)
+                return self._send(200, {"ok": False, "type": type(e).__name__, "error": str(e)})
+            if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
+                print(f"代跑 {spec['cls']} {model.model} {method}：{out[1].get('seconds', '')}", file=log, flush=True)
+            self._send(200, {"ok": True, "result": out})
 
         def log_message(self, *a):           # 一次调用一行，记在上面；http.server 的访问日志不要
             pass

@@ -89,9 +89,10 @@ class SwitchTest(unittest.TestCase):
                          [("你好", "你好呀"), ("/no-observe", ""), ("/do-observe", "")])   # 进行中的一轮先收完
 
     def _hook(self, host, prompt, log, *extra):
+        # HOME 也隔开：客户端有 ~/.config/memory-harness/forward.toml，不隔开钩子会转给服务机
         p = subprocess.run([sys.executable, "-I", "-S", str(HERE / "hook.py"), host, *extra, str(log)], capture_output=True, text=True,
                            input=json.dumps({"session_id": "s9", "transcript_path": str(self.dir / "s9.jsonl"), "prompt": prompt}),
-                           env={"MH_HOME": str(self.dir / "home")})
+                           env={"MH_HOME": str(self.dir / "home"), "HOME": str(self.dir)})
         return p.returncode, p.stdout, p.stderr
 
     def test_wake(self):
@@ -123,7 +124,7 @@ class SwitchTest(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", "-S", str(HERE / "hook.py"), "agy", str(log)],
                            input=json.dumps({"conversationId": "s10", "transcriptPath": str(db), "invocationNum": 1,
                                              "lastUserInput": "<USER_REQUEST>\n/do-observe\n</USER_REQUEST>"}),
-                           text=True, capture_output=True, env={"MH_HOME": str(self.dir / "home")})
+                           text=True, capture_output=True, env={"MH_HOME": str(self.dir / "home"), "HOME": str(self.dir)})
         self.assertEqual((p.returncode, json.loads(p.stdout)), (0, {}))
         from . import hook
         self.assertEqual(hook.decide("agy", "/do-observe", "s10", "/t.jsonl", "/tmp", log), "on")

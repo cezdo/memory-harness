@@ -8,11 +8,11 @@
 import difflib
 import os
 import plistlib
+import pwd
 import re
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -28,7 +28,10 @@ EXTRA = {"memory-harness-invoke": (["engram", "serve"], "mh engram serve：远�
          "memory-harness-listen": (["engram", "listen"], "mh engram listen：监听 QQ 协议端，事件原样追加进数据目录（G7）"),
          "memory-harness-reply": (["reply"], "mh reply：在一个群里被叫到时回几句（G7）"),
          "memory-harness-show": (["rhythm", "--show"], "mh rhythm --show：展示自己的窗口，只读网页（N3）"),
-         "memory-harness-tend": (["rhythm", "--tend"], "mh rhythm --tend：照看，值班的主体管看板上的警告（G11）")}
+         "memory-harness-tend": (["rhythm", "--tend"], "mh rhythm --tend：照看，值班的主体管看板上的警告（G11）"),
+         "memory-harness-push": (["deploy", "push"], "mh deploy push：客户端把宿主会话原文推到服务机（X7，design/deploy）"),
+         "memory-harness-tunnel": (["deploy", "tunnel"], "mh deploy tunnel：macOS 服务端经系统 ssh 把局域网端口映射到本机回环（X7，design/deploy）"),
+         "memory-harness-mcp": (["mcp"], "mh mcp：常驻的 MCP 服务，各会话的 mh-relay 连进来（X10，design/synapse“常驻服务和 relay”）")}
 # 照看还没进公开包（release 的 frozen.txt）：模块不在就不登记它的服务
 EXTRA = {k: v for k, v in EXTRA.items() if k != "memory-harness-tend" or (Path(__file__).parent / "tend").is_dir()}
 ALL = {**SERVICES, **EXTRA}
@@ -50,11 +53,27 @@ def _run(args):
 def path_env():
     """服务的 PATH：TOOLS 所在的目录（按出现先后、去重）+ 系统目录。"""
     dirs = [str(Path(p).parent) for p in (shutil.which(t) for t in TOOLS) if p]
-    return ":".join(dict.fromkeys(dirs + ["/usr/local/bin", "/usr/bin", "/bin"]))
+    brew = ["/opt/homebrew/bin"] if PLATFORM == "launchd" else []      # macOS 的 Homebrew（git、ssh 以外的 GNU 工具）
+    return ":".join(dict.fromkeys(dirs + brew + ["/usr/local/bin", "/usr/bin", "/bin"]))
+
+
+PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
+
+
+def proxy_env(environ=None):
+    """注册时 shell 里的代理设定，原样带进 launchd 服务（2026-11-26：服务机出网要走局域网另一台的代理，launchd 不读 ~/.zshenv）。"""
+    environ = os.environ if environ is None else environ
+    return {k: environ[k] for k in PROXY_VARS if environ.get(k)}
+
+
+def _account():
+    """登录账户真正的家目录。mh 可以跑在另一个 HOME 下（如服务机上用和客户端同路径的 /home/<名>），
+    launchd 只认账户家目录里的 LaunchAgents。"""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 def _logs():
-    return Path.home() / "Library/Logs/memory-harness"
+    return _account() / "Library/Logs/memory-harness"
 
 
 def unit(name, python=None, path=None):
@@ -77,7 +96,8 @@ def plist(name, python=None, path=None):
         "Label": name, "Comment": desc,
         "ProgramArguments": [python or sys.executable, "-m", "mh", *args],
         "WorkingDirectory": str(REPO),
-        "EnvironmentVariables": {"PATH": path or path_env(), "PYTHONUNBUFFERED": "1", STAMP_ENV: "1"},
+        "EnvironmentVariables": {"PATH": path or path_env(), "PYTHONUNBUFFERED": "1", STAMP_ENV: "1", **proxy_env(),
+                                 **({"HOME": str(Path.home())} if Path.home() != _account() else {})},
         "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": RESTART_SEC,
         "StandardOutPath": log, "StandardErrorPath": log,
     }).decode()
@@ -86,7 +106,7 @@ def plist(name, python=None, path=None):
 def target(name):
     """这个平台上服务文件放在哪。"""
     if PLATFORM == "launchd":
-        return Path.home() / "Library/LaunchAgents" / f"{name}.plist"
+        return _account() / "Library/LaunchAgents" / f"{name}.plist"
     return Path.home() / ".config/systemd/user" / f"{name}.service"
 
 
@@ -139,8 +159,11 @@ def since(name):
     """服务这一次是什么时候起来的（绝对时间，秒）；读不到给 None。常驻循环是长进程、不重新加载代码，近况拿它和最新提交比。"""
     if PLATFORM == "launchd":
         m = re.search(r"^\s*pid = (\d+)", _run(["launchctl", "print", f"gui/{os.getuid()}/{name}"]), re.M)
-        out = _run(["ps", "-o", "etimes=", "-p", m.group(1)]).strip() if m else ""
-        return time.time() - int(out) if out.isdigit() else None
+        out = _run(["ps", "-o", "lstart=", "-p", m.group(1)]).strip() if m else ""     # 绝对时刻（etimes 相减每次差一两秒）
+        try:
+            return datetime.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            return None
     out = _run(["systemctl", "--user", "show", name, "-p", "ActiveEnterTimestamp", "--value", "--timestamp=unix"]).strip()
     return int(out[1:]) if re.fullmatch(r"@\d+", out) and int(out[1:]) else None
 

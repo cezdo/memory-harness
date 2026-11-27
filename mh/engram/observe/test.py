@@ -13,7 +13,7 @@ from pathlib import Path
 from .sources.turn import Session, Turn
 from .. import store as st
 from ..store import NA, NOT_DONE, UNKNOWN
-from . import collect, modes, parse, preview
+from . import collect, deep_rough_read, modes, parse, preview
 from .. import observe
 from ..store.instance import USER_NAME as U
 
@@ -360,8 +360,9 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT text FROM turn_detail WHERE ordinal=0").fetchone()[0], Turn("你好", "回答").id)
 
     def test_clean_empty_sessions(self):
-        """清理空会话（2026-11-06）：没有用户的话、也没有回答的主会话删掉原文件；用户说了话没等到回答的、
-        末尾那轮还没入库的、原文里有回答的（解析器漏认了用户的话）、最近动过的都不删；codex 压成 .zst 的照样认；宿主开着的照删（用户 11-06）；删掉的记一笔。"""
+        """清理空会话：没有一轮有“我”的最终回答的主会话删掉原文件（2026-11-27：mh 提取不到东西就不留），
+        说了话没等到回答的、末尾那轮没入库的、原文里只有工具调用的也删；原文里有回答正文的（解析器漏认）、子代理、最近动过的不删；
+        codex 压成 .zst 的照样认；宿主开着的照删（用户 11-06）；删掉的记一笔。"""
         from unittest.mock import patch
         from . import clean
         files, parsed = {}, {}
@@ -379,7 +380,9 @@ class ObserveTest(unittest.TestCase):
         add("sub", [], kind="subagent")
         add("open", [])
         add("goal", [])                                                           # 解析器没认出用户的话，原文里却有回答
-        files["goal"].write_text('{"payload": {"type": "message", "role": "assistant"}}')
+        files["goal"].write_text('{"payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "好"}]}}')
+        add("toolonly", [])                                                       # 原文里只有 assistant 的工具调用，没写出正文
+        files["toolonly"].write_text('{"payload": {"type": "message", "role": "assistant", "content": []}}')
         add("zipped", [])                                                         # codex 后来压成了 .zst，库里记的是压缩前的路径
         subprocess.run(["zstd", "-q", "--rm", str(files["zipped"])], check=True)
         fake = type("M", (), {"parse": staticmethod(lambda path: parsed.get(str(path), (None, [])))})
@@ -388,10 +391,36 @@ class ObserveTest(unittest.TestCase):
         with patch.dict(clean.SOURCES, {"codex": fake}):
             self.assertEqual(clean.clean(self.conn, now=files["empty"].stat().st_mtime + 60, record=record), [])   # 最近动过
             got = clean.clean(self.conn, apply=True, now=now, record=record)
-        self.assertEqual(sorted(s for _, s, _ in got), ["command", "empty", "open", "zipped"])
-        self.assertEqual(sorted(f.name for f in self.dir.glob("*.jsonl")), ["asked.jsonl", "cleaned.jsonl", "goal.jsonl", "pending.jsonl", "s.jsonl", "sub.jsonl"])
-        self.assertEqual(len(record.read_text().splitlines()), 4)
+        self.assertEqual(sorted(s for _, s, _ in got), ["asked", "command", "empty", "open", "pending", "toolonly", "zipped"])
+        self.assertEqual(sorted(f.name for f in self.dir.glob("*.jsonl")), ["cleaned.jsonl", "goal.jsonl", "s.jsonl", "sub.jsonl"])
+        self.assertEqual(len(record.read_text().splitlines()), 7)
         self.assertFalse(list(self.dir.glob("*.zst")))
+        self.assertTrue(clean.pushed("/home/u/x", ("/home/u",)) and clean.pushed("/home/u", ("/home/u",)))
+        self.assertFalse(clean.pushed("/home/u.old", ("/home/u",)) or clean.pushed("/w", ("/home/u",)))
+        self.assertEqual(clean.candidates(self.conn, homes=("/w",)), [])     # 客户端推来的镜像不删：删了推送又补回来（X7 11-27）
+        # 客户端那边（11-27：反过来，本机判、本机删）：空主会话推送时跳过，过了 AGE 再删；没变的文件不再解析
+        client = self.dir / "client"
+        client.mkdir()
+        for n in ("e1", "e2", "talked", "sub"):
+            (client / f"{n}.jsonl").write_text("x")
+        sess = lambda sid, kind="user": Session("codex", sid, str(client / f"{sid}.jsonl"), kind=kind)
+        local = {str(client / "e1.jsonl"): (sess("e1"), []), str(client / "e2.jsonl"): (sess("e2"), []),
+                 str(client / "talked.jsonl"): (sess("talked"), [Turn("帮我看看", "好", closed=True)]),
+                 str(client / "sub.jsonl"): (sess("sub", "subagent"), [])}
+        calls = []
+        lfake = type("M", (), {"files": staticmethod(lambda: [Path(k) for k in local] + [self.dir / "elsewhere.jsonl"]),
+                               "parse": staticmethod(lambda path: calls.append(path) or local[str(path)])})
+        cache = self.dir / "cache.json"
+        t0 = max(f.stat().st_mtime for f in client.iterdir())
+        with patch.dict(clean.SOURCES, {"codex": lfake, "claude": type("N", (), {"files": staticmethod(list)}),
+                                        "dsh": type("N", (), {"files": staticmethod(list)})}):
+            self.assertEqual(clean.excludes([client], cache), {client: ["e1.jsonl", "e2.jsonl"]})
+            n = len(calls)
+            self.assertEqual(clean.clean_client([client], apply=True, now=t0 + 60, record=record, cache=cache), [])   # 太新
+            self.assertEqual(len(calls), n)                                                              # 走了缓存
+            got = clean.clean_client([client], apply=True, now=t0 + clean.AGE + 1, record=record, cache=cache)
+        self.assertEqual(sorted(s for _, s, _ in got), ["e1", "e2"])
+        self.assertEqual(sorted(f.name for f in client.iterdir()), ["sub.jsonl", "talked.jsonl"])
 
     def test_collect_restart(self):
         """Orca 重启后的固定续接提示（2026-11-06）是宿主注入；程序新认得以前当成 human 的轮，再采时改过来（只从 human 改出去）。"""
@@ -545,7 +574,27 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(list(results.values()), ["[main abc1234] x"])
         acp_path.write_text(json.dumps({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-19T12:00:00Z",
                                         "content": "<USER_REQUEST>\nYou generate session titles. Treat …\n</USER_REQUEST>"}) + "\n")
-        self.assertEqual(agy.parse(acp_path)[1], [])
+        title, turns = agy.parse(acp_path)
+        self.assertEqual((title.kind, turns), ("title", []))
+        self.assertEqual(collect.save(self.conn, collect.collector(self.conn), title, turns), (0, 0, 0))
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM session_detail WHERE session=?", (title.session,)).fetchone())
+
+    def test_agy_acp_subagent_registry(self):
+        from .sources import agy
+
+        root = self.dir / "antigravity-acp"
+        path = root / "brain/child/.system_generated/logs/transcript_full.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "SYSTEM_MESSAGE", "content": "Subagent task"}) + "\n")
+        previous = agy.signature(path)
+        record = root / "conversations/subagents/main/child.json"
+        record.parent.mkdir(parents=True)
+        record.write_text('{"conversationId": "child"}')
+        self.assertNotEqual(agy.signature(path), previous)
+        session, turns = agy.parse(path)
+        self.assertEqual((session.kind, session.parent, turns), ("subagent", "main", []))
+        self.assertEqual(collect.save(self.conn, collect.collector(self.conn), session, turns), (0, 0, 0))
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM session_detail WHERE session='child'").fetchone())
 
     def test_shiori_precise(self):
         """夹了栞的轮（I7，2026-11-13）：所在的组程序定成精读，不占精读兜底的份额；程序判不读的组（宿主消息）不动。"""
@@ -668,8 +717,25 @@ class ObserveTest(unittest.TestCase):
                 "deep": FakeModel(deep), "rough": FakeModel(rough)}
 
     def _acts(self):
-        return self.conn.execute("SELECT o.*, a.step, a.window, a.input, a.meta FROM occurrence o JOIN act_detail a "
-                                 "ON a.occurrence=o.id ORDER BY o.id").fetchall()
+        rows = self.conn.execute("SELECT o.*, a.step, a.window, io.input, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
+                                 "JOIN act_io io ON io.occurrence=a.occurrence ORDER BY o.id").fetchall()
+        return [{**dict(r), "input": st.zunpack(r["input"])} for r in rows]
+
+    def test_peak_held(self):
+        """模型在高峰里（wait() 给了时刻）：那几组不调用、不记 act，留到谷价再读；粗读照常。"""
+        self._collect([Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在 /home/someone/x/report.md 里", closed=True),
+                       Turn("再跑一遍", "跑完了" * 20, closed=True), Turn("好的", "嗯", closed=True)])
+        fakes = self._fakes([PLAN], [READ], ["### 事件1\n我跑完了。\n来源：3:A1"])
+        from datetime import datetime, timezone
+        fakes["deep"].wait = lambda: datetime(2026, 11, 25, 4, tzinfo=timezone.utc)
+        log = io.StringIO()
+        observe.run(self.conn, workers=1, models=fakes, log=log)
+        self.assertEqual([(a["step"], a["outcome"]) for a in self._acts()], [("preview", "ok"), ("rough", "ok")])
+        self.assertEqual(fakes["deep"].prompts, [])
+        self.assertIn("1 组留到 04:00 UTC 以后", log.getvalue())
+        fakes["deep"].wait = lambda: None                                   # 到了谷价：接着读
+        observe.run(self.conn, workers=1, models=fakes, log=io.StringIO())
+        self.assertEqual([(a["step"], a["outcome"]) for a in self._acts()][-1], ("deep", "ok"))
 
     def test_observe(self):
         self._collect([Turn("先做一版看看", "好的", closed=True), Turn("结果呢", "结果在 /home/someone/x/report.md 里", closed=True),
@@ -688,7 +754,8 @@ class ObserveTest(unittest.TestCase):
         segs = json.loads(acts[0]["meta"])["reads"]
         self.assertEqual([(x["from"], x["to"], x["how"]) for x in segs], [(1, 2, "精读"), (3, 3, "粗读"), (4, 4, "不读")])
         deep = acts[1]
-        self.assertIn("mh-count", deep["input"])
+        self.assertIn(deep_rough_read.COUNT_LINE.strip(), deep["input"])     # 字数命令那句跟着模型走：dsh web 有（11-26 回退）
+        self.assertEqual(deep_rough_read.tools("deep", "deepseek-api-deep"), "\n")   # 直接调 API 的没有
         rough = acts[2]
         self.assertIn("这几轮写 1–3 条", rough["input"])                      # 条数范围由程序填：用户 1 条 + 我 1 段（2026-10-19）
         self.assertNotIn("{amount}", rough["input"])
@@ -720,6 +787,10 @@ class ObserveTest(unittest.TestCase):
         rows = [Turn(f"第{i}", "答", closed=True, started="2026-10-17T11:00:00Z") for i in range(80)]
         self._collect(rows, sid="long")                                    # 轮数不设上限：80 轮整段一次
         self.assertEqual([len(w) for w, _ in observe.ready(self.conn, op, session="long", now=later)], [80])
+        ctx = observe.ready_context(self.conn)                             # 按完整的键查、共用一份全库部分（X9）：和按前缀的一样
+        self.assertEqual(observe.ready(self.conn, op, now=later, ctx=ctx, key=("dsh", "long")),
+                         observe.ready(self.conn, op, session="long", now=later))
+        self.assertEqual(observe.ready(self.conn, op, now=later, ctx=ctx, key=("dsh", "没有")), [])
 
     def test_preview_missing(self):
         """预览漏分组的轮次（2026-10-27，668f6657 的第 12–14 轮）：不算处理过，下一次照常预览；不然它永远待观测，挡住 form 的门槛。"""
@@ -756,6 +827,10 @@ class ObserveTest(unittest.TestCase):
             with patch.object(observe, "_act", lambda conn, op_id, step, window, *a, **k: real(conn, op_id, step, {**window, "fast": True}, *a, **k)):
                 observe.store_read(self.conn, op, None, group, "rough", tables, mask, text, out, {}, None, {})
         self.assertEqual(len(observe.frame(self.conn)["events"]), 3)
+        whole = observe.frame(self.conn)["events"]                                                         # 逐条版、按 id 取，和全库那份一致（X9）
+        self.assertEqual(list(observe.iter_frame(self.conn)), whole)
+        self.assertEqual(observe.frame(self.conn, ids=[whole[2]["id"], whole[0]["id"]])["events"], [whole[0], whole[2]])
+        self.assertEqual(observe.frame(self.conn, ids=[])["events"], [])
         self.assertEqual(set(states(self.conn).values()), {"not_previewed"})                               # form 照样等预览
         # 告一段落：照常预览。第 1 轮精读、第 2 轮粗读（快道读过，不再读）、第 3 轮不读、第 4 轮粗读
         plan = "### 第 1 轮\n类型：讨论\n读法：精读\n\n### 第 2 轮\n类型：执行\n读法：粗读\n\n### 第 3 轮\n类型：执行\n读法：不读\n\n" \
@@ -777,11 +852,11 @@ class ObserveTest(unittest.TestCase):
         sol = FakeModel([RuntimeError("You've hit your usage limit")])
         sonnet = FakeModel(["### 第 1–2 轮\n类型：闲聊\n读法：不读\n"])
         saved = dict(observe.MODELS)
-        observe.MODELS.update(sol=lambda: sol, sonnet=lambda: sonnet)
+        observe.MODELS.update(sol62=lambda: sol, sonnet=lambda: sonnet)
         try:
             log = io.StringIO()
             done, env = observe.run(self.conn, workers=1, models={"deep": FakeModel([]), "rough": FakeModel([])}, log=log,
-                                    order=["sol", "sonnet"])
+                                    order=["sol62", "sonnet"])
             ops = observe.pool_ops(self.conn)
         finally:
             observe.MODELS.clear()
@@ -789,7 +864,7 @@ class ObserveTest(unittest.TestCase):
         self.assertEqual(env, 0)
         self.assertIn("换 sonnet", log.getvalue())
         acts = [(x["outcome"], x["operator"]) for x in self._acts() if x["step"] == "preview"]
-        self.assertEqual(acts, [("env_error", ops["sol"]), ("ok", ops["sonnet"])])
+        self.assertEqual(acts, [("env_error", ops["sol62"]), ("ok", ops["sonnet"])])
 
     def test_operator_window(self):
         """IDLE 决定预览看哪些轮，计入预览的 Operator：改了就是新的 Operator。"""
@@ -927,11 +1002,10 @@ class ObserveTest(unittest.TestCase):
         groups = [{"no": 1, "from": 1, "to": 1, "turns": [t1], "how": "粗读", "plan": ""},
                   {"no": 2, "from": 2, "to": 2, "turns": [t2], "how": "粗读", "plan": ""}]
         pid = st.occurrence(self.conn, "act", op, outcome="ok", scale="segment")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (pid, "observe", "preview", st.dumps({"turns": [t1, t2]}),
-                                                                           "", "", st.dumps({"segments": groups})))
+        st.write_act(self.conn, pid, "observe", "preview", st.dumps({"turns": [t1, t2]}),
+                                                                           "", "", st.dumps({"segments": groups}))
         aid = st.occurrence(self.conn, "act", op, outcome="ok", scale="segment")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                          (aid, "observe", "rough", st.dumps({"turns": [t1], "preview": pid, "segment": 1}), "", "", "{}"))
+        st.write_act(self.conn, aid, "observe", "rough", st.dumps({"turns": [t1], "preview": pid, "segment": 1}), "", "", "{}")
         self.assertEqual([g["turns"] for _, g, _ in observe.to_read(self.conn)], [[t2]])
         self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
 
@@ -948,7 +1022,7 @@ class ObserveTest(unittest.TestCase):
         legacy = {}
         for k, t in turns.items():                                           # 旧版本逐轮观察过全部轮次，每轮写了一条 E
             a = st.occurrence(self.conn, "act", old, outcome="ok", scale="turn")
-            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "observe", "split", st.dumps({"turn": t}), "", "", "{}"))
+            st.write_act(self.conn, a, "observe", "split", st.dumps({"turn": t}), "", "", "{}")
             legacy[k] = self.conn.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved) "
                                           "VALUES(?,0,?,?,?,?,?,'[]','[]')", (a, t, f"旧的 {k}", "?unknown", "", "?unknown")).lastrowid
         op = observe.operator(self.conn)[0]
@@ -991,7 +1065,7 @@ class ObserveTest(unittest.TestCase):
         def act(step, inputs, meta="{}", window="{}"):
             a = st.occurrence(self.conn, "act", pop if step == "preview" else me, started="2026-01-02T00:00:00Z",
                               inputs=inputs, outcome="ok", cause="manual")
-            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "observe", step, window, "", "", meta))
+            st.write_act(self.conn, a, "observe", step, window, "", "", meta)
             return a
         early = act("preview", {"turn": [turn["b"]]}, window=st.dumps({"turns": [turn["b"]]}))       # 补记那批：预览在前
         m1 = act("reobserve", {"session": [sess["a"]]}, st.dumps({"reason": "第二批", "since": "x"}))
@@ -1015,7 +1089,7 @@ class ObserveTest(unittest.TestCase):
         e1, e2, e3 = [r[0] for r in self.conn.execute("SELECT id FROM event ORDER BY id")]
         form_op = st.operator(self.conn, "form-test", "form", "former")
         fa = st.occurrence(self.conn, "act", form_op, outcome="ok", inputs={"event": [e1, e2, e3]})
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (fa, "form", "pack", "{}", "", "", "{}"))
+        st.write_act(self.conn, fa, "form", "pack", "{}", "", "", "{}")
         me = st.main_operator(self.conn, "m")
         rid = st.request(self.conn, st.MAIN, "observe", {"event": [e1, e3]}, f"第 1 轮是{U}说的；迁移脚本没出现过", me,
                          cause="manual")
@@ -1053,7 +1127,7 @@ class ObserveTest(unittest.TestCase):
         t, = [r[0] for r in self.conn.execute("SELECT occurrence FROM turn_detail")]
         old = st.operator(self.conn, "old", "observe", "observer")
         a = st.occurrence(self.conn, "act", old, outcome="ok", scale="turn")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "observe", "split", st.dumps({"turn": t}), "", "", "{}"))
+        st.write_act(self.conn, a, "observe", "split", st.dumps({"turn": t}), "", "", "{}")
         e = self.conn.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved) "
                               "VALUES(?,0,?,'他说了一','?unknown','','?unknown','[\"U1\"]','[]')", (a, t)).lastrowid
         st.request(self.conn, st.MAIN, "observe", {"event": [e]}, "用了“他”", st.main_operator(self.conn, "m"), cause="manual")
@@ -1092,7 +1166,7 @@ class ObserveTest(unittest.TestCase):
         self._collect([Turn("新", "答", closed=True, started="2026-06-01T00:00:00Z")], sid="new", started="2026-06-01T00:00:00Z")
         t, = [r[0] for r in self.conn.execute("SELECT occurrence FROM turn_detail WHERE session='old'")]
         a = st.occurrence(self.conn, "act", st.operator(self.conn, "old", "observe", "observer"), outcome="ok", scale="turn")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "observe", "split", st.dumps({"turn": t}), "", "", "{}"))
+        st.write_act(self.conn, a, "observe", "split", st.dumps({"turn": t}), "", "", "{}")
         op, now = observe.operator(self.conn)[0], datetime(2026, 6, 2, tzinfo=timezone.utc)
         me = st.main_operator(self.conn, "m")
         order = lambda: [k[1] for _, k, _ in observe.queue(self.conn, op, now=now)]
@@ -1114,7 +1188,7 @@ class ObserveTest(unittest.TestCase):
         e1, e2 = [r[0] for r in self.conn.execute("SELECT id FROM event ORDER BY id")]
         op = st.operator(self.conn, "form-test", "form", "former")
         a = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"event": [e1]})
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (a, "form", "organize", "{}", "", "", "{}"))
+        st.write_act(self.conn, a, "form", "organize", "{}", "", "", "{}")
         steps = lambda: [(r["step"], json.loads(r["inputs"])["event"]) for r in self._acts() if r["step"] in ("withdraw", "restore")]
         self.assertEqual(observe.withheld(self.conn), set())
         switches = []
@@ -1201,6 +1275,25 @@ class ObserveTest(unittest.TestCase):
         finally:
             instance.UNWATCHED = old
 
+    def test_unplugged_already_collected(self):
+        """不接 mh 的目录里的会话已经收进库（2026-11-26：切换服务机后 cwd 对不上漏收）：不预览、不读，/do-observe 也不压过；
+        和暂停的来源一样算读不到的会话（form 入口、Synapse 都按它挡）。"""
+        from ..store import instance
+        self._collect([Turn("一", "答", closed=True), Turn("二", "答", closed=True)])
+        self._collect([Turn("甲", "答", closed=True), Turn("/do-observe", "", closed=True), Turn("丙", "答", closed=True)], sid="s2")
+        self.assertNotEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
+        old = instance.UNPLUGGED
+        instance.UNPLUGGED = ("*w",)
+        try:
+            self.assertEqual(observe.ready(self.conn, observe.operator(self.conn)[0]), [])
+            self.assertEqual(observe.to_read(self.conn), [])
+            keys = {(s, ses) for s, ses in self.conn.execute("SELECT source, session FROM session_detail")}
+            self.assertEqual(observe.unplugged_sessions(self.conn), keys)
+            self.assertLessEqual(keys, observe.hidden_sessions(self.conn))
+        finally:
+            instance.UNPLUGGED = old
+        self.assertEqual(observe.unplugged_sessions(self.conn), set())
+
     def test_home_session_unwatched_unless_attached_to_project(self):
         """家目录（~）直接开的会话（2026-11-19）：碰过具体项目工作区或夹了栞的照常观察，挂不回任何项目工作区的按默认不观察处理。"""
         from unittest import mock
@@ -1281,6 +1374,33 @@ class ListenTest(unittest.TestCase):
         self.assertTrue(listen.keep({"post_type": "message_sent", "message_type": "private", "user_id": 9,
                                      "target_id": 7}, g, {7}))
         self.assertFalse(listen.keep({"post_type": "message", "message_type": "private", "user_id": 8}, g, {7}))
+
+    def test_revive(self):
+        """连不上满 3 分钟才拉、拉过 15 分钟内不再拉；进程还在不拉；端口起来算登上；写了新二维码或等不到就关掉、要喊扫码。"""
+        from unittest import mock
+        from . import listen
+        self.assertFalse(listen.due(1000, None, 1179))
+        self.assertTrue(listen.due(1000, None, 1180))
+        self.assertFalse(listen.due(1000, 1200, 2000))
+        self.assertTrue(listen.due(1000, 1200, 2100))
+
+        def go(states):
+            seq, ended = iter(states), []
+            look = lambda *a: next(seq)
+            with mock.patch.object(listen.subprocess, "run") as run:
+                got = listen.revive("h", "t", "D", 3001, look=look, end=lambda *a: ended.append(1),
+                                    sleep=lambda s: None, wait=15)
+            return got, run.call_count, len(ended)
+        T0, OLD, NEW = "2026-11-24T12:00:00Z", "2026-11-23T17:00:00Z", "2026-11-24T12:00:09Z"
+        s = lambda qr=OLD, up=False, procs=0: {"now": T0, "qr": qr, "up": up, "procs": procs}
+        self.assertEqual(go([s(procs=5)]), (("协议端进程还在（5 个），不拉", False), 0, 0))
+        (what, scan), runs, ended = go([s(), s(procs=3), s(up=True, procs=5)])
+        self.assertEqual((scan, runs, ended), (False, 1, 0))
+        (what, scan), runs, ended = go([s(), s(procs=3), s(qr=NEW, procs=5)])
+        self.assertEqual((scan, ended), (True, 1))
+        self.assertIn("要扫码", what)
+        (what, scan), runs, ended = go([s(), s(procs=3), s(procs=3), s(procs=3)])
+        self.assertEqual((scan, ended), (True, 1))
 
     def test_ws(self):
         import socket
@@ -1659,3 +1779,15 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(guard, [1])                     # 用户原话保底留下
         self.assertEqual(len(reasons), 2)
         self.assertEqual(select.parse("全留", evs), ([], [], []))
+
+
+class MaskTest(unittest.TestCase):
+    def test_file_url(self):
+        """file:///home/… 的链接整条打码（2026-11-25：之前原样漏给了观察者），换回去不变。"""
+        from . import guard
+        m = guard.Mask()
+        text = "已将主仓库迁至 [zeron/](file:///home/u/proj/zeron/zeron/)，见 https://example.com/a 和 ~/proj/x.md"
+        out = m(text)
+        self.assertNotIn("/home/u", out)
+        self.assertIn("(url_A)", out)
+        self.assertEqual(m.restore(out), text)

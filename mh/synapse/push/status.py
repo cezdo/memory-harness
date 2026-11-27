@@ -118,20 +118,34 @@ def _worktrees(repo):
     return out
 
 
+# 常驻进程实际一直用着的代码（X9 2026-11-26）：三个循环每一轮在子进程里跑、载入当时的代码，常驻的只是锁、叫醒、休眠那一层；
+# 没列的服务按整个 mh/ 算
+RESIDENT = {f"memory-harness-{n}": ("mh/rhythm/__init__.py", "mh/__main__.py", "mh/engram/store") for n in ("observe", "form", "tidy")}
+
+
 def _services(names, repo=None):
     """都在跑、近几个小时没出错就压成一行；有异常的才单列（2026-10-24：只推异常）。
-    常驻循环不重新加载代码：起来以后 mh/ 又有提交的列一行（哪个进程跑哪一版代码原来没有东西报，方向探索第 3、4 轮各撞上一次）；
-    只比到 mh/ 整个目录，不分每个服务用哪几个文件。"""
+    常驻进程不重新加载代码：起来以后它用着的代码（RESIDENT，没列的按 mh/ 整个目录）又有提交的列一行
+    （哪个进程跑哪一版代码原来没有东西报，方向探索第 3、4 轮各撞上一次）。"""
     from ...rhythm import register
     ok, bad, behind = [], [], []
-    last = _run(["git", "log", "-1", "--format=%ct %h %cd", "--date=format-local:%m-%d %H:%M", "--", "mh"], repo).split(None, 2) if repo else []
+    lasts = {}
+
+    def last(paths):
+        if paths not in lasts:
+            lasts[paths] = _run(["git", "log", "-1", "--format=%ct %h %cd", "--date=format-local:%m-%d %H:%M", "--", *paths],
+                                repo).split(None, 2) if repo else []
+        return lasts[paths]
+    newest = None
     for s in names:
         st = register.state(s)
         if not st:
             continue
-        up = register.since(s) if st == "active" and len(last) == 3 else None
-        if up and up < int(last[0]):
+        lt = last(RESIDENT.get(s, ("mh",)))
+        up = register.since(s) if st == "active" and len(lt) == 3 else None
+        if up and up < int(lt[0]):
             behind.append(s.removeprefix("memory-harness-"))
+            newest = max(newest or lt, lt, key=lambda x: int(x[0]))
         errs = [x for x in register.lines(s, ERR_HOURS) if ERR.search(x[1])]
         short = s.removeprefix("memory-harness-")
         if st == "active" and not errs:
@@ -139,8 +153,51 @@ def _services(names, repo=None):
         else:
             bad.append(f"- {s}：{'在跑' if st == 'active' else st}" + (_errors(errs) if errs else ""))
     head = [f"- {'、'.join(ok)} {'都' if len(ok) > 1 else ''}在跑，近 {ERR_HOURS} 小时没有出错"] if ok else []
-    late = [f"- {'、'.join(behind)} 起来以后 `mh/` 又有提交（最新 {last[1]}，{last[2]}）：改到它用的代码就挑空档重启"] if behind else []
+    late = [f"- {'、'.join(behind)} 起来以后它常驻用着的代码又有提交（最新 {newest[1]}，{newest[2]}）：挑空档重启"] if behind else []
     return head + late + bad
+
+
+REMOTE_TIMEOUT = 30
+
+
+def services(names, repo=None, clients=None, ssh=None):
+    """服务一节（X7 2026-11-26：服务机和客户端分开以后，listen、reply、show、tend 留在客户端，本机看是 not-found）：
+    本机装着的照 _services；本机没装的经 ssh 去 [deploy.clients] 各台看，那台装着的那几行前面标上机器名；哪台都没装的照旧报 not-found。
+    取不回来的标一行，不静默。"""
+    from ...rhythm import register
+    from ...engram.store.instance import CLIENTS
+    clients = CLIENTS if clients is None else clients
+    here = [s for s in names if register.state(s) != "not-found"]
+    out, missing = _services(here, repo), [s for s in names if s not in here]
+    for host in clients:
+        if not missing:
+            break
+        try:
+            got = (ssh or _ssh_services)(host, missing)
+        except Exception as e:
+            out.append(f"- {host} 上的服务看不到：{_cut(str(e), 60)}")
+            continue
+        out += [f"- {host}：" + x.removeprefix("- ") for x in got["lines"]]
+        missing = [s for s in missing if s not in got["found"]]
+    return out + [f"- {s}：not-found" for s in missing]
+
+
+def _ssh_services(host, names):
+    """到客户端跑本模块的 services 命令 → {"found": 那台装着的, "lines": 那台编好的几行}。"""
+    import json
+    cmd = f"cd memory-harness && MH_NO_FORWARD=1 python3 -m mh.synapse.push.status services {' '.join(names)}"
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, cmd],
+                       capture_output=True, text=True, timeout=REMOTE_TIMEOUT)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip().splitlines() or [f"退出码 {r.returncode}"])[-1])
+    return json.loads(r.stdout)
+
+
+def _local_services(names):
+    """本机装着的那几个，编好服务行（客户端被服务机经 ssh 问时跑）。"""
+    from ...rhythm import register
+    found = [s for s in names if register.state(s) not in ("", "not-found")]
+    return {"found": found, "lines": _services(found, Path.home() / "memory-harness")}
 
 
 def _errors(lines):
@@ -175,7 +232,7 @@ def compile(ws, home=None):
     marks = _shiori(ws)
     if marks:
         parts += ["", "### 未落库（夹了栞、还没形成陈述；形成了就不再列）", *marks]
-    svc = _services(cfg["services"], repo)
+    svc = services(cfg["services"], repo)
     if svc:
         parts += ["", "### 服务", *svc]
     kernel = _kernel(repo)
@@ -191,13 +248,6 @@ def compile(ws, home=None):
         rb = runbook.section(ws, repo, cfg["runbook"], home)
         if rb:
             parts += ["", f"### runbook（`{cfg['runbook']}`）", *rb]
-    try:
-        from ...rhythm import explore      # 方向探索每周一轮的结果（2026-11-08）：写出来没人知道就又是一处静默
-        ex = explore.section(repo)
-    except Exception:
-        ex = []
-    if ex:
-        parts += ["", "### 方向探索（每周一轮，无人在场；结果页给你看，补丁等在场时落地）", *ex]
     try:
         from ...rhythm import self as own   # self 工作区（2026-11-08）：到点的便签、醒来留下的东西
         sf = own.section(repo)
@@ -393,3 +443,10 @@ def fallback(ws, conn=None):
 def workspaces():
     """有手写部分的工作区。"""
     return sorted(p.stem for p in SOURCES.glob("*.md"))
+
+
+if __name__ == "__main__":       # python3 -m mh.synapse.push.status services <名字…>：服务机经 ssh 来问本机装着的服务（X7）
+    import json
+    import sys
+    if sys.argv[1:2] == ["services"]:
+        print(json.dumps(_local_services(sys.argv[2:]), ensure_ascii=False))

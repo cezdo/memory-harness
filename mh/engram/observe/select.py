@@ -19,7 +19,7 @@ from ..store import instance
 from ... import express
 
 PROMPTS = {"mh 发展史": "select-view-v0.1"}     # 视角 → 提示词（提示词里写着这个视角要什么；别的视角从原文重读，不在这里筛）
-MODEL = ("gpt-6.1-sol", "low")
+MODEL = ("gpt-6.2-sol", "low")
 USER_CUT = 400                                  # 用户原话超过这么多字截断（转贴的长文本只要知道转了什么）
 NEW_SCALES = ("turns", "segment")
 _DROP = re.compile(r"E(\d+)")
@@ -35,7 +35,7 @@ def operator(conn, view):
     body = (_dir() / f"{name}.md").read_bytes()
     iso = getattr(model(), "isolation", "") or NA
     params = {"view": view, "user_cut": USER_CUT, "guard": "出处有用户原话的留下", "expression": express.signature()}
-    full = f"sol-low/{name}.{iso}-{hashlib.sha256(body + iso.encode() + dumps(params).encode()).hexdigest()[:8]}"
+    full = f"sol62-low/{name}.{iso}-{hashlib.sha256(body + iso.encode() + dumps(params).encode()).hexdigest()[:8]}"
     oid = register(conn, full, "observe", "observer", model=MODEL[0], prompt=name, prompt_hash=hashlib.sha256(body).hexdigest()[:16],
                    isolation=iso, window="session", params=params)
     conn.commit()                    # 登记完就提交：后面算 todo 要读很久，不能带着写事务（11-11 撞锁，form 报 database is locked）
@@ -56,11 +56,17 @@ def considered(conn, op_id):
     return out
 
 
-def _events(conn, source, session):
-    """这段会话交给 form 的 E（不看暂停的撤下：筛的正是暂停着的来源），去掉被取代、退场、已收回的。"""
+def _context(conn):
+    """_events 要的全库部分：被取代、退场、已收回的 E。和会话无关，一批里只算一次（2026-11-26：todo 按会话每段都重算，
+    form 每轮的 units 经 pending 走到这里，30 段会话 18 秒，占 form 每轮 CPU 的近一半）。"""
     from .. import observe
-    ctx = {"hidden": observe.superseded(conn) | observe.fast_retired(conn) | observe.pruned(conn), "marks": {}}
-    return [e for e in observe.frame(conn, source, session, ctx=ctx)["events"]
+    return {"hidden": observe.superseded(conn) | observe.fast_retired(conn) | observe.pruned(conn), "marks": {}}
+
+
+def _events(conn, source, session, ctx=None):
+    """这段会话交给 form 的 E（不看暂停的撤下：筛的正是暂停着的来源），去掉被取代、退场、已收回的。ctx：_context 先算好的。"""
+    from .. import observe
+    return [e for e in observe.frame(conn, source, session, ctx=ctx or _context(conn))["events"]
             if e["scale"] in NEW_SCALES and e.get("step") != "correct"]
 
 
@@ -71,7 +77,7 @@ def todo(conn, paused=False):
     if not instance.VIEWS:
         return {}
     waiting = {(p["source"], p["session"]) for p in observe.progress(conn) if p["state"] in observe.TO_OBSERVE}
-    out = {}
+    out, ctx = {}, None
     for source, view in instance.VIEWS.items():
         if view not in PROMPTS or source in instance.PAUSE_SOURCES and not paused:
             continue
@@ -80,7 +86,8 @@ def todo(conn, paused=False):
         for (session,) in conn.execute("SELECT session FROM session_detail WHERE source=?", (source,)):
             if (source, session) in waiting:
                 continue
-            new = [e for e in _events(conn, source, session) if e["id"] not in seen]
+            ctx = ctx or _context(conn)
+            new = [e for e in _events(conn, source, session, ctx) if e["id"] not in seen]
             if new:
                 out[(source, session)] = (view, new)
     return out
@@ -144,10 +151,9 @@ def run_one(conn, key, view, events, m=None, cause="new_text"):
     seconds = meta.pop("seconds", None)
     act = occurrence(conn, "act", op_id, started=started, ended=st.now(), scale="session", inputs={"event": drop},
                      cause=cause, outcome=result, error=err, cost=cost(seconds, st.usage_rows(meta.get("usage"))))
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "observe", "prune", dumps({"session": [source, session]}), text, output,
-                  dumps({"reason": f"视角：{view}", "view": view, "considered": [e["id"] for e in events], "reasons": reasons,
-                         "kept_by_guard": guard, "events": len(events), "model": meta.get("model")})))
+    st.write_act(conn, act, "observe", "prune", dumps({"session": [source, session]}), text, output,
+                 dumps({"reason": f"视角：{view}", "view": view, "considered": [e["id"] for e in events], "reasons": reasons,
+                        "kept_by_guard": guard, "events": len(events), "model": meta.get("model")}))
     conn.commit()
     return result, (f"{len(events)} 条 E，收回 {len(drop)}（保底留下 {len(guard)}）" if result == "ok" else f"{result}：{(err or '')[:160]}")
 

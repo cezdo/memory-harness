@@ -10,7 +10,7 @@ from .instance import USER_NAME
 
 OCC_KINDS = ("turn", "session", "act", "use", "request", "deletion")
 CLAIMS = ("event", "form_record", "judgment", "session_entry", "topic_line", "attachment", "cognition")
-DETAILS = ("session_detail", "turn_detail", "act_detail", "use_detail", "request_detail")
+DETAILS = ("session_detail", "turn_detail", "act_detail", "act_io", "use_detail", "request_detail")
 
 
 def footprint(conn, sessions):
@@ -45,6 +45,9 @@ def footprint(conn, sessions):
         marks = ",".join(map(str, occ)) or "NULL"
         for t in CLAIMS:
             new = {r[0] for r in conn.execute(f"SELECT id FROM {t} WHERE born IN ({marks})")}
+            if t == "topic_line":           # 删掉的会话起的线，别的会话的话题还挂着就留下（11-10 删无头会话时 L15 带走了 3 个巡检话题）
+                new -= {r[0] for r in conn.execute("SELECT line, entry, born FROM attachment")
+                        if r[0] in new and r[1] not in claims["session_entry"] and r[2] not in occ}
             if t == "attachment":           # 挂在删掉的话题、线上的挂线（可能由别的 act 写）
                 new |= {r[0] for r in conn.execute("SELECT id, entry, line FROM attachment")
                         if r[1] in claims["session_entry"] or r[2] in claims["topic_line"]}

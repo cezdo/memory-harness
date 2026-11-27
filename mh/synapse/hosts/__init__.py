@@ -5,8 +5,30 @@
 - 这里：认出宿主注入的轮次（不是用户在说话），记下是哪类宿主事件。
 """
 import re
+import sys
+from pathlib import Path
 
-HOST = (("<task-notification", "后台任务"), ("<command-", "命令"), ("<local-command", "命令输出"), ("<bash-", "shell"),
+
+def python():
+    """宿主配置里写的解释器：macOS 上 Homebrew 的 python@3.12（系统的 /usr/bin/python3 是 3.9），别处 /usr/bin/python3。"""
+    brew = Path("/opt/homebrew/opt/python@3.12/bin/python3.12")
+    return str(brew) if sys.platform == "darwin" and brew.exists() else "/usr/bin/python3"
+
+
+def relay():
+    """mh-relay（X10，design/synapse“常驻服务和 relay”）：工具根下 relay/mh-relay，`mh.deploy install server` 编好放在那；没有给 None。"""
+    from ...engram.store.instance import TOOLS
+    p = TOOLS / "relay" / "mh-relay"
+    return p if p.is_file() else None
+
+
+def mcp_command(cmd):
+    """宿主配置里 MCP 的命令：装了 relay 就在前面加 `mh-relay --`（连上常驻服务就转过去，连不上 exec 原命令），没装原样。"""
+    r = relay()
+    return [str(r), "--", *cmd] if r else list(cmd)
+
+
+HOST =(("<task-notification", "后台任务"), ("<command-", "命令"), ("<local-command", "命令输出"), ("<bash-", "shell"),
         ("This session is being continued", "压缩总结"), ("[Request interrupted", "打断"), ("Caveat:", "命令输出"),
         # Orca 重启后自动发来的固定续接提示（2026-11-06）：宿主记成用户消息，不是用户在说话
         ("Orca restarted, which stopped what you were doing", "Orca 重启续接"),

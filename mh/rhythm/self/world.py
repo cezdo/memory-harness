@@ -21,13 +21,10 @@ def alive(pid):
         return False
     try:                                    # 自己的子进程：收掉已经退出的，免得僵尸算活着
         return os.waitpid(pid, os.WNOHANG) == (0, 0)
-    except ChildProcessError:               # 整理循环重启过：不是自己的子进程了，按 /proc 认，pid 被复用的不算
-        try:
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
-            return (any(name in cmd for name in (b"claude", b"codex"))
-                    and "zombie" not in Path(f"/proc/{pid}/status").read_text().lower())
-        except OSError:
-            return False
+    except ChildProcessError:               # 整理循环重启过：不是自己的子进程了，按 ps 认（Linux、macOS 都有），pid 被复用的不算
+        out = _run(["ps", "-o", "stat=,command=", "-p", str(pid)], None)
+        stat, _, cmd = out.strip().partition(" ")
+        return bool(out) and not stat.startswith("Z") and any(name in cmd for name in ("claude", "codex"))
 
 
 def busy():
@@ -44,13 +41,15 @@ def busy():
 
 
 def _services():
-    names = _run(["systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", "memory-harness-*"], None).split("\n")
+    """装着的 mh 常驻服务 → “状态 起于 时刻”。平台差异在 register（systemd / launchd）。"""
+    from .. import register
     out = {}
-    for line in names:
-        name = line.split()[0] if line.strip() else ""
-        if name.endswith(".service"):
-            out[name] = _run(["systemctl", "--user", "show", name, "-p", "ActiveState", "-p", "ActiveEnterTimestamp", "--value"],
-                             None).replace("\n", " ")
+    for name in register.ALL:
+        st = register.state(name)
+        if st in ("not-found", ""):
+            continue
+        t = register.since(name)
+        out[name] = st + (f" 起于 {datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S}" if t else "")
     return out
 
 
@@ -84,7 +83,8 @@ def world(now=None):
              "- 分支：" + "、".join(_run(["git", "branch", "--format=%(refname:short)"]).split()),
              "- worktree：" + "；".join(" ".join(x.split()) for x in _run(["git", "worktree", "list"]).splitlines()),
              f"- 已跟踪文件没提交的改动：{len(dirty)} 个" + ("（" + "、".join(x[3:] for x in dirty[:10]) + "）" if dirty else "")]
-    lines.append("- 常驻服务（systemd 用户级）：")
+    from ..register import PLATFORM
+    lines.append(f"- 常驻服务（{'systemd 用户级' if PLATFORM == 'systemd' else 'launchd LaunchAgent'}）：")
     lines += [f"  - {n}：{v}" for n, v in _services().items()]
     lines.append("- 进程（mh、宿主；宿主持有的 MCP 吃的是它起来那一刻的代码）：")
     lines += [f"  - {pid} 起于 {when:%m-%d %H:%M}：`{cmd}`" for pid, when, cmd in _processes()]

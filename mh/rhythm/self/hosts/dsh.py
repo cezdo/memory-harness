@@ -146,7 +146,7 @@ def launch(root, text, session, resumed, logs):
     if resumed and session:
         args += ["--session-id", session]          # 续接：adopt 这段已有的会话
     args += ["--permission-mode", "danger-full-access", "--approval-policy", "never"]
-    env = dict(os.environ, DSH_HOME=str(h))
+    env = confine.env(dict(os.environ, DSH_HOME=str(h)), logs)
     for key in ("DSH_SESSION_ID", "DSH_PROFILE", "DSH_PROFILE_DIR", "DSH_WEB_URL", "DSH_SHELL"):
         env.pop(key, None)
     with open(text) as stdin, (logs / "run.jsonl").open("w") as out, (logs / "run.err").open("w") as err:

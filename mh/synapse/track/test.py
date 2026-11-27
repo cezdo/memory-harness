@@ -208,6 +208,26 @@ from .. import track
 
 
 class ExpressionDeliveryTest(unittest.TestCase):
+    def test_host_fallback_and_sessionless_push(self):
+        c = st.connect(":memory:")
+        self.addCleanup(c.close)
+        track.use(c, "test", "roam", {}, "", {}, session="fresh", host="agy", meta={"host": "codex"})
+        track.deliver(c, "test", "assist", {}, "手记", {}, channel="push", meta={"host": "agy"})
+        track.use(c, "test", "roam", {}, "", {})
+        op = st.operator(c, "collector-test", "observe", "collector")
+        sid = st.occurrence(c, "session", op)
+        c.execute("INSERT INTO session_detail VALUES(?,?,?,?,?,?,?,?,?)",
+                  (sid, "claude", "collected", st.UNKNOWN, "user", st.NA, "/w", st.UNKNOWN, st.UNKNOWN))
+        track.use(c, "test", "roam", {}, "", {}, session="collected", host="agy")
+        rows = c.execute("SELECT d.host, d.purpose, o.cause, o.parent FROM use_detail d "
+                         "JOIN occurrence o ON o.id=d.occurrence ORDER BY o.id")
+        self.assertEqual([tuple(r) for r in rows], [
+            ("agy", "interactive", "conversation", st.NA),
+            ("agy", "interactive", "conversation", st.NA),
+            (st.UNKNOWN, "dev", "manual", st.NA),
+            ("claude", "interactive", "conversation", sid),
+        ])
+
     def test_delivery_evidence_and_presentation_feedback(self):
         with tempfile.TemporaryDirectory() as d:
             c = st.connect(Path(d) / 'db.sqlite')

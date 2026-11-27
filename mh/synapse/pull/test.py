@@ -37,8 +37,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         op = st.operator(self.conn, "legacy/form-test", "form", "former", legacy=True)
         sess = self.conn.execute("SELECT occurrence FROM session_detail WHERE session=?", (session,)).fetchone()[0]
         act = st.occurrence(self.conn, "act", op, started="2026-10-18T00:00:00Z", scale="session", outcome="ok")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                          (act, "form", "pack", json.dumps({"session": sess, "ordinals": [0, 1]}), "", "", "{}"))
+        st.write_act(self.conn, act, "form", "pack", json.dumps({"session": sess, "ordinals": [0, 1]}), "", "", "{}")
         rec = self.conn.execute("INSERT INTO form_record(born, idx, kind, text, refs, labels, structures, unresolved) "
                                 "VALUES(?,?,?,?,?,?,?,?)", (act, 0, "session", f"旧的陈述：{U}说先备份。", "{}", '["S1"]', "{}", "[]")).lastrowid
         jid = 900
@@ -275,7 +274,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             op = st.operator(self.conn, "test/preview", "observe", "previewer")
             occ = st.occurrence(self.conn, "act", op, started="2026-10-17T09:00:00Z", scale="session", outcome="ok")
             meta = {"reads": [{"from": 1, "to": 2, "type": "升级方案确认。", "turns": [turn]}]}
-            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (occ, "observe", "preview", "{}", "", "", json.dumps(meta)))
+            st.write_act(self.conn, occ, "observe", "preview", "{}", "", "", json.dumps(meta))
             self.conn.commit()
             text = pull.show_node(L, nid, None, self.conn)[0]
             self.assertIn("先给这段对话的结构", text)                  # 有 form 写的结构：结构在前（v0.38）
@@ -489,7 +488,7 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
         L.nodes["k-root"] = {"kind": "node", "name": "W", "parent": "", "ws": "w"}
         L.nodes["L1"]["parent"] = "k-root"
         L.kids["k-root"].append("L1")
-        text = pull.roam(self.conn, "w", **self.kw)
+        text = "".join(pull.roam(self.conn, "w", page=p, **self.kw) for p in (1, 2))   # 同层还有设计目录的骨架节点，多了会翻到第二页
         self.assertIn("- L1 X 升级", text)
         self.assertNotIn("k-root", text)
 
@@ -529,11 +528,11 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
             push.hook(self.conn, {"session_id": "dsh-1", "cwd": "/w", "host": "dsh"})   # 别的宿主不记
         self.assertEqual(claude.current(me), "new")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "old"}), mock.patch.object(os, "getppid", lambda: me):
-            self.assertEqual(mcp._session({}), "new")
+            self.assertEqual(mcp._session({}, "claude"), "new")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "old"}), mock.patch.object(os, "getppid", lambda: 999999999):
-            self.assertEqual(mcp._session({}), "old")                           # 没记过：照旧用环境变量
+            self.assertEqual(mcp._session({}, "claude"), "old")                 # 没记过：照旧用环境变量
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
-            self.assertEqual(mcp._session({"session": "s"}), "s")              # 不是 Claude Code：经参数给
+            self.assertEqual(mcp._session({"session": "s"}, "dsh"), "s")       # 不是 Claude Code：经参数给
         claude.bind("x", pid=999999999)                                         # 进程已经不在的记录，下次写时删掉
         claude.bind("new", pid=me)
         self.assertFalse((claude.RUN / "999999999").exists())
@@ -747,6 +746,42 @@ class PullTest(ft.FormTest):              # 借 form 测试造数据的办法；
                                         "params": {"name": "evoke", "arguments": {"words": ["X 升级"], "grain": "L", "session": "t"}}})["result"]
         self.assertTrue(hidden["isError"])                          # 真带了照常报参数不对
         self.assertIn("没有参数 grain", hidden["content"][0]["text"])
+
+    def test_mcp_records_host_before_collect(self):
+        import os
+        from unittest.mock import patch
+        cases = [("evoke", {"words": ["升级"]}), ("relive", {"handles": ["T1"]}),
+                 ("roam", {}), ("roam", {"node": "T1"})]
+        with patch.dict(os.environ, {"MH_HOST": "agy", "MH_HOME": str(self.dir), "CLAUDE_CODE_SESSION_ID": "outer"}):
+            for name, args in cases:
+                with self.subTest(name=name, args=args):
+                    mcp.call(self.conn, name, dict(args, session="fresh", cwd="/w"))
+                    row = self.conn.execute("SELECT * FROM use_detail ORDER BY occurrence DESC LIMIT 1").fetchone()
+                    self.assertEqual((row["host"], row["session"], row["purpose"]), ("agy", "fresh", "interactive"))
+            mcp.call(self.conn, "roam", {"session": "dsh-fresh", "host": "dsh"})
+            self.assertEqual(self.conn.execute("SELECT host FROM use_detail WHERE session='dsh-fresh'").fetchone()[0], "dsh")
+
+    def test_mcp_connection_context(self):
+        """常驻服务（2026-11-26 试 relay）：每条连接按 relay 报的环境变量、cwd、父进程号认宿主和会话，不看服务进程自己的环境。"""
+        import contextvars
+        import os
+        from unittest.mock import patch
+        ctx = {"env": {"CLAUDE_CODE_SESSION_ID": "from-relay"}, "cwd": "/w/relay", "ppid": 1}
+
+        def job():
+            mcp._CTX.set(ctx)
+            mcp.call(self.conn, "roam", {})
+        with patch.dict(os.environ, {"MH_HOME": str(self.dir), "CLAUDE_CODE_SESSION_ID": "daemon-own", "MH_HOST": "codex"}):
+            contextvars.copy_context().run(job)
+        row = self.conn.execute("SELECT * FROM use_detail ORDER BY occurrence DESC LIMIT 1").fetchone()
+        self.assertEqual((row["host"], row["session"], row["cwd"]), ("claude", "from-relay", "/w/relay"))
+
+    def test_mcp_relay_hello(self):
+        """relay 报的那行（X10）：只留认人的几个变量；codex、agy 从 Claude 会话里起时，漏进来的 Claude 会话号不算。"""
+        ctx = mcp._context({"env": {"CLAUDE_CODE_SESSION_ID": "outer", "MH_HOST": "codex", "PATH": "/x"}, "cwd": "/w", "ppid": 7})
+        self.assertEqual(ctx, {"env": {"MH_HOST": "codex"}, "cwd": "/w", "ppid": 7})
+        ctx = mcp._context({"env": {"CLAUDE_CODE_SESSION_ID": "s1"}})
+        self.assertEqual(ctx, {"env": {"CLAUDE_CODE_SESSION_ID": "s1"}, "cwd": "", "ppid": 0})
 
     def test_mcp_unplugged(self):
         """不接 mh 的目录（[connect].unplugged，2026-11-14）：在那里起的服务不给工具；按参数带的 cwd 调用也不查、不留足迹。"""

@@ -126,7 +126,7 @@ class FormTest(unittest.TestCase):
         label2 = "名字：X 升级\n停在：回退也加了（陈述1）\n索引词：\n- 回退｜rollback\n- X 升级｜X 的升级\n"
         fakes = self._fakes([pack2], [label2], [])
         self._run(fakes)
-        text = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        text = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("## 这段会话原来的会话入口", text)
         self.assertIn("（续上：", text)
         self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='attach'").fetchone()[0], 1)
@@ -154,7 +154,7 @@ class FormTest(unittest.TestCase):
         me = st.main_operator(self.conn, "m")                                                   # 主会话看过：改挂到同一条线，标记就清掉
         form.feedback_attach(self.conn, me, 3, "带着新内容看过了，挂得对", line="L1")
         self.assertEqual(form.entries(self.conn)["T3"]["review"], "")
-        text = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        text = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("（重新整理：", text)
         self.assertIn(["回退", "rollback"], form.entries(self.conn)["T3"]["words"]["lists"])   # 续上部分的词没丢
 
@@ -181,7 +181,7 @@ class FormTest(unittest.TestCase):
         c = u["events"][0]["id"]
         self._run(self._fakes(["名字：X 加回退\n主题：加回退\n### 陈述1\n{U}要加「回退」。\n来源：E{}\n".replace("{U}", U).format(c)],
                               ["名字：X 加回退\n停在：回退加了（陈述1）\n索引词：\n- 回退\n"], ["挂到：L1｜为什么：同一个目标"]))
-        text = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        text = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("## 这段对话的前 2 轮", text)
         self.assertIn(f"{U}想把「甲服务」升到新版本", text)                  # s1 记录里关于共用轮次的陈述
         self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='attach'").fetchone()[0], 2)   # 挂线照常
@@ -210,7 +210,7 @@ class FormTest(unittest.TestCase):
                                "ORDER BY o.id DESC").fetchone()
         self.assertEqual((pk["cause"], json.loads(pk["inputs"])["request"], pk["predecessor"]), ("request", [rid], old_packs[0]))
         self.assertEqual(st.requests(self.conn, "form"), [])                  # 认领过了
-        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        lab = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertNotIn("## 这段会话原来的会话入口", lab)                      # 下游跟着重做，不接原来的入口
         self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='attach'").fetchone()[0], 2)
         (e,) = form.entries(self.conn).values()                               # 一段会话一个入口，挂在原来那条线上
@@ -242,7 +242,7 @@ class FormTest(unittest.TestCase):
         # 认领以后从 pack 起重做，但接原来的入口、沿用挂线（2026-10-21：L 一级要有明确的接续）
         lines_before = {x["parent"] for x in form.entries(self.conn).values()}
         self._run(self._fakes([merged], [LABEL], []))                          # 不调 attach
-        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        lab = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("## 这段会话原来的会话入口", lab)
         self.assertEqual({x["parent"] for x in form.entries(self.conn).values()}, lines_before)
         self.assertEqual(self.conn.execute("SELECT count(*) FROM act_detail WHERE step='attach'").fetchone()[0], 2)
@@ -259,8 +259,8 @@ class FormTest(unittest.TestCase):
         obs = st.operator(self.conn, "observe-test", "observe", "observer")
         t = self.conn.execute("SELECT turn FROM event WHERE id=?", (a[0],)).fetchone()[0]
         act = st.occurrence(self.conn, "act", obs, outcome="ok", inputs={"turn": [t], "event": [a[0], a[1]]})
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "observe", "correct", st.dumps({"turns": [t]}), "", "",
-                                                                           st.dumps({"invalid": [a[1]]})))
+        st.write_act(self.conn, act, "observe", "correct", st.dumps({"turns": [t]}), "", "",
+                                                                           st.dumps({"invalid": [a[1]]}))
         new = self.conn.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved, relations) "
                                 "VALUES(?,0,?,'我想把「甲服务」升到新版本。','?unknown','','?unknown','[]','[]',?)",
                                 (act, t, st.dumps([{"kind": "supersedes", "to": a[0]}]))).lastrowid
@@ -343,7 +343,7 @@ class FormTest(unittest.TestCase):
         c = self._more("s1", "2026-10-17T08:00:00Z")
         pack2 = "名字：X 升级\n主题：加回退\n### 陈述1\n{U}要加「回退」。\n来源：E{c}\n".replace("{U}", U).format(c=c[0])
         self._run(self._fakes([pack2], ["名字：X 升级：先定做法\n停在：回退也加了（陈述1）\n索引词：\n- 回退\n"], []))
-        text = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        text = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("X 升级：先定做法", text)                               # 续上看到的是反馈写的入口
         msg = form.feedback(self.conn, me, "s-" + max(form.entries(self.conn), key=lambda k: int(k[1:]))[1:], "停在写偏了", stops=["定下按 b 做法升级（陈述1、陈述2）"])   # 工具的入口
         self.assertTrue(msg.startswith("反馈已写：T"))                       # 旧写法 s-… 也认，写回 T…
@@ -374,10 +374,10 @@ class FormTest(unittest.TestCase):
         self.assertEqual(len(got), 1)
         act, items = next(iter(got.values()))
         self.assertTrue(items)
-        d = json.loads(self.conn.execute("SELECT output FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0])
+        d = json.loads(st.zunpack(self.conn.execute("SELECT output FROM act_io WHERE occurrence=?", (act,)).fetchone()[0]))
         self.assertEqual(d["nodes"][1]["from"], [1])                                    # 9 越界
         self.assertEqual([e["to"] for e in d["edges"]], ["Q1"])                          # 指向 Q9 的边去掉
-        self.assertIn("陈述1：", self.conn.execute("SELECT input FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0])
+        self.assertIn("陈述1：", st.zunpack(self.conn.execute("SELECT input FROM act_io WHERE occurrence=?", (act,)).fetchone()[0]))
         self._run(self._fakes())
         self.assertEqual(form.structures(self.conn), got)                               # 陈述没变：不重做
         self.assertEqual(structure.parse("不是 JSON", 3), (None, "没有 JSON"))
@@ -529,7 +529,7 @@ class FormTest(unittest.TestCase):
         self.assertNotEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], old_line)
         state = form.relabel(self.conn, "dsh", "s1", int(str(t_old).lstrip("T")), model=FakeModel([LABEL]), log=io.StringIO())
         self.assertIn("X 升级", state)
-        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        lab = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("## 这段会话原来的会话入口", lab)                           # 模型看得到旧入口
         self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], old_line)
 
@@ -585,7 +585,7 @@ class FormTest(unittest.TestCase):
         self.assertEqual(e["name"], "X 升级与回退演练")
         self.assertEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
         self.assertEqual((self._acts("pack"), self._acts("label"), self._acts("attach")), (1, 2, 1))
-        lab = self.conn.execute("SELECT input FROM act_detail WHERE step='label' ORDER BY occurrence DESC").fetchone()[0]
+        lab = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='label' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("原来的入口被指出的问题", lab)
         self.assertIn("名字太泛", lab)
         self.assertEqual(st.requests(self.conn, "form", "open"), [])       # 认领了
@@ -602,7 +602,7 @@ class FormTest(unittest.TestCase):
         self.assertEqual(form.entries(self.conn)["T1"]["name"], "X 升级")
         self.assertNotEqual(self.conn.execute("SELECT line FROM attachment ORDER BY id DESC").fetchone()[0], line)
         self.assertEqual((self._acts("pack"), self._acts("label"), self._acts("attach")), (1, 1, 2))
-        att = self.conn.execute("SELECT input FROM act_detail WHERE step='attach_lines' OR step='attach' ORDER BY occurrence DESC").fetchone()[0]
+        att = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='attach_lines' OR a.step='attach' ORDER BY a.occurrence DESC").fetchone()[0])
         self.assertIn("有人指出不对：线名起窄了", att)
         self.assertIn(f"L{line}", att)
         self.assertEqual(st.requests(self.conn, "form", "open"), [])
@@ -650,7 +650,7 @@ class FormTest(unittest.TestCase):
         steps = [r[0] for r in self.conn.execute("SELECT a.step FROM act_detail a WHERE a.process='form' ORDER BY a.occurrence")]
         self.assertEqual(steps, ["pack", "pack", "induce", "induce", "label", "label", "attach", "attach", "structure", "structure"])
         import hashlib
-        for r in self.conn.execute("SELECT input,meta FROM act_detail WHERE process='form'"):
+        for r in [{"input": st.zunpack(x[0]), "meta": x[1]} for x in self.conn.execute("SELECT io.input, a.meta FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.process='form'")]:
             ex = json.loads(r['meta'])['expression']
             self.assertEqual(ex['text_hash'], hashlib.sha256(r['input'].encode()).hexdigest())
             self.assertEqual(ex['user_name'], U)
@@ -687,7 +687,7 @@ class FormTest(unittest.TestCase):
         self.assertIn(["X 升级", "升级 X"], p["L1"]["words"]["lists"])     # 两个子会话入口都有的组进了线的索引词
         self.assertIn(["甲服务"], p["T1"]["words"]["lists"])                    # 程序补的「」词（两条陈述里都有）
         # 写进的文件附在第 2 轮后面（dsh 的假记录没有写文件，这里只看输入里有事件）
-        first = self.conn.execute("SELECT input FROM act_detail WHERE step='pack' ORDER BY occurrence").fetchone()[0]
+        first = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='pack' ORDER BY a.occurrence").fetchone()[0])
         self.assertIn(f"[E{a[0]}]", first)
         self.assertIn("## 第 2 轮", first)
 
@@ -994,8 +994,8 @@ class FormTest(unittest.TestCase):
         with mock.patch.object(form, "crossed", lambda conn, u: touched[u["unit"][1]]):
             self._run(self._fakes([PACK.format(a=b[0], b=b[1]), PACK.format(a=c[0], b=c[1])], [LABEL, LABEL],
                                   ["挂到：L1｜为什么：同一次升级", "挂到：L1｜为什么：同一次升级", "挂到：新线 Y｜为什么：新的"]))
-        rows = self.conn.execute("SELECT o.outcome, a.input FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
-                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()
+        rows = [(r[0], st.zunpack(r[1])) for r in self.conn.execute("SELECT o.outcome, io.input FROM occurrence o JOIN act_detail a ON a.occurrence=o.id JOIN act_io io ON io.occurrence=a.occurrence "
+                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()]
         self.assertEqual([r[0] for r in rows], ["ok", "ok", "content_error"])           # 出错的下一批再试
         self.assertIn("工作区：在 proj 开的；工具调用里碰过的路径（程序数的，不分读写）：other 5 处、proj 2 处", rows[1][1])
         self.assertNotIn("工作区：", rows[2][1])                                   # other 只碰过 1 处：不进范围，也不写线索
@@ -1021,8 +1021,8 @@ class FormTest(unittest.TestCase):
         lines = {r["id"]: (r["name"], r["workspace"]) for r in self.conn.execute("SELECT * FROM topic_line")}
         got = [lines[r[0]] for r in self.conn.execute("SELECT line FROM attachment ORDER BY id")]
         self.assertEqual(got, [("X 升级", "other"), ("runbook稿", "self"), ("runbook稿", "self"), ("自己想的", "self")])
-        rows = self.conn.execute("SELECT o.outcome, a.input, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id "
-                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()
+        rows = [(r[0], st.zunpack(r[1]), r[2]) for r in self.conn.execute("SELECT o.outcome, io.input, a.meta FROM occurrence o JOIN act_detail a ON a.occurrence=o.id JOIN act_io io ON io.occurrence=a.occurrence "
+                                 "WHERE a.step='attach' ORDER BY o.id").fetchall()]
         self.assertEqual([r[0] for r in rows], ["ok", "ok", "ok", "content_error", "ok"])     # s4 挂 L1（other 的）不收
         self.assertEqual(json.loads(rows[1][2])["self_note"], "runbook稿")
         self.assertEqual(rows[1][1], "")                                                    # 程序挂的：没有给模型的输入
@@ -1055,7 +1055,7 @@ class FormTest(unittest.TestCase):
             self._run(fakes)
             line = self.conn.execute("SELECT * FROM topic_line").fetchone()
             self.assertEqual((line["workspace"], line["node"]), ("proj", "engram/form"))
-            text = self.conn.execute("SELECT input FROM act_detail WHERE step='attach'").fetchone()[0]
+            text = st.zunpack(self.conn.execute("SELECT io.input FROM act_detail a JOIN act_io io ON io.occurrence=a.occurrence WHERE a.step='attach'").fetchone()[0])
             self.assertIn("[k-engram-form] form", text)
             self.assertEqual(form.pool(self.conn)["L1"]["parent"], "k-engram-form")
             b = self._session("s2", "2026-10-17T09:00:00Z", cwd="/home/u/proj")
@@ -1182,7 +1182,7 @@ class FileSkeletonTest(unittest.TestCase):
 
     def line(self, ws="proj"):
         aid = st.occurrence(self.conn, "act", self.op, started=st.now(), ended=st.now(), outcome="ok")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (aid, "form", "feedback", "{}", "", "", "{}"))
+        st.write_act(self.conn, aid, "form", "feedback", "{}", "", "", "{}")
         return self.conn.execute('INSERT INTO topic_line(born,name,workspace,node,parent,"from") VALUES(?,?,?,?,?,?)',
                                  (aid, "检查工具", ws, st.NA, st.NA, "[]")).lastrowid
 
@@ -1364,3 +1364,30 @@ class ExpressionOperatorTest(unittest.TestCase):
             self.assertEqual(register.call_args.kwargs['params']['expression'], express.signature())
             with patch('mh.express.VERSION', 'test-next'):
                 self.assertNotEqual(a, module.operator(None, step)[1])
+
+
+class TreeTest(unittest.TestCase):
+    def test_lines_and_workspaces(self):
+        from . import tree
+        pool = {
+            "k-root": {"kind": "node", "ws": "proj", "name": "Root", "parent": None},
+            "k-sub": {"kind": "node", "ws": "proj", "name": "Sub", "parent": "k-root"},
+            "L1": {"kind": "line", "ws": "proj", "name": "线一", "parent": "k-sub", "date": "2026-11-10"},
+            "L2": {"kind": "line", "ws": "proj", "name": "旧线", "parent": "k-sub", "retired": True, "date": "2026-11-01"},
+            "T1": {"kind": "entry", "name": "话题一", "topic": "一段很长的主题说明", "parent": "L1", "date": "2026-11-10"},
+            "T2": {"kind": "entry", "name": "话题二", "topic": "第二条", "parent": "L1", "date": "2026-11-12"},
+            "L9": {"kind": "line", "ws": "other", "name": "别的", "parent": None, "date": "2026-11-05"},
+            "T9": {"kind": "entry", "name": "别的话题", "topic": "other", "parent": "L9", "date": "2026-11-05"},
+        }
+        self.assertEqual(tree.workspaces(pool), [("proj", 1, 2), ("other", 1, 1)])
+        full = tree.lines(pool, "proj")
+        self.assertEqual(full, [
+            "k-root 【Root】",
+            "  k-sub 【Sub】",
+            "    L1 【线一】 (2)",
+            "      T1 11-10 话题一 | 一段很长的主题说明",
+            "      T2 11-12 话题二 | 第二条",
+        ])
+        short = tree.lines(pool, "proj", short=True)
+        self.assertEqual(short[-1], "      T2 11-12 话题二")
+

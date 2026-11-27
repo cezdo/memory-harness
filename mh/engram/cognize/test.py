@@ -23,8 +23,7 @@ class CognizeTest(unittest.TestCase):
         self.act = st.occurrence(self.conn, "act", op, cause="manual", outcome="ok")
         self.me = st.main_operator(self.conn, "test")
         self.pack = st.occurrence(self.conn, "act", op, cause="manual", outcome="ok")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                          (self.pack, "form", "pack", json.dumps({"unit": ["claude", "s1", 1]}), "", "", "{}"))
+        st.write_act(self.conn, self.pack, "form", "pack", json.dumps({"unit": ["claude", "s1", 1]}), "", "", "{}")
         self.recs = [self.record(i) for i in range(3)]
         self.entry = self.conn.execute(
             "INSERT INTO session_entry(born, record, source, session, name, topic, stops, words, unresolved) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -129,8 +128,7 @@ class CognizeTest(unittest.TestCase):
         self.assertEqual(cognize.pin(self.conn, "form_record", new)["seq"], 2)
         op = st.operator(self.conn, "restate-test", "form", "restater")
         withdraw = st.occurrence(self.conn, "act", op, cause="manual", outcome="ok")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                          (withdraw, "form", "restate", "{}", "", "", json.dumps({"withdrawn": {str(self.recs[0]): "不对"}})))
+        st.write_act(self.conn, withdraw, "form", "restate", "{}", "", "", json.dumps({"withdrawn": {str(self.recs[0]): "不对"}}))
         self.assertEqual(cognize.now(self.conn, self.ref(0)), [])                # 撤下了
 
     def test_entry_line_cognition_pinned(self):

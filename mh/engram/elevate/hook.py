@@ -19,6 +19,8 @@ def main(argv):
         cwd = d.get("cwd") or (d.get("workspacePaths") or [""])[0] or ""
         from mh.engram.store.instance import unplugged
         if unplugged(cwd):                                # 不接 mh 的目录（[connect].unplugged）：内核态不管
+            if host == "agy" and event == "pre":
+                sys.stdout.write('{"decision":"allow"}')
             return 0
         if d.get("agent_id") or d.get("agent_type"):      # 子代理：提权只给用户直接对话的那一层
             if event in ("prompt", "stop"):
@@ -33,7 +35,7 @@ def main(argv):
         if out is not None:
             json.dump(out, sys.stdout, ensure_ascii=False)
         elif host == "agy":
-            sys.stdout.write("{}")
+            sys.stdout.write('{"decision":"allow"}' if event == "pre" else "{}")
         return code
     except Exception as e:
         try:
@@ -43,8 +45,12 @@ def main(argv):
                 f.write(f"{datetime.now().astimezone().isoformat()} {host} {event} {d.get('session_id', '')} {e!r}\n")
         except Exception:
             pass
+        if host == "agy" and event == "pre":
+            sys.stdout.write('{"decision":"allow"}')
         return 0
 
 
 if __name__ == "__main__":
+    from mh.synapse.hosts import forward       # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+    forward.maybe()
     sys.exit(main(sys.argv))

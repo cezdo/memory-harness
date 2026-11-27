@@ -17,7 +17,7 @@ from pathlib import Path
 from . import cognize, observe
 from .store import delete
 from .store import claimed as store_claimed
-from .store import CLAIM_KINDS, MARKERS, REPLACING, UNKNOWN, absent, adjacent, consumed
+from .store import CLAIM_KINDS, MARKERS, REPLACING, UNKNOWN, absent, adjacent, consumed, zunpack
 
 SNAPSHOT = "engram-check-snapshot.json"
 BLOCK = 1000
@@ -229,7 +229,7 @@ def check(conn, db_path, brief=False):
 
     # 字段取值：不用 NULL；三种标记各有多少（只是分布，不是事件）
     marks = []
-    for table in ("occurrence", "session_detail", "turn_detail", "act_detail", "use_detail", "event", "form_record",
+    for table in ("occurrence", "session_detail", "turn_detail", "act_detail", "act_io", "use_detail", "event", "form_record",
                   "judgment", "cognition", "operator"):
         cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})")]
         for c in cols:
@@ -259,7 +259,12 @@ def check(conn, db_path, brief=False):
         full = collections.defaultdict(lambda: [0, -1, hashlib.sha256()])     # 这次的全部行
         part = collections.defaultdict(lambda: [0, hashlib.sha256()])         # 其中上次已有的行
         src = SNAPSHOT_FROM.get(table, table)
-        for k, v in conn.execute(f"SELECT {key}, {expr} FROM {src} ORDER BY {key}"):
+        if table == "act_detail":
+            rows = ((k, zunpack(inp) + "\x1e" + zunpack(out))
+                    for k, inp, out in conn.execute("SELECT occurrence, input, output FROM act_io ORDER BY occurrence"))
+        else:
+            rows = conn.execute(f"SELECT {key}, {expr} FROM {src} ORDER BY {key}")
+        for k, v in rows:
             blk, data = str(k // BLOCK), (v or "").encode("utf-8") + b"\x1f"
             f = full[blk]
             f[0], f[1] = f[0] + 1, k
@@ -323,11 +328,10 @@ def coverage(conn):
             ev.hit(f"observe：待观测（{observe.STATES[d]}）", where[turn])
         else:
             ev.n[f"observe：{observe.STATES[d]}（轮次，不是事件）"] += 1
-    handed = observe.frame(conn)
     read = consumed(conn, "form")
     unread = collections.Counter()
-    waiting = 0
-    for x in handed["events"]:
+    waiting, withdrawn = 0, []
+    for x in observe.iter_frame(conn, withdrawn=withdrawn):      # 逐条看，不把全库 E 攒成表（X9）
         if x["id"] not in read:
             if x.get("step") == "correct":       # 纠正写的：等修订提示被用到才进 form（lazy），不是静默丢失
                 waiting += 1
@@ -340,10 +344,16 @@ def coverage(conn):
     gone = observe.superseded(conn)
     if gone:
         ev.n["observe：按申请被取代的 E（不再交出，留在那一轮上；条数，不是事件）"] += len(gone)
-    if handed["withdrawn"]:
-        ev.n["form：被 form 读过、又因开关撤下的 E（条数，不是事件）"] += len(handed["withdrawn"])
+    if withdrawn:
+        ev.n["form：被 form 读过、又因开关撤下的 E（条数，不是事件）"] += len(withdrawn)
     from .form import history, pack                                    # 只算现在用着的那次 pack 写的（重做取代的旧陈述还留在库里）
-    current = {a for (step, _), a in history(conn).ok.items() if step == "pack"}
+    h = history(conn)
+    current = {a for (step, _), a in h.ok.items() if step == "pack"}
+    attached = {k[:2] for (step, k) in h.ok if step == "attach"}
+    hung = {(r[0], r[1]) for r in conn.execute("SELECT e.source, e.session FROM attachment a JOIN session_entry e ON e.id=a.entry")}
+    for f in conn.execute("SELECT max(id), source, session FROM session_entry GROUP BY source, session ORDER BY 1"):
+        if (f[1], f[2]) in attached and (f[1], f[2]) not in hung:     # 挂线记了成功、话题却不在任何线上（11-23：删除带走了别人挂着的线）
+            ev.hit("form：挂过线、话题现在却没挂在线上", f"T{f[0]} {f[1]}:{f[2][:20]}")
     for act, meta in conn.execute("SELECT occurrence, meta FROM act_detail WHERE process='form' AND step='pack' AND meta LIKE '%\"violations\"%'"):
         if act not in current:
             continue                                             # 已经被重做取代的，问题不在了（2026-10-27）

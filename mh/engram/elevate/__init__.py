@@ -329,6 +329,8 @@ def handle(kernel, host, event, d):
                 return {"decision": "deny", "reason": DENIED.format(path=kernel.path)}, 0
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                            "permissionDecisionReason": DENIED.format(path=kernel.path)}}, 0
+        if host == "agy":
+            return {"decision": "allow"}, 0
         return None, 0
     if event == "post":
         kernel.compare(host, session, tool, cwd)

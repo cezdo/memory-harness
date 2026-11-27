@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ....engram import store
+from ....synapse.hosts import mcp_command, python
 from .. import confine
 
 NAME = "claude"
@@ -22,11 +23,12 @@ WRITES = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 def hooks(repo=REPO):
     """配置目录里装的钩子：只装 mh 自己的（手记、联想、开关、内核态），不装用户级的 tui 信号、主题钩子（不往用户的终端发信号）。"""
-    py = f"/usr/bin/python3 -I -S {repo}"
+    exe = python()                       # 解释器按平台（hosts.python）：macOS 的 /usr/bin/python3 是 3.9，跑不了 mh（11-26 self 搬到 macOS 服务机）
+    py = f"{exe} -I -S {repo}"
     cmd = lambda c: {"type": "command", "command": c}
     return {
-        "SessionStart": [{"hooks": [cmd(f"cd {repo} && python3 -m mh inject")]}],
-        "UserPromptSubmit": [{"hooks": [cmd(f"cd {repo} && python3 -m mh.synapse.push.associate"),
+        "SessionStart": [{"hooks": [cmd(f"cd {repo} && {exe} -m mh inject")]}],
+        "UserPromptSubmit": [{"hooks": [cmd(f"cd {repo} && {exe} -m mh.synapse.push.associate"),
                                         cmd(f"{py}/mh/engram/observe/switch/hook.py claude"),
                                         cmd(f"{py}/mh/engram/elevate/hook.py claude prompt")]}],
         "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
@@ -47,8 +49,9 @@ def home(base=None):
             cred.rename(cred.with_name(f".credentials.json.stale-{int(datetime.now().timestamp())}"))
         cred.symlink_to(Path.home() / ".claude/.credentials.json")
     (h / "settings.json").write_text(json.dumps({"autoMemoryEnabled": False, "hooks": hooks()}, ensure_ascii=False, indent=1))
+    mcp = mcp_command(["env", f"PYTHONPATH={REPO}", python(), "-m", "mh.synapse.pull.mcp"])   # 装了 relay 就经常驻服务（X10）
     (h / "mcp.json").write_text(json.dumps({"mcpServers": {"mh": {
-        "type": "stdio", "command": "env", "args": [f"PYTHONPATH={REPO}", "python3", "-m", "mh.synapse.pull.mcp"], "env": {}}}}))
+        "type": "stdio", "command": mcp[0], "args": mcp[1:], "env": {}}}}))
     return h
 
 
@@ -82,7 +85,7 @@ def launch(root, text, session, resumed, logs):
             "--mcp-config", str(h / "mcp.json"), "--strict-mcp-config", "--add-dir", str(Path.home()),
             "--output-format", "stream-json", "--verbose"]
     args += ["--resume", session] if resumed else ["--session-id", session]
-    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(h))
+    env = confine.env(dict(os.environ, CLAUDE_CONFIG_DIR=str(h)), logs)
     with open(text) as stdin, open(Path(logs) / "run.jsonl", "w") as out, open(Path(logs) / "run.err", "w") as err:
         return subprocess.Popen(confine.wrap(args, root, logs, [h, Path.home() / ".claude/.credentials.json"]), stdin=stdin, stdout=out, stderr=err, cwd=root, env=env, start_new_session=True)
 

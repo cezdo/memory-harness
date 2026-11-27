@@ -1,6 +1,6 @@
 """拔掉 mh 起宿主：测试用的宿主实例，不接 mh（用户 2026-11-14，design/synapse/设计.md“宿主接入”的“不接 mh 的实例”）。
 
-`python3 -m mh unplug <claude|codex|dsh> [宿主参数…]`：在数据目录下的独立 home（<宿主>-unplugged-home）里起宿主。
+`python3 -m mh unplug <claude|codex|dsh|agy> [宿主参数…]`：在数据目录下的独立 home（<宿主>-unplugged-home）里起宿主。
 设置每次从日常配置照抄一份，去掉 mh 的东西：钩子（命令里带仓库路径的）、MCP（名为 mh 的）、mh 装进去的 skill 和命令、
 dsh profile 里 mh 的插件；认证用链接，不复制密钥。会话落在这个 home 里，采集不读这里，所以一轮都不进库。
 """
@@ -15,7 +15,6 @@ from ....engram import store
 
 REPO = Path(__file__).resolve().parents[4]
 USER = Path.home()
-HOSTS = ("claude", "codex", "dsh")
 SKILLS = frozenset(p.name for p in (REPO / "mh/skills").iterdir() if p.is_dir())   # mh 装进宿主的 skill 和命令
 
 
@@ -24,7 +23,7 @@ def home(host, base=None):
 
 
 def mh_command(cmd):
-    """这条钩子命令是不是 mh 的：命令里带仓库路径（三个宿主的装法都是绝对路径或 PYTHONPATH）。"""
+    """这条钩子命令是不是 mh 的：命令里带仓库路径（绝对路径或 PYTHONPATH）。"""
     return str(REPO) in (cmd or "")
 
 
@@ -195,12 +194,61 @@ def dsh_home(base=None, src=USER / ".dsh"):
     return h
 
 
-BUILD = {"claude": (claude_home, "CLAUDE_CONFIG_DIR"), "codex": (codex_home, "CODEX_HOME"), "dsh": (dsh_home, "DSH_HOME")}
+# ---- agy：CLI 读 $HOME/.gemini，独立 ACP adapter 读 GEMINI_HOME
+
+def _agy_hooks(hooks):
+    out = {}
+    for name, events in hooks.items():
+        kept = {}
+        for event, entries in events.items():
+            commands = []
+            for entry in entries:
+                if "hooks" in entry:
+                    children = [h for h in entry["hooks"] if not mh_command(h.get("command"))]
+                    if children:
+                        commands.append(dict(entry, hooks=children))
+                elif not mh_command(entry.get("command")):
+                    commands.append(entry)
+            if commands:
+                kept[event] = commands
+        if kept:
+            out[name] = kept
+    return out
+
+
+def agy_home(base=None, src=USER / ".gemini"):
+    """共用配置放在独立 home 的 .gemini 下，会话与日常目录分开。返回 Gemini 配置根。"""
+    h = home("agy", base) / ".gemini"
+    config = h / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    for name in ("antigravity-cli/antigravity-oauth-token", "antigravity-cli/installation_id",
+                 "antigravity-acp/acp_token.json", "antigravity-acp/acp_business_token.json",
+                 "jetski-standalone-oauth-token"):
+        (h / name).parent.mkdir(parents=True, exist_ok=True)
+        _link(h / name, src / name)
+    for name in ("antigravity-cli/settings.json", "antigravity-acp/settings.json", "config/config.json"):
+        if (src / name).is_file():
+            _copy(h / name, (src / name).resolve())
+    hooks, mcp = {}, {}
+    for name, data in (("hooks.json", hooks), ("mcp_config.json", mcp)):
+        original = src / "config" / name
+        if original.is_file():
+            data.update(json.loads(original.read_text().strip() or "{}"))
+    mcp.get("mcpServers", {}).pop("mh", None)
+    (config / "hooks.json").write_text(json.dumps(_agy_hooks(hooks), ensure_ascii=False, indent=2))
+    (config / "mcp_config.json").write_text(json.dumps(mcp, ensure_ascii=False, indent=2))
+    _link_dir(config / "skills", src / "config/skills")
+    return h
+
+
+BUILD = {"claude": (claude_home, "CLAUDE_CONFIG_DIR"), "codex": (codex_home, "CODEX_HOME"),
+         "dsh": (dsh_home, "DSH_HOME"), "agy": (agy_home, "GEMINI_HOME")}
+HOSTS = tuple(BUILD)
 
 
 def main(argv):
     if not argv or argv[0] not in HOSTS:
-        print("用法：python3 -m mh unplug <claude|codex|dsh> [宿主参数…]\n"
+        print(f"用法：python3 -m mh unplug <{'|'.join(HOSTS)}> [宿主参数…]\n"
               "在不接 mh 的独立 home 里起宿主：没有手记、联想、mh 的 MCP 和 skill，会话不进记忆。\n"
               "--home 只打印 home 的路径（照日常配置重写一遍），不起宿主。", file=sys.stderr)
         sys.exit(2)
@@ -211,6 +259,8 @@ def main(argv):
         print(h)
         return
     env = dict(os.environ, **{var: str(h)})
+    if host == "agy":
+        env["HOME"] = str(h.parent)
     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):     # 外层会话的身份不传进去
         env.pop(key, None)
     exe = shutil.which(host)

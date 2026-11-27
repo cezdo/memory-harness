@@ -16,9 +16,13 @@ form 自己按 observe 的接口（progress 里待观测的）定门槛，跟在
 """
 import fcntl
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from ..engram import form, observe, store
 from ..engram.observe import collect
@@ -30,12 +34,14 @@ PREVIEW_WORKERS = 2     # 预览并行几个：Sonnet 走 Claude，额度和交�
 CORRECT_LIMIT = 4       # 一批最多纠正几组（点名申请，排在新原话后面；纠错要调模型、花额度，申请.md C1d）
 FORM_LIMIT = 10         # 形成一批最多几个单位
 FORM_WORKERS = 4        # pack、label 的模型调用并行几个（attach 按时间顺序一个个来）
-PROVIDER = {"sol": "codex", "sonnet": "claude"}    # 预览池（observe.POOL）里的模型走哪家的额度
+PROVIDER = {"sol62": "codex", "sonnet": "claude"}    # 预览池（observe.POOL）里的模型走哪家的额度
 BUSY_5H = 80            # 5 小时额度用到这么多（%）就排到后面
 QUOTA_TTL = 600         # 额度读一次管多久（秒）
 TIDY_INTERVAL = 60      # 整理循环多久醒一次（秒）；每个任务按自己的周期决定这次跑不跑
 WAKE_POLL = 5           # 休眠时每几秒看一眼叫醒文件
 WAKE_SETTLE = 5         # 被叫醒后再等几秒：宿主的 Stop 可能在这一轮写进会话文件之前发（dsh 的 turn-stopping 在 turn/end 之前）
+BUSY_EXIT = 3           # 一轮放在子进程里跑时（X9），子进程用这个退出码说“还忙，接着跑下一轮”
+REPO = Path(__file__).resolve().parents[2]
 
 
 def _status(conn, log):
@@ -80,7 +86,7 @@ def _runbook(conn, log):
 def _runbook_model():
     """写稿要读整份 runbook 和一天的提交，按读整段的放宽超时；不给工具（codex 的只读沙箱拦不住读文件）。"""
     from ..engram import invoke
-    return invoke.whole(invoke.Codex("gpt-6.1-sol", "low", isolation="codex-home-v1-low", no_tools=True))
+    return invoke.whole(invoke.Codex("gpt-6.2-sol", "low", isolation="codex-home-v1-low", no_tools=True))
 
 
 def _clean(conn, log):
@@ -156,10 +162,22 @@ def pick(names, read=None):
     return [n for _, n in sorted(enumerate(names), key=key)]
 
 
-def _order():
-    """observe 预览模型的先后，按额度，QUOTA_TTL 内不重读。"""
-    if _picked["order"] is None or time.time() - _picked["at"] > QUOTA_TTL:
+def _order(path=None):
+    """observe 预览模型的先后，按额度，QUOTA_TTL 内不重读。一轮一个子进程（X9），所以记在数据目录 run/preview-order.json。"""
+    path = path or store.HOME / "run" / "preview-order.json"
+    if _picked["order"] is None:
+        try:
+            _picked.update(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            pass
+    stale = set(_picked["order"] or ()) != set(observe.POOL["preview"])     # 池里换了模型定义（11-27 sol → sol62）：旧名单不能用
+    if stale or time.time() - _picked["at"] > QUOTA_TTL:
         _picked.update(at=time.time(), order=pick(list(observe.POOL["preview"])))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(_picked))
+        except OSError:
+            pass
     return _picked["order"]
 
 
@@ -213,9 +231,12 @@ def _rest(path, since, interval, sleep=time.sleep, watch=None, seen=None):
     return False
 
 
-def _loop(name, step, db, interval, log, once, watch=None):
-    """常驻循环的共同部分：拿锁，一轮轮跑 step(conn) → (说明, 忙不忙, 结果)，不忙就休眠（可以被叫醒）。once：只跑一轮就返回。
-    watch(conn)：库里这个循环的输入，休眠时变了就醒（读不到当没变）。"""
+def _loop(name, step, db, interval, log, once, watch=None, round_args=None, due=None):
+    """常驻循环的共同部分：拿锁，一轮轮跑 step(conn) → (说明, 忙不忙, 结果)，不忙就休眠（可以被叫醒）。
+    once：只跑一轮就返回结果。watch(conn)：库里这个循环的输入，休眠时变了就醒（读不到当没变）。
+    round_args：常驻时每一轮放进子进程跑（`mh rhythm <round_args> --round`，X9 2026-11-26：一轮的工作数据跑完就还给系统，
+    常驻的只剩锁、叫醒和休眠；原来三个循环闲着也各占 117–162M）。子进程不拿锁（锁在这里），退出码 BUSY_EXIT 表示还忙。
+    due()：这一轮有没有活（整理循环按周期看），没有就不起子进程。"""
     home = db.parent if db else store.HOME
     held = lock(name, home)
     if held is None:
@@ -233,18 +254,49 @@ def _loop(name, step, db, interval, log, once, watch=None):
         time.tzset()                    # 显示按现在的系统时区（11-07 改时区后进程还停在旧的）
         since = _touched(wake)
         seen = look() if watch else None
-        try:
-            note, busy, got = step(conn)
-            if note:
-                print(f"{datetime.now():%m-%d %H:%M} {note}", file=log, flush=True)
-        except Exception as e:          # 一轮出错不让常驻进程退出
-            print(f"本轮出错：{e!r}", file=log, flush=True)
-            busy, got = False, None
-        if once:
-            held.close()
-            return got
+        if once or round_args is None:
+            busy, got = _step(step, conn, log)
+            if once:
+                held.close()
+                return got
+        elif due is None or due():
+            busy = _child(round_args, db, log)
+        else:
+            busy = False
         if not busy:
             _rest(wake, since, interval, watch=look if watch else None, seen=seen)
+
+
+def _step(step, conn, log):
+    """跑一轮，记一行说明。一轮出错不让常驻进程退出。→ (忙不忙, 结果)"""
+    try:
+        note, busy, got = step(conn)
+        if note:
+            print(f"{datetime.now():%m-%d %H:%M} {note}", file=log, flush=True)
+        return busy, got
+    except Exception as e:
+        print(f"本轮出错：{e!r}", file=log, flush=True)
+        return False, None
+
+
+def _child(round_args, db, log):
+    """一轮放进子进程：输出直接写进同一个日志（继承标准输出），退出码 BUSY_EXIT 是还忙。"""
+    argv = [sys.executable, "-m", "mh", "rhythm", *round_args, "--round", *(["--engram-db", str(db)] if db else [])]
+    try:
+        code = subprocess.run(argv, cwd=REPO, stdin=subprocess.DEVNULL).returncode
+    except OSError as e:
+        print(f"本轮出错：起不了子进程 {e!r}", file=log, flush=True)
+        return False
+    if code not in (0, BUSY_EXIT):
+        print(f"本轮出错：子进程退出码 {code}", file=log, flush=True)
+    return code == BUSY_EXIT
+
+
+def run_round(name, db=None, log=sys.stderr):
+    """子进程那一头（`mh rhythm … --round`）：不拿锁，跑一轮，→ 忙不忙。"""
+    step = {"observe": _observe_step, "form": _form_step, "tidy": _tidy_step}[name](log)
+    busy, _ = _step(step, store.connect(db or store.DEFAULT_DB), log)
+    return busy
 
 
 def tidy_once(conn, log=sys.stderr, tasks=None, state=None, now=None):
@@ -272,31 +324,57 @@ def tidy_once(conn, log=sys.stderr, tasks=None, state=None, now=None):
     return ran
 
 
-def tidy_loop(db=None, interval=TIDY_INTERVAL, log=sys.stderr, once=False):
-    """常驻的整理循环（memory-harness-tidy.service）。once：只跑一轮就返回跑了哪些任务。"""
+def _due(tasks=None, state=None, now=None):
+    """整理循环这一醒有没有到周期的任务（tidy_once 的同一个判断），没有就不起子进程。"""
+    try:
+        last = json.loads((state or (store.HOME / "tidy-state.json")).read_text())
+    except (OSError, ValueError):
+        last = {}
+    t = now or time.time()
+    return any(name not in last or t - last[name] >= period for name, _, period, _ in tasks or TIDY)
+
+
+def _tidy_step(log):
     def step(conn):
         return "", False, tidy_once(conn, log=log)
-    return _loop("tidy", step, db, interval, log, once)
+    return step
+
+
+def _observe_step(log, **kw):
+    models = kw.pop("models", None)
+
+    def step(conn):
+        nonlocal models
+        models = models or {s: observe.MODELS[name]() for s, (name, _) in observe.CURRENT.items()
+                            if s != "preview"}          # 预览按额度在池里选（pick）
+        new, done, env = observe_once(conn, log=log, models=models, **kw)
+        note = f"新轮次 {new}，处理 {done}" + (f"，环境错误 {env}" if env else "") if new or done else ""
+        return note, bool(done and not env), (new, done, env)
+    return step
+
+
+def _form_step(log, **kw):
+    models = kw.pop("models", None)
+
+    def step(conn):
+        nonlocal models
+        models = models or {s: form.MODELS[name]() for s, (name, _) in form.CURRENT.items()}
+        done, env = form_once(conn, log=log, models=models, **kw)
+        note = f"形成 处理 {done}" + (f"，环境错误 {env}" if env else "") if done else ""
+        return note, bool(done and not env), (done, env)
+    return step
+
+
+def tidy_loop(db=None, interval=TIDY_INTERVAL, log=sys.stderr, once=False):
+    """常驻的整理循环（memory-harness-tidy.service）。once：只跑一轮就返回跑了哪些任务。"""
+    return _loop("tidy", _tidy_step(log), db, interval, log, once, round_args=["--tidy"], due=_due)
 
 
 def observe_loop(db=None, interval=INTERVAL, log=sys.stderr, once=False, **kw):
     """常驻的观察循环（memory-harness-observe.service）。once：只跑一轮就返回 (新轮次, 处理了几件, 环境错误几次)。"""
-    models = kw.pop("models", None) or {step: observe.MODELS[name]() for step, (name, _) in observe.CURRENT.items()
-                                        if step != "preview"}          # 预览按额度在池里选（pick）
-
-    def step(conn):
-        new, done, env = observe_once(conn, log=log, models=models, **kw)
-        note = f"新轮次 {new}，处理 {done}" + (f"，环境错误 {env}" if env else "") if new or done else ""
-        return note, bool(done and not env), (new, done, env)
-    return _loop("observe", step, db, interval, log, once, watch=_requests_to("observe"))
+    return _loop("observe", _observe_step(log, **kw), db, interval, log, once, watch=_requests_to("observe"), round_args=[])
 
 
 def form_loop(db=None, interval=INTERVAL, log=sys.stderr, once=False, **kw):
     """常驻的形成循环（memory-harness-form.service）。once：只跑一轮就返回 (处理了几件, 环境错误几次)。"""
-    models = kw.pop("models", None) or {step: form.MODELS[name]() for step, (name, _) in form.CURRENT.items()}
-
-    def step(conn):
-        done, env = form_once(conn, log=log, models=models, **kw)
-        note = f"形成 处理 {done}" + (f"，环境错误 {env}" if env else "") if done else ""
-        return note, bool(done and not env), (done, env)
-    return _loop("form", step, db, interval, log, once, watch=_form_inputs)
+    return _loop("form", _form_step(log, **kw), db, interval, log, once, watch=_form_inputs, round_args=["--form"])

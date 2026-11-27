@@ -225,9 +225,35 @@ class RecentTest(unittest.TestCase):
                 mock.patch.object(register, "since", lambda n: up[n]), mock.patch.object(status, "_run", lambda a, cwd=None: "200 abc1234 11-14 21:18"):
             got = status._services(["a", "b", "c"], "/repo")
             self.assertEqual(len(got), 2)
-            self.assertIn("- a 起来以后 `mh/` 又有提交（最新 abc1234，11-14 21:18）", got[1])   # b 比提交晚起、c 读不到时刻：不列
+            self.assertIn("- a 起来以后它常驻用着的代码又有提交（最新 abc1234，11-14 21:18）", got[1])   # b 比提交晚起、c 读不到时刻：不列
             self.assertEqual(len(status._services(["b"], "/repo")), 1)
             self.assertEqual(len(status._services(["a"])), 1)                                  # 不给仓库就不比
+        seen = []                                                                              # 三个循环只比常驻那一层的文件（X9）
+
+        def run(a, cwd=None):
+            seen.append(tuple(a[a.index("--") + 1:]))
+            return "200 abc1234 11-14 21:18"
+        with mock.patch.object(register, "state", lambda n: "active"), mock.patch.object(register, "lines", lambda n, h: []), \
+                mock.patch.object(register, "since", lambda n: 100), mock.patch.object(status, "_run", run):
+            status._services(["memory-harness-form", "memory-harness-mcp"], "/repo")
+        self.assertEqual(seen, [status.RESIDENT["memory-harness-form"], ("mh",)])
+
+    def test_services_on_clients(self):
+        """本机没装的服务经 ssh 去客户端看（X7 2026-11-26）：那台的行标上机器名；哪台都没装的报 not-found；取不回来的标一行。"""
+        from unittest import mock
+        from ...rhythm import register
+        from . import status
+        here = {"a": "active"}
+        with mock.patch.object(register, "state", lambda n: here.get(n, "not-found")), mock.patch.object(register, "lines", lambda n, h: []):
+            got = status.services(["a", "b", "c"], clients={"box": "/home/u"},
+                                  ssh=lambda h, n: {"found": ["b"], "lines": ["- b 在跑，近 6 小时没有出错"]})
+            self.assertEqual(got, ["- a 在跑，近 6 小时没有出错", "- box：b 在跑，近 6 小时没有出错", "- c：not-found"])
+
+            def down(h, n):
+                raise RuntimeError("ssh: connect to host box: No route to host")
+            got = status.services(["a", "b"], clients={"box": "/home/u"}, ssh=down)
+            self.assertIn("- box 上的服务看不到：ssh: connect to host box: No route to host", got)
+            self.assertEqual(status.services(["a", "b"], clients={}), ["- a 在跑，近 6 小时没有出错", "- b：not-found"])
 
     def test_host_given_section_keeps_sources(self):
         from . import status
@@ -716,6 +742,18 @@ class RunbookTest(unittest.TestCase):
         self.assertIn("synapse/设计.md 的 I3", got)
         self.assertNotIn("B2；", got), self.assertNotIn("A1", got), self.assertNotIn("cases", got)
 
+    def test_drift_finds_archived_tmp(self):
+        """11-20 起 tmp 旧目录挪进 tmp/archive/<半月起始日>/，引用不改写：链接到那里找得到就算对得上。"""
+        from . import runbook
+        d = self.repo / "design"
+        d.mkdir()
+        (self.repo / "tmp" / "archive" / "2026-10-01" / "mpr").mkdir(parents=True)
+        (self.repo / "tmp" / "archive" / "2026-10-01" / "mpr" / "r.md").write_text("# 报告\n")
+        (d / "runbook.md").write_text("[报告](../tmp/mpr/r.md)、[没了](../tmp/gone/r.md)\n")
+        got = "\n".join(runbook.drift(self.repo, "design/runbook.md", set()))
+        self.assertNotIn("mpr", got)
+        self.assertIn("../tmp/gone/r.md", got)
+
     def test_window_from_last_draft_not_last_runbook_edit(self):
         """11-05：写完稿后有一次提交没跟上 runbook，随后 runbook 又因别的事提交了；下一份稿仍要看到那次提交。"""
         from . import runbook
@@ -823,7 +861,7 @@ class CacheOnlineTest(unittest.TestCase):
             self.assertEqual(popen.call_count, 1)
             self.assertIsNone(a.cached(self.conn))              # 已经有一个在建：不再起
             self.assertEqual(popen.call_count, 1)
-            self.assertEqual(popen.call_args.kwargs["env"]["MH_DB"], str(Path(self.tmp.name) / "engram.db"))
+            self.assertEqual(Path(popen.call_args.kwargs["env"]["MH_DB"]).resolve(), (Path(self.tmp.name) / "engram.db").resolve())   # macOS 临时目录 /var → /private/var
             (self.folder / "old.pkl").write_bytes(pickle.dumps({"v": a.CACHE_V, "idx": "旧的"}))
             (self.folder / "older.pkl").write_bytes(pickle.dumps({"v": a.CACHE_V - 1, "idx": "格式不对"}))
             os.utime(self.folder / "older.pkl", (1, 1))

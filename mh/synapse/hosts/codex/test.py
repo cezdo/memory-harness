@@ -44,6 +44,27 @@ class ContextTest(unittest.TestCase):
             self.assertEqual(out["permissionDecision"], "allow")
             self.assertEqual(out["updatedInput"], {"words": ["摄影"], "session": "current", "cwd": "/workspace"})
 
+    def test_label_prefixes_source_outside_tag(self):
+        from .__main__ import label, SOURCE
+        out = label({"systemMessage": "x", "hookSpecificOutput": {"additionalContext": "<memory-harness>a</memory-harness>"}})
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], SOURCE + "<memory-harness>a</memory-harness>")
+        self.assertEqual(label({"systemMessage": "x"}), {"systemMessage": "x"})
+        self.assertEqual(label({}), {})
+
+
+class RelayTest(unittest.TestCase):
+    def test_mcp_command(self):
+        """装了 relay（X10）MCP 命令前面加 `mh-relay --`，没装原样（hosts 共用，codex、agy 的安装器都走它）。"""
+        from unittest.mock import patch
+        from .. import mcp_command
+        from ....engram.store import instance
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(instance, "TOOLS", Path(d)):
+                self.assertEqual(mcp_command(["py", "-m", "x"]), ["py", "-m", "x"])
+                (Path(d) / "relay").mkdir()
+                (Path(d) / "relay/mh-relay").write_text("")
+                self.assertEqual(mcp_command(["py", "-m", "x"]), [f"{d}/relay/mh-relay", "--", "py", "-m", "x"])
+
 
 if __name__ == "__main__":
     unittest.main()

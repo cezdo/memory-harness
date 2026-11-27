@@ -24,7 +24,7 @@ from .label import relayed
 # 预览的 Operator 定义；Sol 经隔离的 codex exec，low，工具调用结果作废。
 MODELS = {"opus": lambda: Claude("claude-opus-5-5", "claude -p（opus）"),
           "sonnet": lambda: Claude("claude-sonnet-5-5", "claude -p（sonnet）", effort="low", isolation="claude-home-v1-low"),
-          "sol": lambda: Codex("gpt-6.1-sol", "low", isolation="codex-home-v1-low", no_tools=True)}
+          "sol62": lambda: Codex("gpt-6.2-sol", "low", isolation="codex-home-v1-low", no_tools=True)}
 
 PRECISE_TURNS = 0.3          # 精读的轮数上限（占这次预览的轮数）：兜底，方向是两三成（2026-10-19，原来只按字数卡一半）
 PRECISE_SHARE = 0.4          # 精读的回复字数上限（占这次预览的全部回复）：兜底，方向是两到四成

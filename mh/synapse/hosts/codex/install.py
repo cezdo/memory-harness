@@ -8,10 +8,11 @@ import re
 import shlex
 import shutil
 import subprocess
+from .. import mcp_command, python
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[4]
-PREFIX = f"env PYTHONPATH={shlex.quote(str(ROOT))} /usr/bin/python3 -m mh.synapse.hosts.codex "
+PREFIX = f"env PYTHONPATH={shlex.quote(str(ROOT))} {python()} -m mh.synapse.hosts.codex "
 OURS = re.compile(r"-m mh\.synapse\.(hosts\.)?codex ")   # 本适配器的 handler（E2 之前是 mh.synapse.codex）
 
 
@@ -46,8 +47,9 @@ def install(home):
     for old in (path, home / "config.toml"):
         if old.exists():
             shutil.copy2(old, old.with_name(old.name + ".bak-synapse-" + stamp))
-    subprocess.run(["codex", "mcp", "add", "mh", "--env", f"PYTHONPATH={ROOT}",
-                    "--", "/usr/bin/python3", "-m", "mh.synapse.hosts.codex", "mcp"],
+    # MH_HOST 写进 MCP 的环境：经 relay 连常驻服务时，服务不经过 hosts.codex 的 mcp 入口，靠它认宿主（X10）
+    subprocess.run(["codex", "mcp", "add", "mh", "--env", f"PYTHONPATH={ROOT}", "--env", "MH_HOST=codex",
+                    "--", *mcp_command([python(), "-m", "mh.synapse.hosts.codex", "mcp"])],
                    check=True, env=dict(os.environ, CODEX_HOME=str(home)))
     config = home / "config.toml"
     text = config.read_text()

@@ -224,7 +224,7 @@ export async function apply(ctx, config) {
       async execute(args, exec) {
         const h = exec?.agent?.session?.header;
         const res = await mcp.request("tools/call", {
-          name: t.name, arguments: { ...args, session: h?.id ?? "", cwd: h?.cwd ?? "" },
+          name: t.name, arguments: { ...args, session: h?.id ?? "", cwd: h?.cwd ?? "", host: "dsh" },
         }, cfg.toolTimeoutMs, exec?.signal);
         const text = (res?.content || []).filter((b) => b?.type === "text").map((b) => b.text).join("\n");
         if (res?.isError) throw new Error(text || "拉取出错");

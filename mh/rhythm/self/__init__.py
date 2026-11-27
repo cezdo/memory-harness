@@ -11,18 +11,22 @@
 - section(repo, now, root)：手记近况里的一节（只给 memory-harness）
 
 世界的现状、开始和跑完的快照、核查比出来的变化在 world.py（2026-11-08 从 explore 搬来，self 公开时不依赖冻结着的 explore）。
-醒着的进程包在只读沙箱里，只有 self、草稿纸和记忆自己的记录可写，在 confine.py（2026-11-09）。
+醒着的进程包在沙箱里，只有 self、草稿纸和记忆自己的记录可写，在 confine.py（2026-11-09；macOS 用 sandbox-exec，11-26）。
 宿主怎么起、怎么续接、怎么读出自己做了什么，在 hosts/ 里一个宿主一个模块（接入标准：design/rhythm/self/接入.md）。
 """
+import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from ...engram import store
+from ...engram.store import instance
 from ...engram.observe.label import SELF_WORKSPACE
 from ...engram.store.instance import USER_NAME
 from . import confine, world
@@ -167,7 +171,7 @@ def awaken(note, now, d, resumed, prev, last=None, scratch=None, broken=None):
              f"这次醒来的目录：`{show(d)}`（已经建好）。"]
     if scratch:
         lines.append(f"草稿纸：`{show(scratch)}`（数据目录里，不进 self、不进记忆；克隆、临时文件放这里）。")
-    lines.append("除了 self 和草稿纸，文件系统都是只读的：写别处会报 Read-only file system。")
+    lines.append(f"除了 self 和草稿纸，文件系统都是只读的：写别处会报 {confine.DENIED}。")
     if resumed:
         lines.append("这是接着上次那段会话醒来的。")
     elif prev:
@@ -358,10 +362,69 @@ def pick(now, st, root=ROOT, busy=None):
     return min(ready, key=since), ""
 
 
+def post(root=ROOT, st=None, now=None, publish=None):
+    """醒来留下的 TO_USER 发到预览站的同名分类（用户 11-23：没有简易稳定的看回复的渠道，预览站开一类最方便）。
+    醒着的不发（还在写）；内容变了重发一份；发过的记在状态 posted 里（目录名 → sha、id）。
+    沙箱里连不上预览站，所以由节律在外面发。没配 [show].review_ctl 就不发。返回发了的目录名。"""
+    now = now or datetime.now()
+    own = st is None
+    st = load() if own else st
+    publish = publish or _publish
+    running = (st.get("run") or {}).get("dir")
+    posted = st.setdefault("posted", {})
+    sent = []
+    for day, name, p in wakes(root):
+        f = p / TO_USER
+        if now.date() - day >= SHOW or not f.exists() or str(p) == running:
+            continue
+        sha = hashlib.sha256(f.read_bytes()).hexdigest()
+        if posted.get(p.name, {}).get("sha") == sha:
+            continue
+        got = publish(f, f"{p.name}.md", Path(TO_USER).stem)
+        if got:
+            posted[p.name] = {"sha": sha, "id": got}
+            sent.append(p.name)
+    if own and sent:
+        _save(st)
+    return sent
+
+
+def _publish(path, name, category):
+    ctl = instance.SHOW.get("review_ctl")
+    if not ctl:
+        return None
+    local = Path(ctl).expanduser()
+    try:
+        if local.is_file():
+            r = subprocess.run([sys.executable, str(local), "publish", "--category", category, "--name", name, str(path)],
+                               capture_output=True, text=True, timeout=120)
+            return json.loads(r.stdout)[0]["id"] if r.returncode == 0 else None
+        if not instance.CLIENTS:
+            return None
+        # 本机没有预览站客户端（服务机上没装，工具留在客户端）：经 ssh 传文件内容调远端 ctl.py（复用隧道主连接）
+        host = next(iter(instance.CLIENTS))
+        script = ("import os,subprocess,sys,tempfile;from pathlib import Path;"
+                  "ctl,cat,nm=sys.argv[1:4];"
+                  "f=tempfile.NamedTemporaryFile(delete=False);f.write(sys.stdin.buffer.read());f.close()\n"
+                  "try:\n"
+                  " r=subprocess.run([sys.executable,str(Path(ctl).expanduser()),'publish','--category',cat,'--name',nm,f.name],"
+                  "capture_output=True,text=True);sys.stdout.write(r.stdout);sys.stderr.write(r.stderr);sys.exit(r.returncode)\n"
+                  "finally:os.unlink(f.name)\n")
+        cmd = shlex.join(["python3", "-c", script, ctl, category, name])
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd],
+                           input=Path(path).read_bytes(), capture_output=True, timeout=120)
+        return json.loads(r.stdout.decode())[0]["id"] if r.returncode == 0 else None
+    except (OSError, ValueError, KeyError, IndexError, subprocess.TimeoutExpired):
+        return None                    # 连不上就下一小时再发
+
+
 def tick(log=None, now=None):
-    """整理循环每小时一次：先收上一次醒来，再看有没有该叫醒的便签。返回一句说明（没事返回空）。"""
+    """整理循环每小时一次：先收上一次醒来，把写给用户的发到预览站，再看有没有该叫醒的便签。返回一句说明（没事返回空）。"""
     now = now or datetime.now()
     out = [x for x in [finish(now)] if x]
+    sent = post(now=now)
+    if sent:
+        out.append("发到预览站：" + "、".join(sent))
     st = load()
     note, why = pick(now, st)
     if note:
@@ -419,7 +482,10 @@ def section(repo, now=None, root=ROOT, woke=None, st=None, db=store.DEFAULT_DB):
     for day, name, p in wakes(root):
         if now.date() - day < SHOW:
             check = (p / "核查.md").read_text() if (p / "核查.md").exists() else ""
-            out.append(f"- {day:%m-%d} 醒来（{name}）：`{show(p)}`" + (f"，有写给你的 `{TO_USER}`" if (p / TO_USER).exists() else "")
+            letter = ""
+            if (p / TO_USER).exists():
+                letter = f"，有写给你的 `{TO_USER}`" + (f"（预览站「{Path(TO_USER).stem}」）" if st.get("posted", {}).get(p.name, {}).get("id") else "")
+            out.append(f"- {day:%m-%d} 醒来（{name}）：`{show(p)}`" + letter
                        + ("；核查：越界" if "越界：**有**" in check else ""))
     own, others = turns(now, db)
     if own:                            # 只列数，不设线：还没有案例说多少算偏（设计“回声与读者”）

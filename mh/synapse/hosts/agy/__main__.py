@@ -226,4 +226,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from mh.synapse.hosts import forward       # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+    forward.maybe()
     main()

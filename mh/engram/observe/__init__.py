@@ -12,8 +12,9 @@
   留在那一轮上作历史锚点，不再交出去；form 只读新做法的 E。
 - 一批怎么排（2026-10-19）：以会话为单位，一段会话的窗口在一批里接着预览完，form 不会看到半段；新会话和再观察资源平等，
   先到先得：新会话在它可以预览的那一刻到，再观察的会话在点名范围的那一刻到（同一刻到的从新往旧）。
-- 观察：预览分出的每一组一次调用，给这几轮的全文和预览写的计划。精读 = dsh web minimal 原样带 bash（只放行字数命令），high；
-  粗读 = 去掉全部工具，low。路径、文件名、链接打码后给观察者，输出后换回（guard.py）。不读的不调用。
+- 观察：预览分出的每一组一次调用，给这几轮的全文和预览写的计划。精读 = dsh web 带 bash、只放行字数命令，high（11-25 试过
+  DeepSeek 官方 API、不带工具，11-26 回退，OpenCode Go 到期再迁回）；粗读 = 去掉全部工具，low。模型有 wait() 的（DeepSeek 官方价的高峰）
+  在高峰里不调用：这几组留着，当作还没到时间，不记 act、不算失败。路径、文件名、链接打码后给观察者，输出后换回（guard.py）。不读的不调用。
 - 不观察：用户用 /no-observe 关掉的会话（最后一次开关说了算），以及开关那一轮本身（switch/）。另有工作区级的默认：
   实例配置 [connect].unwatched 里的工作区（2026-11-07），那里的会话不预览、不读，原文照收，已经产出的 E 不动；
   会话里显式的 /do-observe 压过它（临时要看时用）。开关影响 observe 全流程
@@ -44,13 +45,13 @@ from .label import USER_NAME
 
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数（2026-10-17）
-CURRENT = {"preview": ("sol", "preview-v0.6"),   # 2026-10-20 试用 Sol low；对照 tmp/preview-sonnet/
-           "deep": ("deepseek-oc-web-deep", "deep-rough-read-v0.2"),   # 2026-10-31 改名并换 provider：ark 订阅用完，换 OpenCode Go（之前 deepseek-ark-web-deep）
+CURRENT = {"preview": ("sol62", "preview-v0.6"),   # 2026-11-27 Sol 换 6.2（直接换）；2026-10-20 起 6.1 Sol low（定义名 sol），对照 tmp/preview-sonnet/
+           "deep": ("deepseek-oc-web-deep", "deep-rough-read-v0.2"),   # 2026-11-26 回到 dsh web（OpenCode Go 到期再迁回官方 API deepseek-api-deep）；11-25 走过官方 API，10-31 起 oc-web，再之前 deepseek-ark-web-deep
            "rough": ("terra-codex-rough", "rough-read-v0.2")}    # 2026-11-02 起 Terra（之前 10-19 起 luna-codex-rough，再之前 deepseek-ark-web-rough + deep-rough-read-v0.1）；v0.2（10-26）：原话不是中文的，提法照原文写进「」
 MODELS = {**preview.MODELS, **deep_rough_read.MODELS}
 # 预览可以用的模型，按额度轮着用（2026-10-20：有程序兜底，Sol、Sonnet 效果差不多）。先后由节律按额度给（rhythm.pick），
 # 不给时用 CURRENT 里的；一个环境错误就换下一个。各自是一个 Operator，同一个提示词。
-POOL = {"preview": ("sol", "sonnet")}
+POOL = {"preview": ("sol62", "sonnet")}
 MAX_FAILURES = 3
 # 预览的窗口（2026-10-17）：决定预览一次看哪些轮，是 observe 的参数，计入预览的 Operator，不是节律的参数。
 # 会话最后一轮开始后这么久没有新的一轮，就算告一段落，可以预览；按宿主分，尽量一次读完、少重复读
@@ -73,10 +74,10 @@ def window_params(step):
                 "user_cap": preview.USER_CAP, "previous": True, "notice": NOTICE,
                 "host_skip": preview.HOST_SKIP, "host_floor": preview.HOST_FLOOR, "host_hidden": True}
     if step == "rough":
-        return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.TOOLS[step], "masked": True, "cap": deep_rough_read.ROUGH_CAP,
+        return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.tools(step, CURRENT[step][0]), "masked": True, "cap": deep_rough_read.ROUGH_CAP,
                 "split": [deep_rough_read.ROUGH_MIN, deep_rough_read.ROUGH_MAX], "rho": deep_rough_read.ROUGH_RHO, "float": deep_rough_read.ROUGH_FLOAT, "content_min": deep_rough_read.CONTENT_MIN, "long_cap": deep_rough_read.LONG_CAP,
                 "files": "mention", "notice": NOTICE}      # files：附上读写的文件；mention（2026-10-25）：只有提到它们的段落合算 1 条
-    return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.TOOLS[step], "masked": True, "notice": NOTICE}
+    return {"block_cap": blocks.BLOCK_CAP, "tools": deep_rough_read.tools(step, CURRENT[step][0]), "masked": True, "notice": NOTICE}
 
 
 def operator(conn, step="preview", register_new=True, name=None, prompt=None):
@@ -220,24 +221,35 @@ def unwatched(conn, states=None, sessions=None):
     rows = [tuple(r) for r in conn.execute("SELECT source, session, cwd, file FROM session_detail")]
     if sessions is not None:
         rows = [r for r in rows if (r[0], r[1]) in sessions]
-    return ({(src, ses) for src, ses, cwd, f in rows if skip and instance.under(st.unworktree(cwd), skip)}
-            | _home_unattached(conn, rows)) - on \
-        | {(src, ses) for src, ses, _, _ in rows if src in paused}           # 暂停的来源（[engram].pause_sources）：/do-observe 也不压过
+    return (({(src, ses) for src, ses, cwd, f in rows if skip and instance.under(st.unworktree(cwd), skip)}
+             | _home_unattached(conn, rows)) - on
+            | {(src, ses) for src, ses, _, _ in rows if src in paused}           # 暂停的来源（[engram].pause_sources）：/do-observe 也不压过
+            | {(src, ses) for src, ses, cwd, _ in rows if instance.unplugged(cwd)})   # 不接 mh 的目录（[connect].unplugged）：同样不压过（2026-11-26）
 
 
-def ready(conn, op_id, session=None, now=None, reobserve=None):
+def ready_context(conn):
+    """ready 要的全库部分：观察历史、开关、不观察的会话。一圈里按会话调 ready 很多次的（run 的预览）先算一次传进去
+    （X9 2026-11-26：每段活跃会话各算一遍，一次 0.13 秒）。"""
+    off = switch.states(conn)
+    return {"history": history(conn), "off": off, "skip": unwatched(conn, off)}
+
+
+def ready(conn, op_id, session=None, now=None, reobserve=None, ctx=None, key=None):
     """该预览的窗口：[(这几轮, 前面已经处理过几轮)]。会话里第一串连续的、没处理过、已经结束的轮次；会话告一段落，
     才预览，整段一次（轮数不设上限）。只看人直接参与的会话，没写出文字的轮次不看，关掉的会话和开关那一轮不看；
     预览失败满次数的窗口进待重做清单，整窗跳过，后面的轮次照常预览（不挡后面）。
     reobserve：会话键的集合，给了就是再观察：只看这些会话里有旧版本逐轮观察过、新做法还没预览过的，旧版本观察过的
-    不算处理过；按会话开始时间从新到旧排。"""
-    h = history(conn)
+    不算处理过；按会话开始时间从新到旧排。session：会话 ID 前缀；key：完整的 (来源, 会话)，按索引查（前缀的 LIKE 要整表扫）。
+    ctx：ready_context 先算好的，同一圈里共用。"""
+    ctx = ctx or ready_context(conn)
+    h, off, skip = ctx["history"], ctx["off"], ctx["skip"]
     done = (h.previewed if reobserve is not None else h.done) | _stuck(h, op_id)
-    off = switch.states(conn)
-    skip = unwatched(conn, off)
     now = now or datetime.now(timezone.utc)
     sql, args = TURNS + " WHERE s.kind='user'", []
-    if session:
+    if key:
+        sql += " AND d.source=? AND d.session=?"
+        args += list(key)
+    elif session:
         sql += " AND d.session LIKE ?"
         args.append(session + "%")
     by = collections.defaultdict(list)
@@ -294,6 +306,12 @@ def _usage(meta):
     return st.usage_rows(meta.pop("usage", None))
 
 
+def _held(model):
+    """模型现在不该调用（DeepSeek 官方价的高峰，invoke.DeepSeek.wait）：返回可以调用的时刻；能调用或模型不认时段时 None。"""
+    wait = getattr(model, "wait", None)
+    return wait() if callable(wait) else None
+
+
 def _call(model, text):
     try:
         output, meta = invoke.call(model, text)
@@ -308,7 +326,7 @@ def _act(conn, op_id, step, window, inputs, text, output, meta, error, last, key
     seconds = meta.pop("seconds", None)
     act = occurrence(conn, "act", op_id, started=st.iso(st.now(), seconds), ended=st.now(), scale=scale, inputs=inputs,
                      cause=cause, predecessor=last.get(key, NA), outcome=result, error=err, cost=cost(seconds, _usage(meta)))
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "observe", step, dumps(window), text, output, dumps(meta)))
+    st.write_act(conn, act, "observe", step, dumps(window), text, output, dumps(meta))
     last[key] = act
     return act, result, err
 
@@ -478,7 +496,7 @@ def build_read(conn, group, step, model):
     """一组轮次的观察输入（deep_rough_read.build）。返回 (各轮段落表, 打码表, 文本)。"""
     rows = conn.execute(TURNS + f" WHERE d.occurrence IN ({','.join('?' * len(group['turns']))}) ORDER BY d.ordinal",
                         group["turns"]).fetchall()
-    head = (PROMPTS / f"{CURRENT[step][1]}.md").read_text().strip().replace("{tools}", deep_rough_read.TOOLS[step])
+    head = (PROMPTS / f"{CURRENT[step][1]}.md").read_text().strip().replace("{tools}", deep_rough_read.tools(step, CURRENT[step][0]))
     head = express.prompt(head, USER_NAME)
     files = None
     if step == "rough":
@@ -667,7 +685,9 @@ def correct(conn, models=None, log=sys.stderr, cause="request", limit=10):
             if _failed(h.fails, key, op_id):
                 continue
             model = obs.get(step) or obs.setdefault(step, MODELS[CURRENT[step][0]]())
-            head = express.prompt((PROMPTS / f"{_correct.PROMPT}.md").read_text().replace("{tools}", deep_rough_read.TOOLS[step]), USER_NAME)
+            if _held(model):                   # 高峰：申请留着，谷价再来
+                continue
+            head = express.prompt((PROMPTS / f"{_correct.PROMPT}.md").read_text().replace("{tools}", deep_rough_read.tools(step, CURRENT[step][0])), USER_NAME)
             files = None
             if step == "rough":
                 got = touched(conn, rows[0]["source"], rows[0]["session"])
@@ -713,7 +733,8 @@ def reread_groups(conn, pid):
     """补读（2026-10-20：只补读，要节俭）：一次预览的原输出按现在的程序规则（preview.parse：接续轮并回前一轮、宿主消息的
     两条线）重新解析，当时判了不读、现在不是不读的轮次按连续的几轮分组，一律粗读。不调模型；读过的轮次不动，所以不会有两版 E。
     逐轮判断（2026-10-20）：宿主消息后回复不超过 HOST_SKIP 字的那一轮不补，剩下的再按连续的几轮分组。返回 [组]，组的样子同预览（plan 写明是补读，接在前一轮下面的附上那一组的预览）。"""
-    row = conn.execute("SELECT a.output, o.inputs, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence "
+    row = conn.execute("SELECT io.output, o.inputs, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence "
+                       "JOIN act_io io ON io.occurrence=a.occurrence "
                        "WHERE o.id=? AND a.step='preview' AND o.outcome='ok'", (pid,)).fetchone()
     if row is None:
         return []
@@ -721,7 +742,7 @@ def reread_groups(conn, pid):
     rows = conn.execute(TURNS + f" WHERE d.occurrence IN ({','.join('?' * len(ids))}) ORDER BY d.ordinal", ids).fetchall()
     by = {r["ordinal"] + 1: r for r in rows}
     old = {k: g["how"] for g in reads(json.loads(row["meta"])) for k in range(g["from"], g["to"] + 1)}
-    new = {k: g for g in preview.parse(row["output"], rows)[0] for k in range(g["from"], g["to"] + 1)}
+    new = {k: g for g in preview.parse(st.zunpack(row["output"]), rows)[0] for k in range(g["from"], g["to"] + 1)}
     got = [k for k in sorted(old) if old[k] == "不读" and k in new and new[k]["how"] != "不读"
            and not (by[k]["origin"] == "host" and len(by[k]["assistant"]) <= preview.HOST_SKIP)]   # 逐轮：只是几句进度的不补
     runs = []
@@ -761,8 +782,7 @@ def reread(conn, pids, reason, cause="manual"):
         t = st.now()
         act = occurrence(conn, "act", op, started=t, ended=t, scale="turns", inputs={"turn": turns, "act": [pid]},
                          cause=cause, outcome="ok")
-        conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                     (act, "observe", "preview", dumps({"turns": turns}), "", "", dumps({"reads": groups, "reason": reason})))
+        st.write_act(conn, act, "observe", "preview", dumps({"turns": turns}), "", "", dumps({"reads": groups, "reason": reason}))
         out.append((pid, act, len(groups)))
     return out
 
@@ -800,13 +820,14 @@ def queue(conn, op_id, session=None, now=None, reobserve=True):
     out = {}
     reqs = reobserve_requests(conn) if reobserve else []
     # ready 对各会话的判定互不相干：所有申请的会话一起算一次，再按申请先后分（2026-10-30：一张申请一次，330 张一轮 160 秒）
-    again = ready(conn, op_id, session, now, set().union(*(keys for _, _, keys in reqs))) if reqs else []
+    ctx = ready_context(conn)
+    again = ready(conn, op_id, session, now, set().union(*(keys for _, _, keys in reqs)), ctx=ctx) if reqs else []
     for req, at, keys in reqs:
         for rows, _ in again:
             key = (rows[0]["source"], rows[0]["session"])
             if key in keys:
                 out.setdefault(key, (at, key, req))
-    for rows, _ in ready(conn, op_id, session, now):
+    for rows, _ in ready(conn, op_id, session, now, ctx=ctx):
         key = (rows[0]["source"], rows[0]["session"])
         if key in out:
             continue
@@ -844,9 +865,9 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
         prompt = express.prompt((PROMPTS / f"{CURRENT['preview'][1]}.md").read_text(), USER_NAME)
         while active and not env:
             jobs, taken = [], set()
+            ctx = ready_context(conn)          # 一圈算一次，各会话共用（上一圈存下的预览已在库里）
             for key, req in list(active.items()):
-                got = [w for w in ready(conn, preview_ops.values(), key[1], now, {key} if req else None)
-                       if (w[0][0]["source"], w[0][0]["session"]) == key]
+                got = ready(conn, preview_ops.values(), now=now, reobserve={key} if req else None, ctx=ctx, key=key)
                 if not got:
                     del active[key]
                     continue
@@ -881,10 +902,15 @@ def run(conn, limit=10, workers=8, preview_workers=2, session=None, cause="new_t
         if env:
             return done, env
         # 观察：预览定下的几组
-        jobs = []
+        jobs, held = [], collections.Counter()
         for pid, group, step in to_read(conn, session):
+            if (end := _held(obs[step])):
+                held[(step, end)] += 1
+                continue
             tables, mask, text = build_read(conn, group, step, obs[step])
             jobs.append((pid, group, step, tables, mask, text))
+        for (step, end), n in held.items():
+            print(f"[{'精读' if step == 'deep' else '粗读'}] 高峰，{n} 组留到 {end:%H:%M} UTC 以后", file=log, flush=True)
         futures = {pool.submit(_call, obs[j[2]], j[5]): j for j in jobs}
         for f in concurrent.futures.as_completed(futures):
             pid, group, step, tables, mask, text = futures[f]
@@ -914,11 +940,21 @@ def _switched(conn):
     return out
 
 
-def paused_sessions(conn):
-    """暂停的来源（[engram].pause_sources）的会话：连同已有的 E、陈述一起撤下，和关着观察一样读不到（用户 2026-11-11）。"""
-    if not instance.PAUSE_SOURCES:
+def unplugged_sessions(conn):
+    """目录在 [connect].unplugged 下的会话。采集本来一轮都不收；收进来了（2026-11-26 切换服务机后 cwd 对不上，漏收了一批 ai-layout-bench）
+    也不往下做：和暂停的来源一样不预览、不读、不形成，已有的 E、陈述撤下（用户 11-26：写进去的不清，把检查做好）。"""
+    if not instance.UNPLUGGED:
         return set()
-    return {(s, ses) for s, ses in conn.execute("SELECT source, session FROM session_detail") if s in instance.PAUSE_SOURCES}
+    return {(s, ses) for s, ses, cwd in conn.execute("SELECT source, session, cwd FROM session_detail") if instance.unplugged(cwd)}
+
+
+def paused_sessions(conn):
+    """暂停的来源（[engram].pause_sources）的会话：连同已有的 E、陈述一起撤下，和关着观察一样读不到（用户 2026-11-11）；
+    不接 mh 的目录里的会话同样（unplugged_sessions）。"""
+    out = unplugged_sessions(conn)
+    if instance.PAUSE_SOURCES:
+        out |= {(s, ses) for s, ses in conn.execute("SELECT source, session FROM session_detail") if s in instance.PAUSE_SOURCES}
+    return out
 
 
 def hidden_sessions(conn):
@@ -935,6 +971,11 @@ def withheld(conn):
         q = ",".join("?" * len(paused))
         out |= {e for e, in conn.execute(f"SELECT e.id FROM event e JOIN turn_detail d ON d.occurrence=e.turn WHERE d.source IN ({q})",
                                          list(paused))}
+    gone = unplugged_sessions(conn)          # 不接 mh 的目录里的会话（2026-11-26）
+    if gone:
+        q = ",".join("?" * len(gone))
+        out |= {e for e, src, ses in conn.execute(f"SELECT e.id, d.source, d.session FROM event e JOIN turn_detail d ON d.occurrence=e.turn "
+                                                  f"WHERE d.session IN ({q})", [ses for _, ses in gone]) if (src, ses) in gone}
     return out
 
 
@@ -968,9 +1009,8 @@ def _prune_act(conn, step, events, reason, cause):
     t = st.now()
     act = occurrence(conn, "act", op, started=t, ended=t, scale="free", inputs={"event": events},
                      cause=cause, outcome="ok", cost={"seconds": 0, "tokens": NA})
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "observe", step, dumps({"event": len(events)}), "", "",
-                  dumps({"reason": reason, "events": len(events)})))
+    st.write_act(conn, act, "observe", step, dumps({"event": len(events)}), "", "",
+                 dumps({"reason": reason, "events": len(events)}))
     conn.commit()
     return act
 
@@ -1023,9 +1063,8 @@ def mark_switches(conn, cause="new_text"):
                   if state == "off" else f"{USER_NAME}恢复了这个会话的观察（{said}的 /do-observe），这些 E 之前被撤下，重新交给上一层")
         act = occurrence(conn, "act", op, started=st.now(), ended=st.now(), scale="session",
                          inputs={"event": todo, "turn": [turn]}, cause=cause, outcome="ok", cost={"seconds": 0, "tokens": NA})
-        conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                     (act, "observe", step, dumps({"session": sid[0] if sid else UNKNOWN}), "", "",
-                      dumps({"reason": reason, "session": [source, session], "events": len(todo)})))
+        st.write_act(conn, act, "observe", step, dumps({"session": sid[0] if sid else UNKNOWN}), "", "",
+                     dumps({"reason": reason, "session": [source, session], "events": len(todo)}))
         revise(conn, todo, reason, op, act)
         done[step] += len(todo)
     conn.commit()
@@ -1253,7 +1292,7 @@ def frame_context(conn):
     return {"hidden": hidden, "marks": marks_by}
 
 
-def frame(conn, source=None, session=None, ctx=None):
+def frame(conn, source=None, session=None, ctx=None, ids=None):
     """现在交给上一层（form）的 E，和撤下的说明。返回 {"events": [...], "withdrawn": [...]}：
     events     [{id, turn, source, session, ordinal, text, segments, unresolved, speaker, mode, qualifier, modes, act, operator,
                  marks}]，按会话、轮次、出生排；不含 withheld（会话关着观察）、按申请被取代的（superseded）和退场的快道 E（fast_retired）。
@@ -1263,7 +1302,15 @@ def frame(conn, source=None, session=None, ctx=None):
                  scale：读出它的那次 act 的窗口，turns 是一轮或多轮一起读（2026-10-17 起的做法；上线当天写过 segment），
                  turn 是旧版本逐轮观察。
     withdrawn  [{event, act, reason}]：已经被 form 读过、现在因为开关撤下的 E（最后一次记的是 withdraw）。
-    source、session 给了就只看那一个会话（session 是完整的会话 ID）。ctx：frame_context 先算好的，同一批里共用。"""
+    source、session 给了就只看那一个会话（session 是完整的会话 ID）。ctx：frame_context 先算好的，同一批里共用。
+    ids：只要这几条 E（不给会话时用，免得为几条把全库物化）。全库逐条看的用 iter_frame，不攒成表（X9 2026-11-26：全库 +414M）。"""
+    gone = []
+    return {"events": list(iter_frame(conn, source, session, ctx, ids, gone)), "withdrawn": gone}
+
+
+def iter_frame(conn, source=None, session=None, ctx=None, ids=None, withdrawn=None):
+    """frame 的逐条版：一条一条交出 E（字段同 frame 的 events），撤下的说明追加进给的 withdrawn 表。
+    不给会话时按游标走、不 fetchall，全库也只占一行的内存。"""
     ctx = ctx or frame_context(conn)
     hidden, marks_by = ctx["hidden"], ctx["marks"]
     sql = ("SELECT e.*, d.source, d.session, d.ordinal, d.text AS turn_text, p.name AS op_name, o.scale, a.step FROM event e "
@@ -1278,14 +1325,23 @@ def frame(conn, source=None, session=None, ctx=None):
                                                "ORDER BY ordinal DESC", (source, session)):
             here[text] = (occ, ordinal)
         if not here:
-            return {"events": [], "withdrawn": []}
+            return
         sql += f" WHERE d.text IN ({','.join('?' * len(here))})"
         args = list(here)
-    elif source or session:
-        sql += " WHERE " + " AND ".join(c for c, v in (("d.source=?", source), ("d.session=?", session)) if v)
-        args = [v for v in (source, session) if v]
-    rows = conn.execute(sql + " ORDER BY d.source, d.session, d.ordinal, e.born, e.idx", args).fetchall()
+    else:
+        where = [(c, v) for c, v in (("d.source=?", source), ("d.session=?", session)) if v]
+        args = [v for _, v in where]
+        if ids is not None:
+            ids = sorted(set(ids))
+            if not ids:
+                return
+            where.append((f"e.id IN ({','.join('?' * len(ids))})", None))
+            args += ids
+        if where:
+            sql += " WHERE " + " AND ".join(c for c, _ in where)
+    rows = conn.execute(sql + " ORDER BY d.source, d.session, d.ordinal, e.born, e.idx", args)
     if here is not None:
+        rows = rows.fetchall()
         latest = {}                     # 纠正只写回应申请的几条，不是又读了一遍：不参与“只取最近一次读的”
         for r in rows:
             if r["scale"] in ("turns", "segment") and r["step"] != "correct":
@@ -1293,23 +1349,21 @@ def frame(conn, source=None, session=None, ctx=None):
         rows = [r for r in rows if r["scale"] not in ("turns", "segment") or r["step"] == "correct"
                 or r["born"] == latest.get(r["turn_text"])]
         rows.sort(key=lambda r: (here[r["turn_text"]][1], r["born"], r["idx"]))
-    out, gone = [], []
     for r in rows:
         m = marks_by.get(r["id"], [])
         if r["id"] in hidden:
-            if m and m[-1]["step"] == "withdraw":
-                gone.append({"event": r["id"], "act": m[-1]["act"], "reason": m[-1]["reason"]})
+            if m and m[-1]["step"] == "withdraw" and withdrawn is not None:
+                withdrawn.append({"event": r["id"], "act": m[-1]["act"], "reason": m[-1]["reason"]})
             continue
         read = modes.read(r["text"])
         own = lambda col: read[col] if absent(r[col]) else r[col]
         turn, src, sess, ordinal = (r["turn"], r["source"], r["session"], r["ordinal"]) if here is None else \
             (here[r["turn_text"]][0], source, session, here[r["turn_text"]][1])
-        out.append({"id": r["id"], "turn": turn, "source": src, "session": sess, "ordinal": ordinal,
-                    "observed": r["turn"],
-                    "text": r["text"], "segments": json.loads(r["segments"]), "unresolved": json.loads(r["unresolved"]),
-                    "speaker": own("speaker"), "mode": own("mode"), "qualifier": own("qualifier"), "modes": read["version"],
-                    "act": r["born"], "operator": r["op_name"], "scale": r["scale"], "step": r["step"], "marks": m})
-    return {"events": out, "withdrawn": gone}
+        yield {"id": r["id"], "turn": turn, "source": src, "session": sess, "ordinal": ordinal,
+               "observed": r["turn"],
+               "text": r["text"], "segments": json.loads(r["segments"]), "unresolved": json.loads(r["unresolved"]),
+               "speaker": own("speaker"), "mode": own("mode"), "qualifier": own("qualifier"), "modes": read["version"],
+               "act": r["born"], "operator": r["op_name"], "scale": r["scale"], "step": r["step"], "marks": m}
 
 
 def languages(conn, source, session):

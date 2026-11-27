@@ -40,6 +40,21 @@ class ConnectTest(unittest.TestCase):
                 self.assertEqual(i.under(cwd, pats), want, cwd)
             self.assertFalse(i.under(st.unworktree(home + "/memory-harness/tmp/worktrees/x"), pats))   # 先算回仓库：mh 的 worktree 不算 tmp
 
+    def test_client_homes(self):
+        """客户端推来的 cwd（2026-11-26：客户端的 /home/<名>/…）先换成服务机家目录下的，再认工作区、对 [connect]。"""
+        from . import instance as i
+        with mock.patch.dict(os.environ, {"HOME": "/Users/me"}), mock.patch.object(i, "CLIENT_HOMES", ("/home/u",)):
+            self.assertEqual(i.local("/home/u/bench/runs/a"), "/Users/me/bench/runs/a")
+            self.assertEqual(i.local("/home/u"), "/Users/me")
+            self.assertEqual(i.local("/home/u.old/x"), "/home/u.old/x")       # 前缀要到一整节
+            self.assertEqual(i.local("/tmp/x"), "/tmp/x")
+            self.assertEqual(i.local(None), "")
+            self.assertTrue(i.under("/home/u/bench/runs/a", i._patterns(["~/bench"])))
+            with mock.patch.object(st, "WORKSPACE_DIRS", {"/Users/me/proj/dsh/nas": "nas"}):
+                self.assertEqual(st.workspace("/home/u/proj/dsh/nas/sub"), "nas")
+            with mock.patch.object(st, "MANAGING", {"home": "/Users/me"}):
+                self.assertEqual(st.workspace("/home/u"), "home")              # 家目录按管理工作区的名字，不取本机家目录的名字
+
 
 class StoreTest(unittest.TestCase):
     def setUp(self):
@@ -103,10 +118,15 @@ class StoreTest(unittest.TestCase):
             (repo / "sub/dir").mkdir(parents=True)
             proj = home / "projects"
             (proj / "alpha/src").mkdir(parents=True)
+            (proj / "beta/core/.git").mkdir(parents=True)                      # 工作区里放几个仓库（用户 11-24）
+            (proj / "beta/ime/src").mkdir(parents=True)
+            (proj / "beta/ime/.git").mkdir()
             with mock.patch.dict(st.WORKSPACE_DIRS, {}, clear=True), mock.patch.object(Path, "home", lambda: home), \
                     mock.patch.object(st.instance, "PROJECTS", proj), mock.patch.dict(st.MANAGING, {"u": str(home), "projects": str(proj)}, clear=True):
                 self.assertEqual(st.workspace(str(repo / "sub/dir")), "my-repo")
                 self.assertEqual(st.workspace(str(proj / "alpha/src")), "alpha")
+                self.assertEqual([st.workspace(str(proj / x)) for x in ("beta", "beta/core", "beta/ime/src")], ["beta"] * 3)
+                self.assertEqual(st.project_workspace(str(proj / "beta/ime/src/a.rs")), "beta")
                 self.assertEqual(st.project_workspace(str(repo / "sub/dir/a.py")), "my-repo")
                 self.assertEqual(st.project_workspace(str(proj / "alpha/src/b.py")), "alpha")
                 self.assertEqual(st.project_workspace("/dev/null"), "")
@@ -180,6 +200,34 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(c.execute("SELECT role FROM occurrence WHERE id=?", (did,)).fetchone()[0], "deletion")
         with self.assertRaises(sqlite3.IntegrityError):                # 触发器装回去了
             c.execute("DELETE FROM occurrence")
+
+    def test_delete_keeps_line_others_hang_on(self):
+        """11-10 删无头会话：它起的线 L15 上还挂着三段巡检会话的话题，线和它们的挂线被一起删了。别人还挂着的线留下。"""
+        from .delete import delete_sessions
+        c, op = self.conn, operator(self.conn, "t", "form", "former")
+        acts = {}
+        for ses in ("a", "b"):
+            sid = occurrence(c, "session", op)
+            c.execute("INSERT INTO session_detail(occurrence,source,session,file,kind,parent,cwd,model,title)"
+                      " VALUES(?,?,?,?,?,?,?,?,?)", (sid, "claude", ses, NA, "user", NA, "/w", NA, NA))
+            c.execute("INSERT INTO turn_text VALUES(?,?,?,?,?,?,?)", (f"t{ses}", "u", "a", "[]", "[]", "[]", st.now()))
+            turn = occurrence(c, "turn", op, parent=sid)
+            c.execute("INSERT INTO turn_detail(occurrence,text,source,session,ordinal,closed,ending,prev,address,"
+                      "origin,host_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (turn, f"t{ses}", "claude", ses, 0, 1, "normal", NA, "[]", "human", "chat"))
+            acts[ses] = occurrence(c, "act", op, inputs={"turn": [turn]}, outcome="ok")
+            c.execute("INSERT INTO session_entry(born,record,source,session,name,topic,stops,words,unresolved)"
+                      " VALUES(?,?,?,?,?,?,'[]','{}','[]')", (acts[ses], acts[ses], "claude", ses, ses, ses))
+        ea, eb = (c.execute("SELECT id FROM session_entry WHERE session=?", (s,)).fetchone()[0] for s in "ab")
+        c.execute("INSERT INTO topic_line(born,name,workspace,node,parent,\"from\") VALUES(?,?,?,?,?,'[]')",
+                  (acts["a"], "巡检", "w", NA, NA))
+        line = c.execute("SELECT id FROM topic_line").fetchone()[0]
+        for ses, e in (("a", ea), ("b", eb)):
+            c.execute("INSERT INTO attachment(born,entry,line,why) VALUES(?,?,?,'')", (acts[ses], e, line))
+        c.commit()
+        delete_sessions(c, [("claude", "a")], "测试会话")
+        self.assertIsNotNone(c.execute("SELECT 1 FROM topic_line WHERE id=?", (line,)).fetchone())
+        self.assertEqual([r[0] for r in c.execute("SELECT entry FROM attachment")], [eb])
 
     def test_append_only(self):
         op = operator(self.conn, "t", "observe", "observer")

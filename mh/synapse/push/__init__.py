@@ -134,7 +134,7 @@ def hook(conn, payload):
     got = {"topic_line": sorted({int(x) for x, _ in pairs if x != "?"}), "session_entry": sorted({int(t) for _, t in pairs})}
     text = track.deliver(conn, VERSION, "assist", {"push": "standing"}, text,
               {k: v for k, v in got.items() if v}, session=session, purpose="interactive",
-              cwd=cwd, channel="push", meta={"host": host})
+              cwd=cwd, channel="push", host=host, meta={"host": host})
     try:                 # 流水出了任何错都不影响推送（pushes.py 的纪律）
         pushes.note("assist", host, session, cwd, True, summary=f"手记推送：{len(text)} 字",
                     version=VERSION, chars=len(text), workspace=workspace(cwd))

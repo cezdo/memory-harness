@@ -878,10 +878,10 @@ def _c_hits(conn, ts):
 
 
 def relive(conn, handles, said=False, recall=None, session="", purpose="interactive", cwd="", note="", source=False,
-           page=None, files=False, near=False, **_):
+           page=None, files=False, near=False, host="", **_):
     tok = _WIN.set(paging(page))
     try:
-        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files, near)
+        return _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files, near, host)
     finally:
         _WIN.reset(tok)
 
@@ -892,7 +892,7 @@ def _window_query():
     return {"page": p} if p != 1 else {}
 
 
-def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False, near=False):
+def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, files=False, near=False, host=""):
     """按位置读（v0.13；v0.12 以前叫 get）：陈述只给它自己，near 时连同前后几条（v0.39），话题按顺序分页（接着读给范围句柄），线、骨架给下一层，E、J 给正文。
     source：来源（陈述的 E、J 的旧会话记录和同一段会话现在的话题）；said：E 走到原话；recall：历史。"""
     L = layers(conn)
@@ -948,7 +948,7 @@ def _relive(conn, handles, said, recall, session, purpose, cwd, note, source, fi
               {"relive": {"handles": list(handles), "said": said, "source": source, "recall": recall, **({"files": True} if files else {}),
                           **({"near": True} if near else {}),
                           **_window_query()}},
-              text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note, raw=said,
+              text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note, raw=said, host=host,
               meta={"sections": sections} if sections else None)
     return text
 
@@ -1088,7 +1088,7 @@ def _rrf(*orders, k=60, depth=200):
     return sorted(score, key=lambda x: -score[x]) + list(dict.fromkeys(rest))
 
 
-def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain=None, **_):
+def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain=None, host="", **_):
     """按词找（v0.32，用户 2026-11-01：多词要有“且”）：查词按空白切成词，每个词单独认（英文按整词）。
     话题按“同一处同时含几个词”分层，含得多的在前；同层先比含的词有多稀有，再比陈述的 BM25（话题取它最高的那条陈述）。
     陈述自己同时含两个词以上（只有一个词时含这个词）、而且这样的不超过一页，才列陈述，后面接话题；否则只列话题（结果多时
@@ -1190,19 +1190,19 @@ def evoke(conn, words, session="", purpose="interactive", cwd="", note="", grain
     naming = glossary.fuller(ts, gpath) if gpath else []   # 命名演进的影子（D5，11-08；D6 11-19 按工作区读词典）：只记、不给看
     meta = {**({"evoked": evoked} if evoked else {}), **({"naming": naming} if naming else {})}
     text = track.deliver(conn, VERSION, "evoke", query, text, dict(ins), session=session, purpose=purpose, cwd=cwd, note=note,
-                         meta=meta or None)
+                         meta=meta or None, host=host)
     return text
 
 
-def roam(conn, node=None, session="", purpose="interactive", cwd="", note="", page=None, **_):
+def roam(conn, node=None, session="", purpose="interactive", cwd="", note="", page=None, host="", **_):
     tok = _WIN.set(paging(page))
     try:
-        return _roam(conn, node, session, purpose, cwd, note)
+        return _roam(conn, node, session, purpose, cwd, note, host)
     finally:
         _WIN.reset(tok)
 
 
-def _roam(conn, node, session, purpose, cwd, note):
+def _roam(conn, node, session, purpose, cwd, note, host):
     """roam（v0.12 以前叫 map）：不给 node 是入口（各工作区）；给工作区名是那个工作区的第一层（有骨架的，是骨架的根下面那层）；给句柄同 relive 的一层。"""
     L = layers(conn)
     from ...engram.store import workspace
@@ -1226,9 +1226,9 @@ def _roam(conn, node, session, purpose, cwd, note):
     else:
         kind, v = resolve(L, node)
         if kind != "node":
-            return _relive(conn, [node], False, None, session, purpose, cwd, note, False)
+            return _relive(conn, [node], False, None, session, purpose, cwd, note, False, host=host)
         text, ins = show_node(L, v, conn=conn)
-    text = track.deliver(conn, VERSION, "roam", {"roam": {"node": node, **_window_query()}}, text, ins, session=session, purpose=purpose, cwd=cwd, note=note)
+    text = track.deliver(conn, VERSION, "roam", {"roam": {"node": node, **_window_query()}}, text, ins, session=session, purpose=purpose, cwd=cwd, note=note, host=host)
     return text
 
 

@@ -47,7 +47,7 @@ from . import attach, glossary, induce, label, pack, restate as _restate, skelet
 
 PROMPTS = Path(__file__).parent / "prompts"
 # 当前的做法：步骤 → (模型定义, 提示词)，只在这里定义。提示词版本从 0.1 起：大改动加前面的数，小改动加后面的数
-CURRENT = {"pack": ("sol-low", "pack-v0.9.5"), # v0.9.5：末尾留视角段的位置，导入的来源填 VIEW_PACK（用户 2026-11-11），别的来源为空、提示词同 v0.9.4
+CURRENT = {"pack": ("sol62-low", "pack-v0.9.5"), # v0.9.5：末尾留视角段的位置，导入的来源填 VIEW_PACK（用户 2026-11-11），别的来源为空、提示词同 v0.9.4
                                                # v0.9.4：写进文件的细节合并掉，结论（选了什么、为什么、关键数值）留在陈述里（用户 11-04）
                                                # v0.9.3：「」只括专名和照引的原话，概念、说法、讨论的主题不括（用户 11-04）
                                                # v0.9.2：陈述写到能用、展开只为查证；一件事 = 读的人会一起用的东西，写细不拆；去掉来源上限（依据哪几条改由程序对）；
@@ -56,16 +56,16 @@ CURRENT = {"pack": ("sol-low", "pack-v0.9.5"), # v0.9.5：末尾留视角段的�
                                                # v0.4：一条一事、来源一页以内、两页要同一段、不写范围，程序检查不合规的重写一次（2026-10-27）
                                                # v0.5：上限不是为了少记，装不下就多写一条，不因此略去（v0.4 离线重跑略去的 E 从 51 涨到 594）；
                                                # 检查 v2 加覆盖：用户的话不略去，略去超过一成的重写
-           "induce": ("sol-low", "induce-v0.1"),               # 归纳：只归纳排查，一句话只说查什么、落在哪（G6，2026-10-29）
-           "label": ("sol-low", "label-v0.2"),
-           "attach": ("sol-low", "attach-v0.3"),               # 有骨架的工作区（v0.3：判据是以后能不能找到，目标只是线索，2026-10-24 L44）
-           "attach_lines": ("sol-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
-           "restate": ("sol-low", "restate-v0.1"),             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
-           "structure": ("sol-low", "structure-v0.1")}         # 会话结构：问题—决定（D4，用户 2026-11-05：跟着 form 做，relive 超窗先给它）
+           "induce": ("sol62-low", "induce-v0.1"),               # 归纳：只归纳排查，一句话只说查什么、落在哪（G6，2026-10-29）
+           "label": ("sol62-low", "label-v0.2"),
+           "attach": ("sol62-low", "attach-v0.3"),               # 有骨架的工作区（v0.3：判据是以后能不能找到，目标只是线索，2026-10-24 L44）
+           "attach_lines": ("sol62-low", "attach-lines-v0.3"),   # 没骨架的工作区：只有线（同上；v0.2：已有的入口可能比新文件夹晚，2026-10-19）
+           "restate": ("sol62-low", "restate-v0.1"),             # 修订提示：只改写依据那几条 E 的陈述（2026-10-21）
+           "structure": ("sol62-low", "structure-v0.1")}         # 会话结构：问题—决定（D4，用户 2026-11-05：跟着 form 做，relive 超窗先给它）
 VIEW_PACK = "pack-view-v0.1"                                   # 带视角的来源（instance.VIEWS）pack 时接在提示词末尾的要求；它的摘要进 pack 的 Operator（window_params）
 STEP_OF = {"attach_lines": "attach"}                           # act 里记的 step
-MODELS = {"sol-low": lambda: invoke.whole(Codex("gpt-6.1-sol", "low"))}
-DESC = {"sol-low": "gpt-6.1-sol low（经 codex exec）"}          # 环境里“现在回看的我”
+MODELS = {"sol62-low": lambda: invoke.whole(Codex("gpt-6.2-sol", "low"))}   # 2026-11-27 换 6.2；之前定义名 sol-low 是 6.1：定义名带版本，模型不在 Operator 名里
+DESC = {"sol62-low": "gpt-6.2-sol low（经 codex exec）"}          # 环境里“现在回看的我”
 MAX_FAILURES = 3
 REWRITES = 1             # pack 检查出不合规的陈述，带着问题当场重写几次（2026-10-27：最多一次，不循环；还不合规的照样入库，记在 meta）
 IDLE = 3600              # 下限：会话最后一轮开始后这么久没有新的一轮。实际按 observe.idle（claude 1 小时、codex 2、dsh 3）判，不早于 observe 预览的时刻（J1、J8，2026-10-27）；
@@ -135,8 +135,10 @@ def redact(text):
 
 # ---- 形成史（只读 form 自己的 act）----
 
-ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, a.output, o.error FROM act_detail a
-          JOIN occurrence o ON o.id=a.occurrence WHERE a.process='form' AND a.step IN ('pack','induce','label','attach','structure') ORDER BY o.id"""
+ACTS = """SELECT o.id, o.operator, o.outcome, o.inputs, a.step, a.window, a.meta, io.output, o.error FROM act_detail a
+          JOIN occurrence o ON o.id=a.occurrence
+          LEFT JOIN act_io io ON io.occurrence=a.occurrence AND a.step='pack'
+          WHERE a.process='form' AND a.step IN ('pack','induce','label','attach','structure') ORDER BY o.id"""
 
 
 # 修订提示（observe 写来的：E 被取代、不成立、撤下、恢复）认领以后怎么做（2026-10-21：两个方案都留着做成选项，先用前者）：
@@ -230,7 +232,7 @@ def history(conn):
             fails.pop((step, unit, op), None)
             if step == "pack":
                 packed.update(json.loads(inputs).get("event", []))
-                (empty.add if (output or "").strip() == "无" else empty.discard)(unit)
+                (empty.add if st.zunpack(output).strip() == "无" else empty.discard)(unit)
             if step == "induce":
                 induced[w.get("pack")] = oid
             if step == "label" and json.loads(meta or "{}").get("carry") is not None and oid >= cut.get(unit[:2], {}).get("attach", 0):
@@ -295,10 +297,11 @@ def units(conn, now=None, session=None):
     from ..observe import select as _select
     unselected = _select.pending(conn) if instance.VIEWS else set()     # 带视角的来源：还没筛完的会话先不整理
     ctx = observe.frame_context(conn)      # 全库的部分只算一次
+    paused = observe.paused_sessions(conn)
     for info in infos:
         source, sess = info["source"], info["session"]
-        if source in instance.PAUSE_SOURCES or (source, sess) in unselected:
-            continue                       # 暂停的来源（[engram].pause_sources）：pack、label、attach 都不做；没筛完的等 observe 筛
+        if (source, sess) in paused or (source, sess) in unselected:
+            continue                       # 暂停的来源（[engram].pause_sources）、不接 mh 的目录：pack、label、attach 都不做；没筛完的等 observe 筛
         # 纠正写的 E 不当新 E：它们只经修订提示进来，改写依据旧 E 的那几条陈述（restate）；当新 E 会按中间插入整段重做，
         # 越过了这次纠正所在的那一级（2026-10-21：01a10aa7、f5cdabd1、session-1cf6 被这样整段重做过）
         evs = [e for e in observe.frame(conn, source, sess, ctx=ctx)["events"] if e["scale"] in NEW_SCALES and e.get("step") != "correct"]
@@ -670,8 +673,7 @@ def _act(conn, op_id, step, unit, window, inputs, text, output, meta, error, h, 
     act = occurrence(conn, "act", op_id, started=st.iso(st.now(), seconds), ended=st.now(), scale="session", inputs=inputs,
                      cause=cause, predecessor=h.last.get((step, unit), NA), outcome=result, error=err,
                      cost=cost(seconds, _usage(meta)))
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "form", step, dumps({"unit": list(unit), **window}), text, output, dumps(meta)))
+    st.write_act(conn, act, "form", step, dumps({"unit": list(unit), **window}), text, output, dumps(meta))
     h.last[(step, unit)] = act
     if result in ("timeout", "content_error"):
         h.fails[(step, unit, op_id)][result] += 1
@@ -826,8 +828,9 @@ def structure_todo(conn, h, ops, session=None):
     done = structures(conn)
     swap = replacements(conn)
     out = []
+    paused = observe.paused_sessions(conn)
     for k in sorted(keys, key=lambda k: -latest[k][1]):
-        if session and not k[1].startswith(session) or k[0] in instance.PAUSE_SOURCES:
+        if session and not k[1].startswith(session) or k in paused:
             continue
         unit = latest[k][0]
         if _failed(h, "structure", unit, ops["structure"]):
@@ -931,8 +934,9 @@ def auto_repack(conn, log=sys.stderr):
     for key, rs in redo_requests(conn).items():
         asked[key] = [r for r in rs if r["from"] == "form"]
     wrote = 0
+    paused = observe.paused_sessions(conn)
     for (step, unit), act in sorted(h.ok.items(), key=lambda x: x[1]):
-        if step != "pack" or unit[0] in instance.PAUSE_SOURCES:
+        if step != "pack" or tuple(unit[:2]) in paused:
             continue
         meta = json.loads(conn.execute("SELECT meta FROM act_detail WHERE occurrence=?", (act,)).fetchone()[0] or "{}")
         hard = [(n, w) for n, w in meta.get("violations", []) if not pack.soft(w)]       # 正文长度是软的：确认过还长就保持
@@ -1313,7 +1317,7 @@ def restate_job(conn, r):
         return None
     ids = sorted({x for _, row in stmts for x in json.loads(row["refs"]).get("event", [])}
                  | {x["id"] for _, new in changes for x in (new or [])})
-    by = {e["id"]: e for e in observe.frame(conn)["events"] if e["id"] in set(ids)}
+    by = {e["id"]: e for e in observe.frame(conn, ids=ids)["events"]}
     rows = {r_["id"]: r_ for r_ in conn.execute(f"SELECT * FROM event WHERE id IN ({','.join('?' * len(ids))})", ids)}
     evs = lambda row: [by.get(x) or {"id": x, "text": rows[x]["text"], "speaker": "?", "mode": "?", "segments": []}
                        for x in json.loads(row["refs"]).get("event", []) if x in rows]
@@ -1347,8 +1351,8 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
         if job is None:                    # 没有受影响的陈述：不调模型，记一次处理
             act = occurrence(conn, "act", op, started=st.now(), ended=st.now(), scale="session",
                              inputs={"request": [r["id"]], "event": r["inputs"].get("event", [])}, cause=cause, outcome="ok")
-            conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "form", "restate", dumps({"unit": list(unit)}), "", "",
-                                                                          dumps({"reason": "没有依据这些 E 的现行陈述"})))
+            st.write_act(conn, act, "form", "restate", dumps({"unit": list(unit)}), "", "",
+                         dumps({"reason": "没有依据这些 E 的现行陈述"}))
             conn.commit()
             done += 1
             continue
@@ -1391,9 +1395,10 @@ def restate(conn, models=None, log=sys.stderr, limit=10, cause="request"):
 def induce_todo(conn, h, ops, session=None):
     """要归纳的单位：最后一次成功的 pack 是现行 pack Operator 写的、有陈述、还没归纳过、没失败满。→ [{"unit", "pack", "session"}]。"""
     out = []
+    paused = observe.paused_sessions(conn)
     for (step, unit), pa in sorted(h.ok.items(), key=lambda x: x[1]):
         if step != "pack" or unit in h.empty or pa in h.induced or (session and not unit[1].startswith(session)) \
-                or unit[0] in instance.PAUSE_SOURCES:
+                or tuple(unit[:2]) in paused:
             continue
         if conn.execute("SELECT operator FROM occurrence WHERE id=?", (pa,)).fetchone()[0] != ops["pack"]:
             continue
@@ -1543,9 +1548,8 @@ def feedback_entry(conn, operator_id, entry_id, reason, name=None, topic=None, s
     change = {k: v for k, v in (("name", name), ("topic", topic), ("stops", stops)) if v is not None}
     act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="session", inputs={"act": [f["born"]]},
                      cause="manual", outcome="ok")
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "form", "feedback", dumps({"entry": entry_id}), dumps(change), "",
-                  dumps({"reason": reason, "holder": holder, "supersedes": f"T{entry_id}"})))
+    st.write_act(conn, act, "form", "feedback", dumps({"entry": entry_id}), dumps(change), "",
+                 dumps({"reason": reason, "holder": holder, "supersedes": f"T{entry_id}"}))
     new = conn.execute("INSERT INTO session_entry(born, record, source, session, name, topic, stops, words, unresolved) "
                        "VALUES(?,?,?,?,?,?,?,?,?)", (act, f["record"], f["source"], f["session"], name or f["name"], topic or f["topic"],
                                                     dumps(new_stops), f["words"], f["unresolved"])).lastrowid
@@ -1598,8 +1602,7 @@ def feedback_attach(conn, operator_id, entry_id, reason, line=None, new_line=Non
                                                         "parent_line": parent_line, "from": list(from_)}
     act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="session", inputs={"act": [f["born"]]},
                      cause="manual", outcome="ok")
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "form", "feedback", dumps({"entry": entry_id}), dumps(change), "", dumps({"reason": reason, "holder": holder})))
+    st.write_act(conn, act, "form", "feedback", dumps({"entry": entry_id}), dumps(change), "", dumps({"reason": reason, "holder": holder}))
     if new_line is not None:
         lid = conn.execute('INSERT INTO topic_line(born, name, workspace, node, parent, "from") VALUES(?,?,?,?,?,?)',
                            (act, new_line, ws, path, par, dumps([int(handle_of(x)[1:]) for x in from_]))).lastrowid
@@ -1629,9 +1632,8 @@ def feedback_line(conn, operator_id, name, reason, workspace, node=None, parent_
         raise ValueError(f"「{name}」和 {workspace} 已有的线重名")
     act = occurrence(conn, "act", operator_id, started=st.now(), ended=st.now(), scale="session", inputs={},
                      cause="manual", outcome="ok")
-    conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                 (act, "form", "feedback", dumps({"line": name}), dumps({"new_line": name, "node": node, "workspace": workspace,
-                  "parent_line": parent_line, "from": list(from_)}), "", dumps({"reason": reason, "holder": holder})))
+    st.write_act(conn, act, "form", "feedback", dumps({"line": name}), dumps({"new_line": name, "node": node, "workspace": workspace,
+                 "parent_line": parent_line, "from": list(from_)}), "", dumps({"reason": reason, "holder": holder}))
     lid = conn.execute('INSERT INTO topic_line(born, name, workspace, node, parent, "from") VALUES(?,?,?,?,?,?)',
                        (act, name, workspace, path, par, dumps([int(handle_of(x)[1:]) for x in from_]))).lastrowid
     conn.commit()

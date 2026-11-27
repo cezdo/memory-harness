@@ -77,7 +77,7 @@ class Flow(Base):
         self.assertEqual(handle(self.k, "agy", "prompt", {"conversationId": "a1", "invocationNum": 2,
                                                           "lastUserInput": "<USER_REQUEST>\n/mhcore 改称呼\n</USER_REQUEST>"}), (None, 0))
         self.assertEqual(handle(self.k, "agy", "pre", {"conversationId": "a1", "workspacePaths": [str(self.src.parents[2])],
-                                                       "toolCall": {"name": "edit_file", "args": {"Path": str(self.src)}}}), (None, 0))
+                                                       "toolCall": {"name": "edit_file", "args": {"Path": str(self.src)}}}), ({"decision": "allow"}, 0))
         # ACP（transcriptPath 是 conversations/<id>.db）：钩子拿不到原话，/mhcore 交给 Zeron 调的 acp-prompt；这里什么都不做，
         # 也不把 acp-prompt 刚开的窗口当“下一次输入”关掉
         with tempfile.TemporaryDirectory() as td:

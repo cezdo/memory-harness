@@ -11,14 +11,16 @@ MARK = {"推翻": "✗ 推翻", "接替": "↻ 接替", "支持": "← 支持", 
 
 def latest(conn, session, items):
     """这段会话最后一份成功的结构，且输入就是现在的主列 → (act, 结构)；没有返回 None。"""
-    r = conn.execute("SELECT o.id, a.output, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence "
+    from ...engram.store import zunpack
+    r = conn.execute("SELECT o.id, io.output, a.meta FROM act_detail a JOIN occurrence o ON o.id=a.occurrence "
+                     "JOIN act_io io ON io.occurrence=a.occurrence "
                      "WHERE a.process='form' AND a.step='structure' AND o.outcome='ok' "
                      "AND json_extract(a.window, '$.unit[0]')=? AND json_extract(a.window, '$.unit[1]')=? ORDER BY o.id DESC LIMIT 1",
                      session).fetchone()
     if r is None or json.loads(r["meta"] or "{}").get("items") != items:
         return None
     try:
-        return r["id"], json.loads(r["output"])
+        return r["id"], json.loads(zunpack(r["output"]))
     except ValueError:
         return None
 

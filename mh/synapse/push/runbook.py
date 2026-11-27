@@ -120,6 +120,18 @@ def _anchors(text):
     return got
 
 
+def _archived(repo, t):
+    """tmp/ 下找不到的，去 tmp/archive/<半月起始日>/ 下找（AGENTS：tmp 旧目录挪进归档，引用不改写，2026-11-20）。"""
+    tmp = (repo / "tmp").resolve()
+    try:
+        rest = t.relative_to(tmp)
+    except ValueError:
+        return None
+    if rest.parts[:1] == ("archive",):
+        return None
+    return next((d / rest for d in sorted((tmp / "archive").glob("*/"), reverse=True) if (d / rest).exists()), None)
+
+
 def drift(repo, rel, open_ids):
     """runbook 和设计对不上的地方 → 几行（用户 2026-10-30）：链接指向的文件或标题不在了；设计里写“runbook X”而 X 已经
     不在 runbook 里（做完移走了）。只核 runbook 所在的文档目录（`design/`），只追加的历史（案例正文、已做）不核。
@@ -135,6 +147,8 @@ def drift(repo, rel, open_ids):
             if path.startswith(("http:", "https:", "mailto:")):
                 continue
             t = (f.parent / path).resolve() if path else f
+            if not t.exists():
+                t = _archived(repo, t) or t
             if not t.exists():
                 broken.append(f"{f.relative_to(top)} → {path}")
             elif anchor and t.is_file() and t.suffix == ".md":

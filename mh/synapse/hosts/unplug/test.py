@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from . import REPO, claude_home, codex_home, dsh_home, strip_hooks
+from . import REPO, agy_home, claude_home, codex_home, dsh_home, strip_hooks
 
 MH = f"/usr/bin/python3 -I -S {REPO}/mh/engram/elevate/hook.py claude prompt"
 UI = "/home/x/tui/bin/agent-signal clear"
@@ -31,6 +31,34 @@ class HomeTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_agy(self):
+        src = self.root / ".gemini"
+        config = src / "config"
+        (config / "skills/no-observe").mkdir(parents=True)
+        (config / "skills/other").mkdir()
+        token = src / "antigravity-cli/antigravity-oauth-token"
+        token.parent.mkdir()
+        token.write_text("fake")
+        settings = token.with_name("settings.json")
+        settings.write_text('{"model": "default"}')
+        grouped = {"matcher": "read", "hooks": [hook(MH), hook(UI)]}
+        hooks = {"memory-harness": {"SessionStart": [hook(MH)]},
+                 "orca-status": {"PreInvocation": [hook(UI)], "PreToolUse": [grouped], "Stop": [hook(MH)]}}
+        (config / "hooks.json").write_text(json.dumps(hooks))
+        (config / "mcp_config.json").write_text(json.dumps({"mcpServers": {"mh": {}, "other": {"command": "other"}}}))
+
+        h = agy_home(self.root / "out", src)
+        self.assertEqual(h, self.root / "out/.gemini")
+        self.assertEqual(json.loads((h / "config/hooks.json").read_text()), {
+            "orca-status": {"PreInvocation": [hook(UI)], "PreToolUse": [dict(grouped, hooks=[hook(UI)])]}})
+        self.assertEqual(json.loads((h / "config/mcp_config.json").read_text()),
+                         {"mcpServers": {"other": {"command": "other"}}})
+        self.assertEqual([p.name for p in (h / "config/skills").iterdir()], ["other"])
+        self.assertEqual((h / token.relative_to(src)).readlink(), token)
+        isolated_settings = h / settings.relative_to(src)
+        self.assertFalse(isolated_settings.is_symlink())
+        self.assertEqual(isolated_settings.read_text(), settings.read_text())
 
     def test_claude(self):
         src = self.root / ".claude"

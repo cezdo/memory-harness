@@ -41,7 +41,10 @@ def _alive(pid):
 
 
 def host_pid(start=None):
-    """往上找第一个叫 claude 的进程（钩子经 sh 起，MCP 直接是它的子进程）；找不到给 0。"""
+    """往上找第一个叫 claude 的进程（钩子经 sh 起，MCP 直接是它的子进程）；找不到给 0。
+    宿主在别的机器上、入口经 forward 转过来的，那边找好了放在 MH_HOST_PID（“设备-pid”，X7）。"""
+    if not start and os.environ.get("MH_HOST_PID"):
+        return os.environ["MH_HOST_PID"]
     pid = start or os.getppid()
     for _ in range(8):
         if pid <= 1:
@@ -73,7 +76,7 @@ def bind(session, pid=None):
 def current(pid=None):
     """MCP：父进程（claude）现在的会话；没记过给空串。"""
     try:
-        return (RUN / str(pid or os.getppid())).read_text().strip()
+        return (RUN / str(pid or os.environ.get("MH_HOST_PID") or os.getppid())).read_text().strip()
     except OSError:
         return ""
 

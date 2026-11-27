@@ -60,7 +60,7 @@ class EngramTest(unittest.TestCase):
         """一次 form：读这些 E，写几条 J（关系 [{kind, to}]）。返回 J 编号。"""
         op = st.operator(self.conn, "form-test", "form", "former")
         act = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"event": list(events)})
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "form", "judge", "{}", "", "", "{}"))
+        st.write_act(self.conn, act, "form", "judge", "{}", "", "", "{}")
         out = []
         for i, (text, rels) in enumerate(judgments):
             cur = self.conn.execute("INSERT INTO judgment(born, idx, text, holders, basis, basis_labels, relations, pattern, slots, "
@@ -78,14 +78,32 @@ class EngramTest(unittest.TestCase):
         def pack(violations):
             a = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"event": [self.e1]})
             meta = {"violations": [[0, "有 25 条事件没有落在任何陈述上"]]} if violations else {}
-            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)",
-                              (a, "form", "pack", st.dumps({"unit": ["dsh", "s1", self.e1]}), "", "名字：x\n", st.dumps(meta)))
+            st.write_act(self.conn, a, "form", "pack", st.dumps({"unit": ["dsh", "s1", self.e1]}), "", "名字：x\n", st.dumps(meta))
             self.conn.commit()
             return a
         bad = pack(True)
         self.assertIn(f"act {bad}", check.check(self.conn, self.db).split("覆盖（")[1])      # 现行的违规
         pack(False)                                                                          # 重做了，违规的被取代
         self.assertNotIn("不合 pack 的检查", check.check(self.conn, self.db).split("覆盖（")[1])
+
+    def test_check_attached_entry_lost_line(self):
+        """挂线记了成功、话题却不在任何线上（11-23：删除带走了别人挂着的线，check 原来看不出）。"""
+        op = st.operator(self.conn, "form-test-attach", "form", "former")
+        unit = st.dumps({"unit": ["dsh", "s1", self.e1]})
+        acts = {}
+        for step in ("pack", "label", "attach"):
+            acts[step] = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"event": [self.e1]})
+            st.write_act(self.conn, acts[step], "form", step, unit, "", "", "{}")
+        self.conn.execute("INSERT INTO session_entry(born,record,source,session,name,topic,stops,words,unresolved)"
+                          " VALUES(?,?,?,?,?,?,'[]','{}','[]')", (acts["label"], acts["pack"], "dsh", "s1", "x", "x"))
+        self.conn.commit()
+        self.assertIn("挂过线、话题现在却没挂在线上", check.check(self.conn, self.db).split("覆盖（")[1])
+        self.conn.execute("INSERT INTO topic_line(born,name,workspace,node,parent,\"from\") VALUES(?,?,?,?,?,'[]')",
+                          (acts["attach"], "线", "w", st.NA, st.NA))
+        self.conn.execute("INSERT INTO attachment(born,entry,line,why) VALUES(?,(SELECT max(id) FROM session_entry),"
+                          "(SELECT max(id) FROM topic_line),'')", (acts["attach"],))
+        self.conn.commit()
+        self.assertNotIn("挂过线、话题现在却没挂在线上", check.check(self.conn, self.db))
 
     def test_check(self):
         report = check.check(self.conn, self.db)
@@ -126,7 +144,7 @@ class EngramTest(unittest.TestCase):
         """C 的成员和表述要解析得到（D1a，2026-10-21）：绕过 cognize.write 直接写一条坏引用，检查认出来。"""
         op = st.operator(self.conn, "cognize-test", "cognize", "cognizer")
         act = st.occurrence(self.conn, "act", op, outcome="ok")
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "cognize", "write", "{}", "", "", "{}"))
+        st.write_act(self.conn, act, "cognize", "write", "{}", "", "", "{}")
         bad = st.dumps([{"kind": "form_record", "id": 999, "rel": "part"}])
         self.conn.execute('INSERT INTO cognition(born, kind, name, statements, members, "from", state, window) VALUES(?,?,?,?,?,?,?,?)',
                           (act, "concrete", "甲", st.dumps([{"text": "甲。", "refs": []}]), bad, "[]", st.NA, st.NA))
@@ -143,7 +161,7 @@ class EngramTest(unittest.TestCase):
 
         def reread(turns, rels):
             act = st.occurrence(self.conn, "act", op, outcome="ok", inputs={"turn": turns, "request": [rid]}, cause="request")
-            self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (act, "observe", "rough", st.dumps({"turns": turns}), "", "", "{}"))
+            st.write_act(self.conn, act, "observe", "rough", st.dumps({"turns": turns}), "", "", "{}")
             return self.conn.execute("INSERT INTO event(born, idx, turn, text, mode, qualifier, speaker, segments, unresolved, "
                                      "relations) VALUES(?,0,?,'新的','?unknown','','?unknown','[]','[]',?)",
                                      (act, turns[0], st.dumps(rels))).lastrowid
@@ -162,7 +180,7 @@ class EngramTest(unittest.TestCase):
         reread([t2], [{"kind": "supersedes", "to": self.e1}, {"kind": "supersedes", "to": e3 + 50}])
         bad = st.occurrence(self.conn, "act", st.operator(self.conn, "form-test", "form", "former"), outcome="ok",
                             inputs={"request": [rid]})
-        self.conn.execute("INSERT INTO act_detail VALUES(?,?,?,?,?,?,?)", (bad, "form", "pack", "{}", "", "", "{}"))
+        st.write_act(self.conn, bad, "form", "pack", "{}", "", "", "{}")
         self.conn.commit()
         report = check.check(self.conn, self.db)
         self.assertIn("取代：旧 E 的出处不在新 E 读的那几轮里", report)

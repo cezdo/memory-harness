@@ -7,9 +7,10 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+from .. import mcp_command, python
 
 ROOT = Path(__file__).resolve().parents[4]
-PREFIX = f"env PYTHONPATH={shlex.quote(str(ROOT))} /usr/bin/python3 -m mh.synapse.hosts.agy "
+PREFIX = f"env PYTHONPATH={shlex.quote(str(ROOT))} {python()} -m mh.synapse.hosts.agy "
 OURS = re.compile(r"-m mh\.synapse\.hosts\.agy ")
 GROUP = "memory-harness"
 SKILLS = ("mh-zhengming", "mh-describe")
@@ -34,10 +35,12 @@ def configuration():
 
 
 def mcp_server():
+    # MH_HOST 写进 MCP 的环境：经 relay 连常驻服务时，服务不经过 hosts.agy 的 mcp 入口，靠它认宿主（X10）
+    cmd = mcp_command([python(), "-m", "mh.synapse.hosts.agy", "mcp"])
     return {
-        "command": "/usr/bin/python3",
-        "args": ["-m", "mh.synapse.hosts.agy", "mcp"],
-        "env": {"PYTHONPATH": str(ROOT)},
+        "command": cmd[0],
+        "args": cmd[1:],
+        "env": {"PYTHONPATH": str(ROOT), "MH_HOST": "agy"},
     }
 
 

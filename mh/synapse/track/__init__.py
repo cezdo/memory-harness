@@ -54,31 +54,32 @@ def _split(conn, got):
 
 
 def use(conn, version, mode, query, shown, got, session="", purpose="interactive", cwd="", note="", channel="pull",
-        meta=None):
+        meta=None, host=""):
     """记一次拉取（或推送）。got：{"<种类>": [编号…]}，取到或送达的是哪些（会话入口、话题线、骨架也可以，见 _split）。
-    写完就提交，不留写事务（观察、形成也在写这个库）。没带会话编号的交互调用记为 dev（开发调试，不算使用；照旧的足迹）。"""
-    if purpose == "interactive" and not session:
+    写完就提交，不留写事务（观察、形成也在写这个库）。没带会话编号的交互拉取记为 dev（开发调试，不算使用；照旧的足迹）。"""
+    if channel == "pull" and purpose == "interactive" and not session:
         purpose = "dev"
-    parent, host = _session(conn, session)
+    parent, db_host = _session(conn, session)
     inputs, handles = _split(conn, got)
     meta = dict(meta or {})
+    resolved_host = db_host if db_host != UNKNOWN else (host or meta.get("host") or UNKNOWN)
     t = st.now()
     oid = st.occurrence(conn, "use", operator(conn, version), started=t, ended=t, scale="turn", inputs=inputs,
                         cause=CAUSES.get(purpose, UNKNOWN), parent=parent, outcome="ok")
     meta["expression"] = express.evidence(meta.get("expression") or instance.expression(purpose), shown)
     conn.execute("INSERT INTO use_detail VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (oid, channel, mode, purpose, host, session or UNKNOWN, cwd or UNKNOWN, NA, dumps(query), shown,
+                 (oid, channel, mode, purpose, resolved_host, session or UNKNOWN, cwd or UNKNOWN, NA, dumps(query), shown,
                   note or NA, dumps(dict(meta or {}, **({"handles": handles} if handles else {})))))
     conn.commit()
     return oid
 
 
-def deliver(conn, version, mode, query, text, got, *, session="", purpose="interactive", cwd="", note="", channel="pull", meta=None, raw=False):
+def deliver(conn, version, mode, query, text, got, *, session="", purpose="interactive", cwd="", note="", channel="pull", meta=None, raw=False, host=""):
     """最终交付与 shown 使用同一个字符串；原来源内容和句柄不变。"""
     ctx = instance.expression("standing" if mode == "assist" else "memory" if purpose in ("interactive", "prefetch", "dev") else purpose)
     shown = express.present(text, ctx, raw=raw)
     info = dict(meta or {}, expression={**express.evidence(ctx, shown), "source_raw": raw})
-    use(conn, version, mode, query, shown, got, session=session, purpose=purpose, cwd=cwd, note=note, channel=channel, meta=info)
+    use(conn, version, mode, query, shown, got, session=session, purpose=purpose, cwd=cwd, note=note, channel=channel, meta=info, host=host)
     return shown                         # 送达编号只在库里，不进标签（用户 2026-11-02：不再推进上下文）
 
 
@@ -95,6 +96,7 @@ def presentation_feedback(conn, version, target, reason, *, session="", cwd="", 
     got = json.loads(row["inputs"])
     got["use"] = [target]
     use(conn, version, "feedback", {"feedback": detail}, shown, got, session=session, cwd=cwd, note=note,
+        purpose="interactive" if session else "dev",
         channel="feedback", meta={"feedback": detail, "expression": express.evidence(instance.expression("feedback"), shown)})
     return shown
 

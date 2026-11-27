@@ -2,8 +2,8 @@
 （2026-10-15：推送用 hook，拉取用自己写的 MCP 服务，尽量减少手写命令的损耗）。
 
 - 不依赖 MCP SDK：stdio 传输就是一行一条 JSON-RPC 消息，只需 initialize、tools/list、tools/call、ping 四种，自己写，不新建 venv。
-- 会话编号取宿主给子进程的环境变量 CLAUDE_CODE_SESSION_ID，足迹照旧记在这段会话上（目的 interactive）；
-  取不到时，工具参数里可以给 session，再不给就记为 dev。
+- Claude Code 从环境和钩子记录取会话号，其余宿主经内部参数或 agy 旁路传入；宿主随请求记进足迹。
+  交互拉取没有会话号时记为 dev。
 - 库：新库 engram.db，经 mh/synapse/pull 取（2026-10-19 换库，E1a；旧库 E4 归档）。环境变量 MH_DB 可以换（测试用拷贝，不在正式库上留足迹）。
 - 进程常驻于一段会话：pull 的读视图按库的变化缓存，get、map 不用每次重建。
 - 出错不让会话断：返回 isError 和错误文字，进程继续。
@@ -19,9 +19,14 @@ dsh（2026-10-15）：一个 dsh 进程里所有会话共用一个服务进程�
   所以不走 dsh 自带的 MCP 客户端，由 mh/synapse/hosts/dsh/ 插件自己连这个服务，每次调用把会话编号放进参数 session，
   并去掉子进程环境里的 CLAUDE_CODE_SESSION_ID（dsh web 若从 Claude Code 里启动，会继承到那段 Claude 会话的编号）。
 """
+import concurrent.futures
+import contextvars
+import io
 import json
 import os
+import socket
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -29,6 +34,7 @@ from .. import library
 from ...engram.store.instance import USER_NAME, unplugged
 
 NAME, PROTOCOL = "mh", "2025-06-18"
+CODEX_HINT = "memory-harness memory tools (evoke, relive, roam, yorimichi, shiori); usage is in the handnote's tools section."
 
 NOTE = {"note": {"type": "string", "description": "一句话意见"}}
 WINDOW = {      # relive、roam 的翻页：一页固定 8 条，没有 limit（evoke 连 page 也没有，v0.17；relive、roam 去掉 limit，v0.24）
@@ -78,15 +84,42 @@ def tools():
     return TOOLS
 
 
-def _session(args):
+# 这条连接是谁（2026-11-26 试 relay）：直接起的进程就是本进程自己；经 relay 连进常驻服务的，用 relay 开头报的那份。
+# 只认这几个环境变量和 cwd、父进程号：认宿主、会话、目录用（_host、_session、unplugged）。
+ENV_KEYS = ("MH_HOST", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "MH_HOST_PID", "MH_DEVICE", "MH_CLIENT_HOME")
+_CTX = contextvars.ContextVar("mcp_ctx", default=None)
+
+
+def _env(k):
+    ctx = _CTX.get()
+    return (ctx["env"].get(k) if ctx else os.environ.get(k)) or None
+
+
+def _cwd():
+    ctx = _CTX.get()
+    return ctx["cwd"] if ctx else os.getcwd()
+
+
+def _ppid():
+    ctx = _CTX.get()
+    return ctx["ppid"] if ctx else os.getppid()
+
+
+def _host(args):
+    return (args.get("host") or _env("MH_HOST")
+            or ("claude" if _env("CLAUDE_CODE_SESSION_ID") else "")
+            or ("codex" if _env("CODEX_THREAD_ID") else ""))
+
+
+def _session(args, host):
     """Claude Code：钩子按宿主进程记下的当前会话（/clear 以后环境变量是旧的），没有再用环境变量；别的宿主经参数给。"""
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+    if host == "claude" and _env("CLAUDE_CODE_SESSION_ID"):
         from ..hosts import claude
-        return claude.current() or os.environ["CLAUDE_CODE_SESSION_ID"]
+        return claude.current(_env("MH_HOST_PID") or _ppid()) or _env("CLAUDE_CODE_SESSION_ID")
     return args.get("session") or ""
 
 
-HIDDEN = ("session", "cwd")       # 宿主、测试传的，不在 schema 里
+HIDDEN = ("session", "cwd", "host")       # 宿主、测试传的，不在 schema 里
 
 
 class ArgError(ValueError):
@@ -113,19 +146,19 @@ UNPLUGGED_SAID = "这个目录不接 mh（实例配置 [connect].unplugged），
 def call(conn, name, args):
     """执行一个工具，返回文字。"""
     check_args(name, args)
-    if os.environ.get("MH_HOST") == "agy":     # ACP 不认 bind 的 overwrite：按旁路认会话（hosts/agy，2026-11-20）
+    host = _host(args)
+    if host == "agy":     # ACP 不认 bind 的 overwrite：按旁路认会话（hosts/agy，2026-11-20）
         from ..hosts.agy import take
         got = take(name, args)
         if got and not args.get("session"):
             args = dict(args, session=got.get("session") or "", cwd=args.get("cwd") or got.get("cwd") or "")
-    if unplugged(args.get("cwd") or os.getcwd()):
+    if unplugged(args.get("cwd") or _cwd()):
         return UNPLUGGED_SAID
-    kw = dict(session=_session(args), purpose="interactive", cwd=args.get("cwd") or os.getcwd(), note=args.get("note") or "")
+    kw = dict(session=_session(args, host), host=host, purpose="interactive", cwd=args.get("cwd") or _cwd(), note=args.get("note") or "")
     if name in ("evoke", "relive", "roam"):
         return _call_new(conn, name, args, kw)
     if name == "yorimichi":     # 允许联想拐几次（push/yorimichi，2026-10-28）：联想的钩子按它给不给、给几条
         from ..push import yorimichi
-        host = os.environ.get("MH_HOST") or ("claude" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "")
         return yorimichi.record(kw["session"], args.get("width"), args.get("why") or "", host=host)
     if name == "shiori":        # 栞（I7，2026-11-13）：调用本身就是标记，这里什么都不写（engram/observe/shiori）
         return "夹好了。这一轮会被精读；落库以前，手记近况的“未落库”里看得到它。"
@@ -159,10 +192,12 @@ def handle(conn, msg):
         from .. import pull
         result = {"protocolVersion": want, "capabilities": {"tools": {}},
                   "serverInfo": {"name": NAME, "version": pull.VERSION}}             # 不给 instructions：用法在手记的“工具”里，这里再写一遍就重复了（用户 2026-10-25）
+        if _env("MH_HOST") == "codex":    # codex 延迟加载只列命名空间和这句说明，空着模型认不出 mh 的工具（2026-11-26）；只给一句指路，不写用法
+            result["instructions"] = CODEX_HINT
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": [] if unplugged(os.getcwd()) else tools()}     # 不接 mh 的目录里起的（Claude Code、codex 按会话起）：不给工具
+        result = {"tools": [] if unplugged(_cwd()) else tools()}     # 不接 mh 的目录里起的（Claude Code、codex 按会话起）：不给工具
     elif method == "tools/call":
         p = msg.get("params") or {}
         try:
@@ -177,8 +212,11 @@ def handle(conn, msg):
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
-def serve(stdin=sys.stdin, stdout=sys.stdout):
-    conn = library()
+def serve(stdin=sys.stdin, stdout=sys.stdout, run=None):
+    """run(msg) → 回复：不给就在本进程开库、直接 handle（stdio 时）；常驻服务给的是交给它那个工作线程去做。"""
+    if run is None:
+        conn = library()
+        run = lambda m: handle(conn, m)
     for line in stdin:
         line = line.strip()
         if not line:
@@ -188,11 +226,159 @@ def serve(stdin=sys.stdin, stdout=sys.stdout):
         except ValueError:
             out = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "不是 JSON"}}
         else:
-            out = handle(conn, msg) if isinstance(msg, dict) else None
+            out = run(msg) if isinstance(msg, dict) else None
         if out is not None:
             stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
             stdout.flush()
 
 
+SOCKET = Path(os.environ.get("MH_HOME", Path.home() / ".local/share/memory-harness")) / "run" / "mcp.sock"   # 同 store.HOME
+
+
+def _context(hello):
+    """relay 开头那行 → 这条连接的 ctx。只留 ENV_KEYS；宿主不是 Claude 的（codex、agy 在 MCP 配置里写 MH_HOST），
+    同它们自己的 mcp 入口：会话来自工具参数，外层 Claude 会话漏进来的 CLAUDE_CODE_SESSION_ID 不算。"""
+    env = {k: v for k, v in (hello.get("env") or {}).items() if k in ENV_KEYS and v}
+    if env.get("MH_HOST", "claude") != "claude":
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+    return {"env": env, "cwd": hello.get("cwd") or "", "ppid": hello.get("ppid") or 0}
+
+
+def _with_env(ctx):
+    """钩子在工作线程里跑时，临时把 relay 带来的环境变量放进 os.environ（用完还原）。
+    本机调时没带 MH_HOST_PID，按 relay 的 ppid 往上找 claude 进程号，让 claude.bind() 认得出。"""
+    env = dict(ctx.get("env") or {})
+    if not env.get("MH_HOST_PID") and ctx.get("ppid"):
+        from ..hosts import claude
+        pid = claude.host_pid(ctx["ppid"])
+        if pid:
+            env["MH_HOST_PID"] = str(pid)
+    saved = {k: os.environ.get(k) for k in ENV_KEYS}
+    for k in ENV_KEYS:
+        if env.get(k):
+            os.environ[k] = str(env[k])
+        else:
+            os.environ.pop(k, None)
+    return saved
+
+
+def _restore_env(saved):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def handle_hook(conn, action, raw_stdin, ctx):
+    """常驻服务代跑一次性钩子（inject / associate / codex-start / codex-associate）→ (exit_code, stdout_str, stderr_str)。"""
+    import io
+    saved = _with_env(ctx)
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    old_err = sys.stderr
+    try:
+        sys.stderr = err
+        if action == "inject":
+            from .. import push
+            out.write(json.dumps(push.hook(conn, json.loads(raw_stdin)), ensure_ascii=False) + "\n")
+        elif action == "associate":
+            from ..push import associate
+            code = associate.hook(io.StringIO(raw_stdin), out) or 0
+        elif action in ("codex-start", "codex-associate"):
+            from ..hosts.codex import __main__ as codex_main
+            d = json.loads(raw_stdin)
+            d["host"] = "codex"
+            if not (d.get("agent_id") or d.get("agent_type")):
+                if action == "codex-start":
+                    from .. import push
+                    json.dump(codex_main.label(push.hook(conn, d)), out, ensure_ascii=False)
+                else:
+                    from ..push import associate
+                    buf = io.StringIO()
+                    c = associate.hook(io.StringIO(json.dumps(d)), buf)
+                    text = buf.getvalue()
+                    if text and not c:
+                        text = json.dumps(codex_main.label(json.loads(text)), ensure_ascii=False)
+                    out.write(text)
+                    code = c or 0
+        else:
+            err.write(f"mh-mcp: 不支持的钩子 {action}\n")
+            code = 1
+    except Exception as e:
+        err.write(f"mh-mcp hook {action} 出错：{e!r}\n")
+        code = 1
+    finally:
+        sys.stderr = old_err
+        _restore_env(saved)
+    return code, out.getvalue(), err.getvalue()
+
+
+def daemon(path=SOCKET):
+    """常驻的 MCP + 钩子服务（2026-11-26 试：原来每段会话起一个 Python 进程，各 30M；改成各会话起一个几 MB 的 relay 连到这里）。
+    每条连接：第一行是 relay 报的 {"env": {…}, "cwd": …, "ppid": …}；
+    - 无 mode / mode="mcp"：之后是一行一条 JSON-RPC；
+    - mode="hook"：之后是钩子 stdin 原文，回复 `<exit_code> <stdout_bytes>\n<stdout><stderr>`。
+    所有调用交给一个工作线程，一次做一个：库连接和 pull 的读视图缓存（按库连接存）只有一份，各会话共用，
+    启动后立即异步预热读视图缓存，消除首次 evoke 的冷启动尖刺。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    os.chmod(path, 0o600)
+    srv.listen()
+    state = {}
+    worker = concurrent.futures.ThreadPoolExecutor(1, initializer=lambda: state.setdefault("conn", library()))
+    def _warm():
+        from . import layers
+        layers(state["conn"])
+
+    worker.submit(_warm)                               # 启动后预热 Layers 缓存，消除首次 evoke 5s 冷启动
+
+    def run(ctx, msg):
+        def job():
+            _CTX.set(ctx)
+            return handle(state["conn"], msg)
+        return worker.submit(contextvars.copy_context().run, job).result()
+
+    def run_hook(ctx, action, raw_stdin):
+        def job():
+            _CTX.set(ctx)
+            return handle_hook(state["conn"], action, raw_stdin, ctx)
+        return worker.submit(contextvars.copy_context().run, job).result()
+
+    def one(sock):
+        with sock, sock.makefile("rb") as rf, sock.makefile("wb") as wf:
+            try:
+                head = rf.readline()
+                hello = json.loads(head.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                return
+            ctx = _context(hello)
+            if hello.get("mode") == "hook":
+                try:
+                    raw = rf.read().decode("utf-8", errors="replace")
+                    code, out_s, err_s = run_hook(ctx, hello.get("action") or "", raw)
+                    ob, eb = out_s.encode("utf-8"), err_s.encode("utf-8")
+                    wf.write(f"{code} {len(ob)}\n".encode("ascii") + ob + eb)
+                    wf.flush()
+                except OSError:
+                    pass
+                return
+            try:
+                serve(io.TextIOWrapper(rf, encoding="utf-8"), io.TextIOWrapper(wf, encoding="utf-8"),
+                      run=lambda m: run(ctx, m))
+            except (OSError, ValueError):
+                pass
+
+    while True:
+        sock, _ = srv.accept()
+        threading.Thread(target=one, args=(sock,), daemon=True).start()
+
+
 if __name__ == "__main__":
-    serve()
+    if sys.argv[1:2] == ["daemon"]:
+        daemon()
+    else:
+        from mh.synapse.hosts import forward       # 本机有转发配置就整个转给 mh 服务机（X7），不返回
+        forward.maybe()
+        serve()

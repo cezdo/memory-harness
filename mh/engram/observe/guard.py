@@ -8,7 +8,11 @@ import re
 import shlex
 import os
 
-COUNT = os.environ.get("MH_COUNT", "/usr/local/mh-tools/mh-count/mh-count")
+from ..store.instance import TOOLS, _tools
+
+# 字数命令写进精读的提示词，路径要是 dsh web 实际跑的那台机器上的：精读经 [invoke.remote] 交给别的机器时，
+# 本机的实例配置 [tools].mh_count 写那台的路径（2026-11-26：macOS 上算出 ~/local/…，Linux 上是 /usr/local/…）
+COUNT = os.environ.get("MH_COUNT") or _tools.get("mh_count") or str(TOOLS / "mh-count/mh-count")
 NAMES = {COUNT, "mh-count"}
 OPS = set(";&|()<>")
 
@@ -35,7 +39,7 @@ def allow(cmd):
 
 CJK = "一-鿿"
 EXT = r"(?:md|py|html?|jsonl?|ya?ml|js|ts|mjs|sh|txt|db|toml|csv|zstd|log|patch|ini|cfg|conf|service|timer|png|jpe?g|pdf|ahk|ps1|bat|exe|zip)"
-URL = re.compile(r"https?://[^\s<>\"'`)\]}，。；、）」]+")
+URL = re.compile(r"(?:https?|file)://[^\s<>\"'`)\]}，。；、）」]+")   # file:// 也算（2026-11-25：file:///home/… 里的路径前面是 /，路径那条认不出，原样漏给了观察者）
 A = r"[A-Za-z0-9_.\-@+]"                    # 路径的一节：只认 ASCII（Python 的 \w 也匹配中文）
 F = rf"[A-Za-z0-9_\-{CJK}]"                  # 文件名可以有中文
 PATH = re.compile(

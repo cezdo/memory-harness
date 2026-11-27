@@ -7,8 +7,9 @@ import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
-from . import REPO, ROOT, confine, TO_USER, awaken, due, hosts, notes, own_actions, pick, section, thread, turns, wakes
+from . import REPO, ROOT, confine, TO_USER, awaken, due, hosts, notes, own_actions, pick, post, section, thread, turns, wakes
 from ...engram import store
 from .hosts import claude
 from .hosts.codex_test import CodexTest
@@ -68,6 +69,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(got["旧字段"]["bad"], ["谁：codex", "宿主：codex", "到：2026-11-09", "每：7 天"])
         self.assertEqual((got["新字段"]["host"], got["新字段"]["bad"]), ("codex", []))
 
+    @patch.object(confine, "ready", lambda: "")             # 沙箱在不在由 test_confine 管；没有 bwrap 的机器（macOS）也照样判先后
     def test_pick(self):
         free, now = (lambda: False), datetime(2026, 11, 22, 10)
         self.assertEqual(pick(now, {}, self.root, free), (None, ""))                           # 没有便签
@@ -221,6 +223,22 @@ class SelfTest(unittest.TestCase):
         self.assertEqual([(p / "self-confine-test").exists() for p in targets], [True, True, True, False, False, False])
         self.assertEqual(cred.read_text(), "x\n")
 
+    @unittest.skipUnless(Path(confine.SANDBOX_EXEC).exists(), "没有 sandbox-exec")
+    def test_confine_seatbelt(self):
+        """macOS（11-26）：Seatbelt 只限制写入，可写的清单和 bwrap 同一份；系统临时目录另外放行（测试落在其中，这里不放）。"""
+        t = Path(self.tmp.name)
+        logs, host, mind, other = t / "logs", t / "host", t / "data", t / "other"
+        for d in (logs / confine.SCRATCHPAD, host, mind / "events", other):
+            d.mkdir(parents=True)
+        paths = confine.writable(self.root, logs, [host], mind)
+        targets = (self.root, logs / confine.SCRATCHPAD, host, mind / "events", logs, other)
+        sh = "; ".join(f"echo x > {p}/self-confine-test 2>/dev/null" for p in targets) + "; echo done"
+        out = subprocess.run([confine.SANDBOX_EXEC, "-p", confine.profile(paths), "sh", "-c", sh],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        self.assertEqual(out, ["done"])                                          # 写 /dev/null 照常
+        self.assertEqual([(p / "self-confine-test").exists() for p in targets], [True, True, True, True, False, False])
+        self.assertIn('(subpath "/x/a\\"b")', confine.profile([Path('/x/a"b')]))  # 路径里的引号转义
+
     def test_hosts_contract(self):
         """每个接入的宿主都实现了接入标准里的那组函数。"""
         for name, m in hosts.HOSTS.items():
@@ -258,6 +276,26 @@ class SelfTest(unittest.TestCase):
         got = "\n".join(section(REPO, now, self.root, {}, busy, self.db))
         self.assertIn("醒着：命名影子", got)
         self.assertNotIn("命名影子.md", got)                                                    # 醒着的那张不再列成到点
+
+    def test_post(self):
+        """写给用户的发到预览站同名分类（11-23）：醒着的不发，发过的不重发，内容改了重发，发不出去下次再来。"""
+        now = datetime(2026, 11, 23, 22)
+        for d in ("2026-11-21-用一用", "2026-11-23-用一用-dsh", "2026-11-01-太早"):
+            (self.root / d).mkdir()
+            (self.root / d / TO_USER).write_text(d)
+        (self.root / "2026-11-22-命名影子").mkdir()                                            # 没写信的不发
+        calls = []
+        pub = lambda path, name, cat: calls.append((path.parent.name, name, cat)) or "id" + str(len(calls))   # noqa: E731
+        st = {"run": {"dir": str(self.root / "2026-11-23-用一用-dsh")}}
+        self.assertEqual(post(self.root, st, now, pub), ["2026-11-21-用一用"])
+        self.assertEqual(calls, [("2026-11-21-用一用", "2026-11-21-用一用.md", Path(TO_USER).stem)])
+        st.pop("run")
+        self.assertEqual(post(self.root, st, now, pub), ["2026-11-23-用一用-dsh"])
+        self.assertEqual(post(self.root, st, now, pub), [])                                      # 发过的不重发
+        (self.root / "2026-11-21-用一用" / TO_USER).write_text("改过")
+        self.assertEqual(post(self.root, st, now, lambda *a: None), [])                          # 发不出去：不记
+        self.assertEqual(post(self.root, st, now, pub), ["2026-11-21-用一用"])
+        self.assertIn("预览站", "\n".join(section(REPO, now, self.root, {}, st, self.db)))
 
     def turn_rows(self, rows):
         """往临时库里放轮次：[(会话, cwd, 开始时刻)]。"""
